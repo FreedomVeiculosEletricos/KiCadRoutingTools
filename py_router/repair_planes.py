@@ -854,6 +854,86 @@ def auto_detect_zones(
 
 
 
+def plane_join_widths(policy: str, min_w: float, max_w: float, default_w: float,
+                      requested_w: float, floor_w: float = 0.0
+                      ) -> Tuple[float, float, float]:
+    """The ``(min, max, last_resort)`` region-join widths for ONE plane net.
+
+    ``min_w``/``max_w`` are the run's join range (--min/--max-track-width),
+    ``default_w`` the run's --track-width, ``requested_w`` the width this net
+    routes at (power width, net class, .kicad_dru opt, impedance), ``floor_w``
+    the narrowest track the board's rules accept on this net.
+
+    * ``off``: nothing narrower than the net's own width -- the joins start at
+      max(min_w, requested_w), and the last-resort narrow bridge (#217) is the
+      net's own width, never the run's signal width. Two plane nets asking x
+      and y mm each get theirs.
+    * ``board``: down to the net's rule floor, never below it: the joins start
+      at max(min_w, floor_w), the last resort at max(default_w, floor_w).
+    * ``fab``: unchanged (min_w .. max_w, last resort default_w).
+    The max never drops under the min."""
+    if policy == 'off':
+        lo, narrow = max(min_w, requested_w), requested_w
+    elif policy == 'board':
+        lo, narrow = max(min_w, floor_w), max(default_w, floor_w)
+    else:
+        lo, narrow = min_w, default_w
+    return lo, max(max_w, lo), narrow
+
+
+def _plane_join_width_resolver(config, pcb_data, input_file, net_ids,
+                               net_track_widths, net_layer_widths,
+                               min_w, max_w):
+    """``resolve(net_id, layer) -> plane_join_widths(...)`` for this run's
+    escalation policy. ``net_track_widths`` None = read the plane nets' widths
+    from the board's own net classes / .kicad_dru (DesignRules.draw_size, as
+    route.py does with --track-width omitted)."""
+    from fab_tiers import get_escalation_policy
+    policy, floors = get_escalation_policy()
+    if policy not in ('off', 'board'):
+        return lambda nid, layer: plane_join_widths(
+            policy, min_w, max_w, config.track_width, config.track_width)
+    rules = None
+    if net_track_widths is None or policy == 'board':
+        try:
+            from design_rules import DesignRules
+            rules = DesignRules.from_project(pcb_data, input_file or None,
+                                             copper_layers=list(config.layers))
+        except Exception as e:                                 # noqa: BLE001
+            print(f"{YELLOW}Warning: plane-join widths: design rules "
+                  f"unavailable ({e}); using --track-width.{RESET}")
+    if net_track_widths is None:
+        net_track_widths, net_layer_widths = {}, {}
+        for nid in (net_ids if rules is not None else ()):
+            w = rules.draw_size('track_width', nid)
+            if w:
+                net_track_widths[nid] = float(w)
+            by_layer = {l: rules.draw_size('track_width', nid, l)
+                        for l in config.layers}
+            by_layer = {l: float(v) for l, v in by_layer.items() if v}
+            if len(set(by_layer.values())) > 1:
+                net_layer_widths[nid] = by_layer
+    # get_net_track_width's precedence (power width > per-layer > class),
+    # on a copy so the rest of the repair keeps its own config.
+    wcfg = replace(config, net_track_widths=dict(net_track_widths),
+                   net_layer_widths=dict(net_layer_widths or {}))
+    board_floor = float(floors.get('track_width') or 0.0)
+
+    def resolve(net_id, layer):
+        floor_w = board_floor
+        if policy == 'board' and rules is not None:
+            try:
+                floor_w = max(floor_w, float(rules.floor('track_width', net_id,
+                                                         layer) or 0.0))
+            except Exception:                                  # noqa: BLE001
+                pass
+        return plane_join_widths(policy, min_w, max_w, config.track_width,
+                                 wcfg.get_net_track_width(net_id, layer),
+                                 floor_w)
+    return resolve
+
+
+
 
 def repair_planes(
     input_file: str,
@@ -923,6 +1003,14 @@ def repair_planes(
     # never ripped as a tap blocker here nor by the sub-runs below. The #562
     # finalize passes its step's set; None (the standalone CLI) = none.
     hands_off_nets: Optional[List[str]] = None,
+    # Each net's own requested track width ({net_id: mm}) and per-layer width
+    # ({net_id: {layer: mm}}), as the calling route step resolved them (net
+    # class / .kicad_dru opt / impedance). They bound the region joins under
+    # --escalation off (plane_join_widths). None = read the board's own net
+    # classes and rules (the standalone CLI with --track-width omitted); {} =
+    # every non-power net is at track_width (an explicit --track-width).
+    net_track_widths: Optional[Dict[int, float]] = None,
+    net_layer_widths: Optional[Dict[int, Dict[str, float]]] = None,
 ) -> Tuple[int, int]:
     """
     Route between disconnected regions in power plane zones.
@@ -1120,6 +1208,9 @@ def repair_planes(
         config.power_net_widths = {
             _name2id[nm]: w for nm, w in zip(power_nets, power_nets_widths)
             if nm in _name2id}
+    _join_widths = _plane_join_width_resolver(
+        config, pcb_data, input_file, net_ids, net_track_widths,
+        net_layer_widths, min_track_width, max_track_width)
     # #581: keep repair vias (pad taps, region joins, reconnects) off same-net
     # pads when the constraint is active. Explicit kwarg wins (route.py's #562
     # finalize forwards its resolved value -- the output's .kicad_pro sibling
@@ -1669,6 +1760,11 @@ def repair_planes(
         layers_str = ", ".join(sorted(net_zone_layers))
         clearances_str = ", ".join(f"{l}={zone_clearances.get(l, zone_clearance)}mm" for l in sorted(net_zone_layers))
         print(f"\n[{net_name}] on {layers_str} (clearances: {clearances_str}):")
+        # This net's region-join width range under the escalation policy.
+        _jmin, _jmax, _jnarrow = _join_widths(net_id, primary_layer)
+        if _jmin != min_track_width or _jnarrow != config.track_width:
+            print(f"  region joins {_jmin:g}-{_jmax:g} mm, last-resort "
+                  f"{_jnarrow:g} mm (this net's width, --escalation policy)")
 
         # Per-pad repair pass (issue #99): reconnect pads route_planes could
         # not via down to the plane. Runs before island repair so the new
@@ -1869,7 +1965,7 @@ def repair_planes(
             # passes the extra half-width to the router, which now does an exact
             # swept-capsule clearance check (issues #156/#173), so a wide (e.g.
             # 0.4mm) connection's diagonal no longer grazes foreign copper.
-            track_width=min_track_width,
+            track_width=_jmin,
             track_via_clearance=track_via_clearance,
             hole_to_hole_clearance=hole_to_hole_clearance
         )
@@ -1886,6 +1982,7 @@ def repair_planes(
             'zone_bounds': zone_bounds, 'net_zone_layers': net_zone_layers,
             'zone_clearances': zone_clearances,
             'max_zone_clearance': max_zone_clearance,
+            'join_widths': (_jmin, _jmax, _jnarrow),
         }
         region_segments, region_vias, routes_added, route_paths, _ = route_disconnected_regions(
             net_id=net_id,
@@ -1897,8 +1994,9 @@ def repair_planes(
             base_obstacles=base_obstacles,
             layer_map=layer_map,
             zone_clearance=max_zone_clearance,
-            max_track_width=max_track_width,
-            min_track_width=min_track_width,
+            max_track_width=_jmax,
+            min_track_width=_jmin,
+            narrow_track_width=_jnarrow,
             track_via_clearance=track_via_clearance,
             hole_to_hole_clearance=hole_to_hole_clearance,
             analysis_grid_step=analysis_grid_step,
@@ -1978,8 +2076,9 @@ def repair_planes(
                 base_obstacles=base_obstacles,
                 layer_map=layer_map,
                 zone_clearance=max_zone_clearance,
-                max_track_width=max_track_width,
-                min_track_width=min_track_width,
+                max_track_width=_jmax,
+                min_track_width=_jmin,
+                narrow_track_width=_jnarrow,
                 track_via_clearance=track_via_clearance,
                 hole_to_hole_clearance=hole_to_hole_clearance,
                 analysis_grid_step=analysis_grid_step,
@@ -2560,12 +2659,13 @@ def repair_planes(
                 continue
             print(f"\n[{_ctx['net_name']}] fill re-pinched by the ripped-net "
                   f"reconnect -- re-running the region join:")
+            _rmin, _rmax, _rnarrow = _ctx['join_widths']
             _b2, _lm2 = build_base_obstacles(
                 exclude_net_ids={_nid},
                 routing_layers=routing_layers,
                 pcb_data=pcb_data,
                 config=config,
-                track_width=min_track_width,
+                track_width=_rmin,
                 track_via_clearance=track_via_clearance,
                 hole_to_hole_clearance=hole_to_hole_clearance)
             _rsegs, _rvias, _radd, _rpaths, _ = route_disconnected_regions(
@@ -2578,8 +2678,9 @@ def repair_planes(
                 base_obstacles=_b2,
                 layer_map=_lm2,
                 zone_clearance=_ctx['max_zone_clearance'],
-                max_track_width=max_track_width,
-                min_track_width=min_track_width,
+                max_track_width=_rmax,
+                min_track_width=_rmin,
+                narrow_track_width=_rnarrow,
                 track_via_clearance=track_via_clearance,
                 hole_to_hole_clearance=hole_to_hole_clearance,
                 analysis_grid_step=analysis_grid_step,
@@ -3807,6 +3908,9 @@ Examples:
     from list_nets import (board_default_netclass_clearance, board_default_netclass_param,
                            resolve_cli_floor)
     _vs_explicit = args.via_size is not None or args.via_drill is not None
+    # An explicit --track-width holds for every non-power net (as in route.py);
+    # omitted, each plane net's region joins read its own class width.
+    _tw_explicit = args.track_width is not None
     for _pname, _nckey, _fallback in (('track_width', 'track_width', defaults.TRACK_WIDTH),
                                       ('via_size', 'via_diameter', defaults.VIA_SIZE),
                                       ('via_drill', 'via_drill', defaults.VIA_DRILL)):
@@ -3928,6 +4032,7 @@ Examples:
     _rdp_result = repair_planes(
         input_file=args.input_file,
         output_file=args.output_file,
+        net_track_widths=({} if _tw_explicit else None),
         layer_costs=(list(args.layer_costs) if args.layer_costs else None),
 
         net_names=net_names,
