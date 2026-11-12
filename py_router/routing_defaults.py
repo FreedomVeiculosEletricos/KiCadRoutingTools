@@ -71,6 +71,10 @@ NECKDOWN_TAPER_LENGTH = 0.5  # mm narrow->wide width taper (0 = abrupt)
 # the tap router (route_planes); not a CLI/GUI parameter. The fab / board
 # policies do not read it (their necks are shaped by NECKDOWN_LENGTH).
 PAD_ENTRY_NECK_MM = 2.0
+# Pad entry (pad_entry.py): a track end must reach width/2 + this into the pad
+# it lands on (the pad's medial axis when the pad is narrower), so the joint is
+# as wide as the track with a margin over the fab's etch tolerance.
+PAD_ENTRY_MARGIN_MM = 0.05
 TRACK_PROXIMITY_DISTANCE = 2.0  # mm
 # #1146 pairwise keep-away: band cost per cell (mm equivalent; 0 = measure
 # and report only) and the radius around the routed net's own pads where the

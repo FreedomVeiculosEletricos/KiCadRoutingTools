@@ -120,10 +120,21 @@ def grading():
                                unflashed_hole_only=True) == {'F.Cu'})
 
 
-def _cleanup(mode, layer):
-    pcb, tail, trunk = _board(mode, layer)
-    flagged = [f for f in check_weird(pcb)[0] if f['category'] == 'removable-segment']
-    n, _ = collapse_strict_redundant([], pcb, None)
+def _cleanup(mode, layer, pad_entry_rule=False):
+    """The trunk ends 0.04 mm inside the pad outline, so the tail is also
+    what carries it into the pad: the pad-entry rule (pad_entry.py) keeps it
+    on every layer. The #1063 checks isolate the unflashed-layer joint by
+    switching that rule off; ``pad_entry_rule`` grades with it on."""
+    import pad_entry
+    real = pad_entry.shallow_pad_entry
+    if not pad_entry_rule:
+        pad_entry.shallow_pad_entry = lambda *a, **k: None
+    try:
+        pcb, tail, trunk = _board(mode, layer)
+        flagged = [f for f in check_weird(pcb)[0] if f['category'] == 'removable-segment']
+        n, _ = collapse_strict_redundant([], pcb, None)
+    finally:
+        pad_entry.shallow_pad_entry = real
     return len(flagged), n, tail in pcb.segments, trunk in pcb.segments
 
 
@@ -145,6 +156,11 @@ def cleanup():
     flagged, n, tail_kept, trunk_kept = _cleanup('remove_except_start_end', 'F.Cu')
     check("an end layer keeps its pad: the F.Cu tail is removed",
           n == 1 and not tail_kept and trunk_kept, f"removed {n}")
+    # With the pad-entry rule on, the tail is the trunk's way into the pad:
+    # removing it would leave the trunk joined 0.04 mm deep.
+    flagged, n, tail_kept, trunk_kept = _cleanup('keep_all', 'In1.Cu', True)
+    check("pad-entry rule: the tail that carries the trunk into the pad stays",
+          flagged == 0 and n == 0 and tail_kept, f"flagged {flagged}, removed {n}")
 
 
 def main():
