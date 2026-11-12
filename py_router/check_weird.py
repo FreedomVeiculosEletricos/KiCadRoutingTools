@@ -80,6 +80,14 @@ Categories:
                      Eagle connects a wire only there; close_soft_joints lays
                      the connector that cures it (pad_entry.py). Always
                      reported (no size).
+  smd-entry          a track leaving an SMD pad through a corner, at an angle,
+                     or through a side SMD_ENTRY_SIDE forbids -- Altium's SMD
+                     Entry rule. Always reported.
+  smd-to-corner      a track bending within exit_distance (SMD_TO_CORNER_MM,
+                     at least its half-width) of an SMD pad's outline --
+                     Altium's SMD To Corner. Always reported. route.py's
+                     cleanup rebuilds both from the pad centre
+                     (rebuild_pad_exits).
   kicad-dangling     a joint segment whose two ends both lie on other
                      same-net TRACKS that hold the other end too (#1217):
                      KiCad counts such an item for one end only, so its DRC
@@ -142,7 +150,8 @@ from pcb_modification import (_point_anchored, _prune_net_cycles, _pt_seg_dist,
 CATEGORIES = ['dangling-end', 'soft-joint', 'redundant-cycle',
               'removable-segment', 'stacked-copper', 'unsupported-via',
               'dangling-via', 'orphan-island', 'narrow-pad-joint',
-              'kicad-dangling', 'off-centre-via-end', 'shallow-pad-entry']
+              'kicad-dangling', 'off-centre-via-end', 'shallow-pad-entry',
+              'smd-entry', 'smd-to-corner']
 # Reported, but not counted in the headline or the exit code (see the module
 # docstring): check_complete blocks DONE on that exit code.
 ADVISORY_CATEGORIES = frozenset({'off-centre-via-end'})
@@ -1124,6 +1133,32 @@ def _check_shallow_pad_entry(name, net_segs, net_vias, net_pads, findings):
                 f"the track", size=None))
 
 
+def _check_smd_exit(name, net_segs, net_vias, net_pads, findings):
+    # (callers skip the nets whose exits are the spec: pad_exit_skip_net_ids)
+    """Flag SMD pad exits that fail Altium's SMT rules
+    (pcb_modification.smd_exit_violations, what rebuild_pad_exits repairs):
+    ``smd-entry`` -- the track crosses the pad outline through a corner, at an
+    angle, or through a side SMD_ENTRY_SIDE forbids; ``smd-to-corner`` -- it
+    bends within exit_distance of the outline. Read-only; no size."""
+    if not net_pads or not net_segs:
+        return
+    from pcb_modification import smd_exit_violations
+    from pad_entry import exit_distance
+    for s, (ex, ey), pad, pts, _cs, _r, rules in smd_exit_violations(
+            net_segs, net_vias, net_pads):
+        ref = f"{pad.component_ref}.{pad.pad_number}"
+        if 'smd-entry' in rules:
+            findings.append(_finding(
+                'smd-entry', name, s.layer, ex, ey,
+                f"{s.width:.3f}mm track leaves SMD pad {ref} through a corner "
+                f"or at an angle, not straight out through an edge", size=None))
+        if 'smd-to-corner' in rules:
+            findings.append(_finding(
+                'smd-to-corner', name, s.layer, ex, ey,
+                f"{s.width:.3f}mm track bends less than "
+                f"{exit_distance(s.width):.3f}mm from SMD pad {ref}", size=None))
+
+
 def check_weird(pcb_data: PCBData, net_patterns: Optional[List[str]] = None,
                 thorough: bool = False, quiet: bool = True,
                 tolerance: float = 0.1
@@ -1174,6 +1209,13 @@ def check_weird(pcb_data: PCBData, net_patterns: Optional[List[str]] = None,
         print(f"Checking {len(check_ids)} nets "
               f"({len(pcb_data.segments)} segments, {len(pcb_data.vias)} vias)...")
 
+    # Protected / coupled / impedance / length-graded nets: their exits are
+    # the spec, and the rebuild leaves them as they are (pad_exit_skip_net_ids).
+    try:
+        from cleanup_pipeline import pad_exit_skip_net_ids
+        smd_skip = pad_exit_skip_net_ids(pcb_data)
+    except Exception:
+        smd_skip = set()
     for net_id in check_ids:
         name = _net_name(pcb_data, net_id)
         net_segs = segs_by_net.get(net_id, [])
@@ -1206,6 +1248,8 @@ def check_weird(pcb_data: PCBData, net_patterns: Optional[List[str]] = None,
         _check_terminal_web(pcb_data, net_id, name, net_segs, net_pads,
                             min_track_w, findings)
         _check_shallow_pad_entry(name, net_segs, net_vias, net_pads, findings)
+        if net_id not in smd_skip:
+            _check_smd_exit(name, net_segs, net_vias, net_pads, findings)
 
     if tolerance and tolerance > 0:
         findings = [f for f in findings
@@ -1284,7 +1328,8 @@ def main():
                              'gap, duplicated-copper length, via diameter); '
                              'smaller findings are dropped. Default 0.1; use '
                              '0 to report everything. soft-joint, '
-                             'narrow-pad-joint, shallow-pad-entry, '
+                             'narrow-pad-joint, shallow-pad-entry, smd-entry, '
+                             'smd-to-corner, '
                              'kicad-dangling and '
                              'off-centre-via-end carry no size and are ALWAYS '
                              'reported -- smaller is worse, or KiCad treats '

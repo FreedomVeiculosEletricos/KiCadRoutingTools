@@ -3072,6 +3072,15 @@ category each:
   route.py's cleanup lays a connector from the end to the pad centre (as
   Altium's router starts a pad exit); what remains is an end that connector
   could not clear (`pad_entry.py`);
+- `smd-entry` -- a track leaving an SMD pad through a corner, at an angle, or
+  through a side `SMD_ENTRY_SIDE` forbids (Altium's SMD Entry rule: straight
+  out through an edge, with the track's copper inside that edge; a round pad
+  radially);
+- `smd-to-corner` -- a track bending within `SMD_TO_CORNER_MM` (0.25 mm, and
+  never less than its half-width) of an SMD pad's outline (Altium's SMD To
+  Corner). route.py's cleanup rebuilds both from the pad centre, straight out
+  through an allowed edge, then onto the route (`rebuild_pad_exits`); what
+  remains is an exit no rebuild could clear;
 - `kicad-dangling` -- a joint segment whose ends both lie on other same-net
   tracks, which KiCad's DRC reports as `track_dangling` (#1217);
 - `off-centre-via-end` -- a track end inside a same-net via's copper, on a
@@ -3112,7 +3121,7 @@ Options:
                         duplicated-copper length, via diameter); smaller findings are
                         dropped. Default: 0.1; use 0 to report everything.
                         soft-joint, narrow-pad-joint, shallow-pad-entry,
-                        kicad-dangling and
+                        smd-entry, smd-to-corner, kicad-dangling and
                         off-centre-via-end carry no size and are always reported
   --max-print INT       Max findings printed per category (<=0 prints all; default 20)
 ```

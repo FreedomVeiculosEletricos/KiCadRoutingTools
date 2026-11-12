@@ -49,6 +49,7 @@ from pcb_modification import (
     trim_dangles_past_body_anchor,
     neck_wide_segments_grazing_pads,
     smooth_octolinear_chains,
+    rebuild_pad_exits,
     close_soft_joints,
     merge_collinear_segments,
     CLOSE_SOFT_JOINT_KINDS,
@@ -114,6 +115,20 @@ def _smooth_skip_net_ids(pcb_data):
             if getattr(net, 'name', None) in names}
 
 
+def pad_exit_skip_net_ids(pcb_data, config=None):
+    """Nets whose SMD pad exits the rebuild leaves alone: the smoother's
+    (protected, coupled, impedance) plus every net a length or skew grade
+    reads -- a rebuilt exit changes a member's length and a pair's
+    symmetry."""
+    from pcb_modification import length_graded_net_ids
+    ids = set(_smooth_skip_net_ids(pcb_data)) | set(_skew_bound_net_ids(pcb_data))
+    try:
+        ids |= set(length_graded_net_ids(pcb_data, config))
+    except Exception:
+        pass
+    return ids
+
+
 def _skew_bound_net_ids(pcb_data):
     """Nets a skew rule grades on this board (#1759): every member of a
     group `check_drc.skew_rule_groups` forms from the board's recorded
@@ -161,6 +176,7 @@ def run_post_route_cleanup(results, pcb_data, scope_net_ids, config, *,
                            keep_input_copper: bool = False,
                            progress_callback=None,
                            smooth: bool = False,
+                           pad_exits: bool = False,
                            merge_collinear: bool = True,
                            strict_collapse: bool = True,
                            ) -> CleanupOutcome:
@@ -612,6 +628,31 @@ def run_post_route_cleanup(results, pcb_data, scope_net_ids, config, *,
             if _ms_unresolved:
                 _prog("graze micro-shift after smoothing")
                 _microshift(_ms_unresolved)
+
+    # SMD pad exits (pad_entry.py, Altium's SMD Entry / SMD To Corner): an
+    # exit through a corner, at an angle, or bent within the exit distance of
+    # the outline is rebuilt from the pad centre straight out through an
+    # allowed edge. It rewrites copper, so it runs with the shape passes,
+    # before close (#319 ordering); close's pad-entry connector catches the
+    # ends it cannot rebuild. Protected / coupled / impedance / length-graded
+    # nets keep their exits (pad_exit_skip_net_ids). Front switch ``pad_exits``:
+    # ON for route.py's single-ended step, OFF for diff pairs (pair geometry
+    # is the spec, as for smoothing) and the plane fronts (route.py's
+    # end-of-run pass rebuilds the taps they lay).
+    if pad_exits and not _judge:
+        _prog("SMD pad exits")
+        _routed_ids = {id(x) for r in results for x in (r.get('new_segments') or [])}
+        _px_n, _px_strip, _px_added = rebuild_pad_exits(
+            results, pcb_data, _sub_scope, config,
+            editable=(None if not keep_input_copper
+                      else (lambda x: id(x) in _routed_ids)),
+            skip_net_ids=pad_exit_skip_net_ids(pcb_data, config))
+        counts['pad_exits_rebuilt'] = _px_n
+        _trace('pad_exits')
+        strip.extend(_px_strip)
+        if _px_n:
+            print(f"{label}SMD pad exits: rebuilt {_px_n} exit(s) straight out "
+                  f"through an edge")
 
     # FINAL copper step (#319 ordering): nothing below may remove copper.
     # KICAD_NO_SOFT_JOINT_BRIDGE=1 is an A/B ablation knob (like

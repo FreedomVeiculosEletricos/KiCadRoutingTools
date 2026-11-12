@@ -1565,8 +1565,7 @@ def _merge_staged_oracle_copper(orc, results_data, pcb_data,
 
 
 def _late_soft_joint_bridge984(pcb_data, output_file, return_results,
-                               results_data, write_model, scope_names, config,
-                               pad_entries_only=False):
+                               results_data, write_model, scope_names, config):
     """Bridge the soft joints copper laid AFTER the run's cleanup left (#984).
 
     close_soft_joints lives in run_post_route_cleanup, which runs before the
@@ -1578,10 +1577,6 @@ def _late_soft_joint_bridge984(pcb_data, output_file, return_results,
     the SAME pass over the nets those legs touched, on the board the run
     ships -- the written file on the CLI, the write model on the GUI -- and
     puts its connectors on that board's channel. Returns connectors added.
-
-    ``pad_entries_only``: the pad-entry connector alone (pad_entry.py), over
-    every net the run owns -- plane taps and other late copper land on pads
-    after the cleanup that firms them, on nets no oracle leg touched.
     """
     import copy as _copy
     from pcb_modification import close_soft_joints
@@ -1602,8 +1597,7 @@ def _late_soft_joint_bridge984(pcb_data, output_file, return_results,
         if not scope:
             return 0
         added = []
-        n = close_soft_joints(added, board, scope, config,
-                              pad_entries_only=pad_entries_only)
+        n = close_soft_joints(added, board, scope, config)
         conns = [c for r in added for c in (r.get('new_segments') or [])]
         if not conns:
             return 0
@@ -1625,17 +1619,141 @@ def _late_soft_joint_bridge984(pcb_data, output_file, return_results,
             _c = _c[:lp] + '\n'.join(sexprs) + '\n' + _c[lp:]
             with open(output_file, 'w', encoding='utf-8') as _f:
                 _f.write(_c)
-        if pad_entries_only:
-            print(f"  Pad entry (late): {n} track end(s) connected to the pad "
-                  f"centre")
-        else:
-            print(f"  Soft joints after the oracle (#984): {n} connector(s) on "
-                  f"{', '.join(sorted(names))}")
+        print(f"  Soft joints after the oracle (#984): {n} connector(s) on "
+              f"{', '.join(sorted(names))}")
         return n
     except Exception as _e:                                     # noqa: BLE001
         print(f"  (post-oracle soft-joint bridge skipped: "
               f"{type(_e).__name__}: {_e})")
         return 0
+
+
+def _late_pad_exits(pcb_data, output_file, return_results, results_data,
+                    write_model, input_signature, scope_names,
+                    keep_input_copper, config=None):
+    """SMD pad exits and pad entries on the board this run SHIPS (pad_entry.py).
+
+    The in-run cleanup rebuilds exits and firms entries, but the plane
+    finalize's taps, the oracle legs and the reconciliation land on pads
+    after it, the late sweeps may clear copper that refused a rebuild in-run,
+    and the strict collapse may expose an exit by removing the copper that
+    made it a joint. So, after the last pass that removes copper:
+    rebuild_pad_exits (Altium's SMD Entry / SMD To Corner) and the strict
+    collapse of what it left redundant on the nets it changed, in rounds,
+    then close_soft_joints' pad-entry connector for the ends no rebuild took. Same board and ownership as
+    _late_strict_collapse1063: the written file on the CLI, the write model on
+    the GUI; input copper by VALUE, read-only under --keep-input-copper.
+    Protected / coupled / impedance / length-graded nets keep their exits.
+    Returns (exits rebuilt, connectors added)."""
+    import copy as _copy
+    from collections import Counter
+    from improvement_gate import copper_item_key
+    from pcb_modification import (rebuild_pad_exits, close_soft_joints,
+                                  collapse_strict_redundant)
+    from cleanup_pipeline import pad_exit_skip_net_ids
+    try:
+        if return_results:
+            rd = results_data if results_data is not None else {}
+            board = _copy.copy(pcb_data)
+            if write_model is not None:
+                segs_by_net, vias_by_net = write_model(rd)
+                board.segments = [s for _l in segs_by_net.values() for s in _l]
+                board.vias = [v for _l in vias_by_net.values() for v in _l]
+            else:
+                board.segments = list(pcb_data.segments)
+                board.vias = list(pcb_data.vias)
+        elif output_file and os.path.isfile(output_file):
+            from kicad_parser import parse_kicad_pcb as _pkpx
+            board = _pkpx(output_file)
+        else:
+            return 0, 0
+        name_of = {nid: n.name for nid, n in board.nets.items()}
+        names = set(scope_names or ())
+        scope = {nid for nid, nm in name_of.items() if nm in names}
+        if not scope:
+            return 0, 0
+        left = {n: Counter(c) for n, c in (input_signature or {}).items()}
+        owned = set()
+        for s in board.segments:
+            c = left.get(name_of.get(s.net_id))
+            k = copper_item_key(s)
+            if c and c[k] > 0:
+                c[k] -= 1
+            else:
+                owned.add(id(s))
+        before = list(board.segments)
+        added_res = []
+        n_x = 0
+        skip = pad_exit_skip_net_ids(board, config)
+        left = {}
+        for _round in range(3):
+            left = {}
+            n, _strip, added = rebuild_pad_exits(
+                added_res, board, scope, config,
+                editable=(None if not keep_input_copper
+                          else (lambda x: id(x) in owned)),
+                skip_net_ids=skip, stats=left)
+            n_x += n
+            if not n:
+                break
+            owned |= {id(x) for x in added}
+            mine = [x for x in board.segments if id(x) in owned]
+            collapse_strict_redundant(
+                [{'new_segments': mine, 'new_vias': []}], board,
+                {x.net_id for x in added}, keep_input_copper=keep_input_copper)
+        n_e = close_soft_joints(added_res, board, scope, config,
+                                pad_entries_only=True)
+        kept = {id(s) for s in board.segments}
+        removed = [s for s in before if id(s) not in kept]
+        new = [x for r in added_res for x in (r.get('new_segments') or [])
+               if id(x) in kept]
+        if left:
+            print("  Pad exits (end of run): left as routed -- "
+                  + ", ".join(f"{k.replace('_', ' ')} {v}"
+                              for k, v in sorted(left.items())))
+        if not (removed or new):
+            return 0, 0
+        if return_results:
+            gone = {id(x) for x in removed}
+            for r in rd.get('results') or []:
+                if r.get('new_segments'):
+                    r['new_segments'] = [x for x in r['new_segments']
+                                         if id(x) not in gone]
+            in_ids = {id(x) for x in before} - owned
+            rd.setdefault('segments_to_remove', []).extend(
+                x for x in removed if id(x) in in_ids)
+            rd.setdefault('results', []).append(
+                {'new_segments': new, 'new_vias': [], 'cleanup': 'pad_exit'})
+            pcb_data.segments = [x for x in pcb_data.segments
+                                 if id(x) not in gone] + new
+            bump_copper_epoch(pcb_data)
+        else:
+            if removed:
+                n_s, _n_v = _strip_written_copper(output_file, removed, [],
+                                                  name_of)
+                if n_s != len(removed):
+                    print(f"  WARNING: pad exits: chose {len(removed)} "
+                          f"segment(s) to replace, found {n_s} in the file")
+            if new:
+                from kicad_parser import board_uses_name_nets
+                from kicad_writer import generate_segment_sexpr
+                with open(output_file, 'r', encoding='utf-8') as _f:
+                    _c = _f.read()
+                v10 = board_uses_name_nets(_c)
+                sexprs = [generate_segment_sexpr(
+                    (x.start_x, x.start_y), (x.end_x, x.end_y), x.width,
+                    x.layer, x.net_id, name_of.get(x.net_id) if v10 else None)
+                    for x in new]
+                lp = _c.rfind(')')
+                _c = _c[:lp] + '\n'.join(sexprs) + '\n' + _c[lp:]
+                with open(output_file, 'w', encoding='utf-8') as _f:
+                    _f.write(_c)
+        print(f"  Pad exits (end of run): rebuilt {n_x} SMD exit(s) straight "
+              f"out through an edge, {n_e} pad-entry connector(s)")
+        return n_x, n_e
+    except Exception as _e:                                     # noqa: BLE001
+        print(f"  (end-of-run pad exits skipped: {type(_e).__name__}: {_e})")
+        return 0, 0
 
 
 def _late_dangling_via_sweep1166(pcb_data, output_file, return_results,
@@ -3650,6 +3768,10 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                       _scope1166, keep_input_copper)
             _late_orphan_sweep659(pcb_data, output_file, as_gui, rd,
                                   None, keep_input_copper, skip_routing)
+            if full and not env_knobs.NO_SOFT_JOINT_BRIDGE:
+                _late_pad_exits(pcb_data, output_file, as_gui, rd, None,
+                                _input_sig1069, _scope1166, keep_input_copper,
+                                config)
             _moved = _late_skew_snapshot1798(
                 pcb_data, output_file, as_gui, rd, None, _skew_path1798,
                 _scope1166, before=_sk)
@@ -5339,6 +5461,7 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
         # them, presumably by freeing corridor space. --no-smoothing disables it
         # per step; KICAD_SMOOTH_ROUTE=0/1 still overrides either way.
         smooth=smoothing,
+        pad_exits=True,
         # #1063: the strict collapse runs ONCE, at the end of the outermost
         # run (_late_strict_collapse1063), never here -- the plane finalize
         # and the reconciliation route around this copper, and collapsing it
@@ -9161,18 +9284,18 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
              if _n not in pcb_data.nets
              or pcb_data.nets[_n].name not in _finished1525},
             keep_input_copper, skip_routing)
-    # Pad entry (pad_entry.py): the finalize's plane taps and the other legs
-    # above land on pads after the in-run cleanup that firms shallow entries,
-    # on nets beyond the oracle's, and the late sweeps above may clear the
-    # copper that refused a connector in-run. Firm them on every net the run
-    # owns, after the last pass that removes copper.
+    # Pad exits and entries (pad_entry.py): the finalize's plane taps and the
+    # other legs above land on pads after the in-run cleanup, on nets beyond
+    # the oracle's, and the late sweeps and collapse above change what an
+    # exit joins. After the last pass that removes copper; it collapses what
+    # its own rebuilds leave redundant.
     if (final_reconcile and not skip_routing and not _ckpt_stop
             and quick < 2 and not env_knobs.NO_SOFT_JOINT_BRIDGE):
-        _late_soft_joint_bridge984(
+        _late_pad_exits(
             pcb_data, output_file, return_results,
-            locals().get('results_data'), _gui_write_model,
+            locals().get('results_data'), _gui_write_model, _input_sig1069,
             {pcb_data.nets[_n].name for _n in sweep_scope_ids
-             if _n in pcb_data.nets}, config, pad_entries_only=True)
+             if _n in pcb_data.nets}, keep_input_copper, config)
     if _skew_before1798:
         _late_skew1798 = _late_skew_snapshot1798(
             pcb_data, output_file, return_results, locals().get('results_data'),

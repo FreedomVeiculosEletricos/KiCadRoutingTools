@@ -75,6 +75,19 @@ PAD_ENTRY_NECK_MM = 2.0
 # it lands on (the pad's medial axis when the pad is narrower), so the joint is
 # as wide as the track with a margin over the fab's etch tolerance.
 PAD_ENTRY_MARGIN_MM = 0.05
+# Pad exit on SMD pads (pad_entry.py), Altium's SMT rules:
+#  * SMD To Corner -- a track leaves the pad straight for at least
+#    max(SMD_TO_CORNER_MM, its half-width) before its first bend;
+#  * SMD Entry -- it crosses the pad outline perpendicular to an edge, inside
+#    that edge's straight span (never through a corner, never at an angle).
+#    Ends (the short edges) are always allowed; SMD_ENTRY_SIDE allows the long
+#    edges too (Altium: only on a pad whose side is > 2x its end).
+SMD_TO_CORNER_MM = 0.25
+SMD_ENTRY_SIDE = True
+# How far a straight edge exit's copper may overhang the pad's side: half a
+# 0.05 mm routing grid step, so an exit the grid set a quantum off a fine
+# pin's axis (clear of its neighbours) is an end exit, not a corner one.
+SMD_ENTRY_OVERHANG_MM = 0.025
 TRACK_PROXIMITY_DISTANCE = 2.0  # mm
 # #1146 pairwise keep-away: band cost per cell (mm equivalent; 0 = measure
 # and report only) and the radius around the routed net's own pads where the

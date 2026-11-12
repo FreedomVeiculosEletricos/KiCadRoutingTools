@@ -704,8 +704,9 @@ def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
                 return True
         return False
 
-    from check_drc import copper_keepout_gate
+    from check_drc import copper_keepout_gate, filled_graphic_shapes
     _ko_refuses = copper_keepout_gate(pcb_data)
+    _close_fills = filled_graphic_shapes(pcb_data)
 
     def clears(nid, x1, y1, x2, y2, layer, w):
         d = min(_seg_foreign_pad_dist(pcb_data, nid, x1, y1, x2, y2, layer,
@@ -723,6 +724,10 @@ def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
         hd = min(hd, _own_net_npth_hole_dist(pcb_data, nid, x1, y1, x2, y2))
         if not (d >= clr + w / 2.0 - 1e-4 and
                 hd >= npth_clr + w / 2.0 - 1e-4):
+            return False
+        # filled footprint copper (an SOT tab): outline strokes only above
+        if not _filled_graphics_clear(_close_fills, x1, y1, x2, y2, layer,
+                                      nid, w, clr):
             return False
         # #1760: a bridge must not enter a keep-out the route kept out of (a
         # tracks-not-allowed rule area, a net-filtered keep-out). The joint
@@ -5680,69 +5685,23 @@ def _seg_cross_point(ax, ay, bx, by, cx, cy, dx, dy):
     return (ax + t * rx, ay + t * ry)
 
 
-def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
-                             clearance: float = 0.1,
-                             keep_input_copper: bool = False,
-                             net_clearances=None,
-                             board_edge_clearance: float = 0.0,
-                             config=None,
-                             skip_net_ids=None,
-                             dry_run: bool = False,
-                             min_gain: float = 0.01,
-                             max_net_segs: int = 400,
-                             max_chain_segs: int = 100):
-    """Collapse grid-A* staircase micro-jogs into octolinear shortcuts (#536).
-
-    Walks each net's simple track chains (split at junctions, same-net vias,
-    pad landings, width changes, layer changes) and greedily replaces the
-    farthest reachable sub-path with an octolinear connector -- the direct
-    segment when the span is already on a 45-degree bearing, else a single
-    diagonal+axis elbow (_octolinear_bends). Output stays STRICTLY octolinear;
-    no arbitrary-angle chords. A span is only replaced when the connector
-
-      * keeps clearance from all foreign copper (pads / segments / vias),
-        NPTH holes at their higher floor, and the board edge -- with a
-        .kicad_dru layer rule replacing the base clearance on ruled layers
-        (#498, which the older graze passes never honored) and a .kicad_dru
-        TRACK rule raising the seg-vs-seg term on top of it (#735);
-      * is shorter than the copper it replaces by at least min_gain, or
-        (#958, in a second greedy phase over the shortened chain, which
-        also takes the strictly shorter connectors the first phase's new
-        bends expose) equal in length to floating-point roundoff with
-        strictly fewer emitted legs -- a jog that is already a shortest
-        octolinear path loses its needless corner at the same length;
-        min_gain is never an allowance to get longer;
-      * strands no same-net copper: mid-span via taps, pad touches, and
-        T/X-touching sibling tracks hold their span un-collapsed unless the
-        touch sits at a kept endpoint.
-
-    Per net, the result is committed only if check_net_connectivity does not
-    grade it worse than the original. The guard runs WITHOUT pour credit:
-    endpoints are preserved by construction, so the track/via/pad graph
-    alone must not degrade -- raw zone-outline credit would mask a real
-    track loss behind fill the refill may not produce.
-
-    POURS the moving copper carves are deliberately not consulted -- the
-    same pour-blind convention routing follows; the plane finalize /
-    kicad-oracle recheck downstream owns that damage (see the comment at
-    the clears() block). dry_run=True measures without mutating anything --
-    the #536 "is it worth it on OUR output" instrument. Soft costs are
-    deliberately not consulted (the router's corridors are a routing-time
-    concept); callers gate this to the final chain step -- see
-    cleanup_pipeline.
-
-    Returns (changed_count, nets_changed, original_segments_to_remove,
-    added_segments, stats)."""
-    from collections import defaultdict
-    from check_connected import check_net_connectivity
-    from geometry_utils import segment_to_segment_closest_points, segments_intersect
+def _copper_clearance_gates(pcb_data, clearance, net_clearances,
+                            board_edge_clearance, config):
+    """The clearance gates a pass that PLACES new copper must pass (#536's
+    smoother, the pad-exit rebuild): foreign pads / tracks / vias at the
+    pairwise class clearance with .kicad_dru layer and track rules, NPTH holes
+    and slots at their floors, the board edge, and every keep-out. Returns a
+    namespace whose ``clears(x1, y1, x2, y2, layer, net_id, w)`` is the gate;
+    its parts are exposed for the smoother's other checks."""
+    import math
+    import os
+    from types import SimpleNamespace
     from single_ended_routing import (_seg_foreign_pad_dist, _seg_foreign_seg_dist,
                                       _seg_foreign_via_dist, _seg_foreign_hole_dist)
     from routing_defaults import NPTH_TO_TRACK_CLEARANCE
     from check_drc import (board_edge_geometry, _point_on_board,
-                           _segment_to_rings_distance, point_to_pad_distance,
+                           _segment_to_rings_distance,
                            npth_slot_capsules, segment_to_npth_slots_distance)
-    from connectivity import COINCIDENCE_TOL
     from obstacle_map import resolve_hole_clearance
 
     # #1038: the board's DECLARED copper-to-hole floor, not the flat 0.20. The
@@ -5808,45 +5767,6 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
             return all(min(x - min_x, max_x - x, y - min_y, max_y - y) >= required
                        for x, y in ((x1, y1), (x2, y2)))
         return True
-
-    # FINE-PITCH PAD FIELDS, from the board's OWN helpers -- `detect_bga_pitch`
-    # and `get_footprint_bounds`, the two `auto_detect_bga_exclusion_zones` is
-    # itself built from. A dense field's inter-pad space is escape corridor: the
-    # only way out for a pad that still needs one.
-    #
-    # Keyed on PITCH, not on the package name. `find_components_by_type('BGA')`
-    # is the obvious reuse and it is the wrong set here: ft2232h_jtag's U4 --
-    # the part whose corridor this fix exists for -- is
-    # `Package_QFP:LQFP-64_10x10mm_P0.5mm`, so `detect_package_type` calls it
-    # QFP and the BGA filter returns nothing. (Its log line "BGA Grid Analysis
-    # for U4" is the FANOUT's grid analyser, which runs on any candidate and
-    # finds a pitch in a QFP's peripheral rows.) What makes the space a corridor
-    # is the pitch, not the ball/lead distinction, so a 0.5mm QFP and a 0.65mm
-    # BGA both qualify and ottercast's 0.2mm QFN does too.
-    #
-    # A static REGION deliberately, not "pads that currently lack copper": that
-    # set changes on every route pass, so a guard keyed on it fires differently
-    # each lap. Measured -- an earlier cut keyed on waiting pads and
-    # destabilised ottercast_audio's five-pass chain (2 -> 4 nets incomplete)
-    # while fixing ft2232h_jtag. A package does not move between passes.
-    _dense_boxes = []
-    try:
-        from kicad_parser import detect_bga_pitch, get_footprint_bounds
-        for _fp in pcb_data.footprints.values():
-            if not pad_field_is_corridor(
-                    _fp, getattr(config, 'track_width', None) or 0.15,
-                    clearance):
-                continue
-            _dense_boxes.append(get_footprint_bounds(_fp, margin=0.0))
-    except Exception:
-        _dense_boxes = []
-
-    def _in_dense_field(x1, y1, x2, y2):
-        for (bx0, by0, bx1, by1) in _dense_boxes:
-            if (min(x1, x2) <= bx1 and max(x1, x2) >= bx0
-                    and min(y1, y2) <= by1 and max(y1, y2) >= by0):
-                return True
-        return False
 
     # Foreign-net POURS are deliberately NOT consulted (same convention as
     # routing itself, which is pour-blind): a shortcut inside a foreign pour
@@ -5978,6 +5898,487 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
                       f"({x1:.2f},{y1:.2f})-({x2:.2f},{y2:.2f}) {layer} "
                       f"w={w} cached_d={pd:.3f} fresh_d={pd_fresh:.3f}")
         return ok
+
+    return SimpleNamespace(npth_clr=npth_clr, eff_clr=eff_clr, pair_base=pair_base, _trk_clr=_trk_clr, edge_rings=edge_rings, edge_outer=edge_outer, edge_cutouts=edge_cutouts, board_bounds=board_bounds, _edge_clr=_edge_clr, _slot_caps=_slot_caps, edge_clears=edge_clears, _keepout_areas=_keepout_areas, _ko_on_layer=_ko_on_layer, keepout_clears=keepout_clears, clears=clears)
+
+
+def smd_exit_violations(segs, vias, pads, net_id=None):
+    """Every free track end entering an SMD pad whose exit fails Altium's SMD
+    Entry / SMD To Corner (pad_entry.grade_pad_exit), as ``[(seg, (ex, ey),
+    pad, chain_pts, chain_segs, reason, rules)]``. ``segs`` / ``vias`` /
+    ``pads`` are one net's. The detector check_weird reports by and
+    rebuild_pad_exits repairs by."""
+    from collections import defaultdict
+    from pad_entry import (smd_gradable, pad_depth, terminal_chain,
+                           grade_pad_exit, on_via, on_other_track,
+                           shallow_pad_entry)
+
+    def key(x, y):
+        return (round(x, 4), round(y, 4))
+
+    by_layer = defaultdict(list)
+    for s in segs:
+        if not getattr(s, 'graphic', False):
+            by_layer[s.layer].append(s)
+    out = []
+    for layer, lsegs in by_layer.items():
+        lpads = [p for p in pads if smd_gradable(p, layer) and not _sense_copper(p)]
+        if not lpads:
+            continue
+        adj = defaultdict(list)
+        for s in lsegs:
+            adj[key(s.start_x, s.start_y)].append(s)
+            adj[key(s.end_x, s.end_y)].append(s)
+        for s in lsegs:
+            if _sense_copper(s):
+                continue
+            for ex, ey in ((s.start_x, s.start_y), (s.end_x, s.end_y)):
+                if len(adj[key(ex, ey)]) != 1 or on_via(vias, ex, ey):
+                    continue
+                if on_other_track(lsegs, s, ex, ey):
+                    continue
+                touch = [p for p in lpads
+                         if pad_depth(p, ex, ey) > -s.width / 2.0 + 1e-6]
+                if not touch:
+                    continue
+                pad = max(touch, key=lambda p: pad_depth(p, ex, ey))
+                pts, csegs, reason = terminal_chain(s, ex, ey, adj, key, vias)
+                rules = set(grade_pad_exit(pad, pts, s.width))
+                nx, ny = pts[1]
+                if shallow_pad_entry(lpads, layer, ex, ey, nx, ny, s.width):
+                    rules.add('shallow')
+                if rules:
+                    out.append((s, (ex, ey), pad, pts, csegs, reason, rules))
+    return out
+
+
+def _filled_graphics_clear(fills, x1, y1, x2, y2, layer, net_id, w, clearance):
+    """Does a new ``w`` track x1,y1 -> x2,y2 keep ``clearance`` from every
+    FILLED footprint graphic of another net (an SOT tab, a shield, #1181)?
+    The segment gates measure such copper by its outline strokes only, so a
+    leg laid inside the fill read clear; the obstacle map stamps the
+    interiors, and the passes that place copper after it test them here.
+    ``fills``: check_drc.filled_graphic_shapes(pcb_data)."""
+    if not fills:
+        return True
+    n = max(2, int(math.hypot(x2 - x1, y2 - y1) / 0.05) + 1)
+    m = clearance + w / 2.0
+    for f in fills:
+        if f.layer != layer or f.net_id == net_id:
+            continue
+        x0, y0, xx, yy = f._bbox
+        if (max(x1, x2) < x0 - m or min(x1, x2) > xx + m
+                or max(y1, y2) < y0 - m or min(y1, y2) > yy + m):
+            continue
+        for q in range(n + 1):
+            x, y = x1 + (x2 - x1) * q / n, y1 + (y2 - y1) * q / n
+            if f.contains(x, y) or f.boundary_distance(x, y) < m - 1e-4:
+                return False
+    return True
+
+
+def _kicad_dangling_count(segs, vias, pads, copper_layers):
+    """How many of a net's tracks KiCad's DRC reports track_dangling
+    although both their ends lie on same-net copper (check_weird's
+    kicad-dangling, #1217) -- a rewrite must not add one."""
+    from check_weird import kicad_dangling_end
+    return sum(1 for s in segs if not getattr(s, 'graphic', False)
+               and kicad_dangling_end(s, segs, vias, pads, [], copper_layers)
+               is not None)
+
+
+def rebuild_pad_exits(results, pcb_data: PCBData, scope_net_ids, config,
+                      editable=None, skip_net_ids=None, stats=None):
+    """Rebuild every SMD pad exit that fails Altium's SMD Entry / SMD To Corner
+    (smd_exit_violations) the way Altium's router lays one: from the pad
+    centre straight out through an allowed edge (pad_entry.allowed_exits) to
+    ``exit_distance`` past the outline, then onto the route -- directly or by
+    one octolinear elbow -- at the first vertex of the run that keeps both
+    bends at 90 degrees or wider. The run's copper up to that vertex is
+    replaced.
+
+    A rebuild is committed only when every new segment passes the placing
+    passes' clearance gates (_copper_clearance_gates: classes, .kicad_dru
+    rules, holes, board edge, keep-outs), its copper stays off the pad past
+    the exit point, the new run grades clean, nothing else touches the copper
+    it replaces, and the net's connectivity does not grade worse. Only
+    ``editable(seg)`` copper is replaced (default: all); locked, graphic and
+    sense copper never is. Write-list / strip contract as the other rewriting
+    passes. Returns (rebuilt, input_segments_to_strip, added_segments);
+    ``stats``, if given, counts the exits left as they are, by reason."""
+    import math
+    from collections import defaultdict
+    from check_connected import check_net_connectivity
+    from pad_entry import (allowed_exits, to_board_dir, exit_distance,
+                           pad_depth, segment_pad_depth, grade_pad_exit,
+                           shallow_pad_entry, exit_crossing)
+    skip = set(skip_net_ids or ())
+    # A caller may hand a shallow copy of a board (route.py's late pass):
+    # never trust foreign-copper arrays cached against another copper list.
+    for _attr in ('_foreign_seg_arr_cache', '_foreign_via_arr_cache',
+                  '_foreign_pad_arr_cache'):
+        if getattr(pcb_data, _attr, None) is not None:
+            setattr(pcb_data, _attr, None)
+    gates = _copper_clearance_gates(
+        pcb_data, getattr(config, 'clearance', 0.1),
+        getattr(config, 'net_clearances', None) or None,
+        getattr(config, 'board_edge_clearance', 0.0) or 0.0, config)
+    # Filled footprint copper (_filled_graphics_clear, #1181).
+    from check_drc import filled_graphic_shapes
+    _clr = getattr(config, 'clearance', 0.1)
+    _fills = filled_graphic_shapes(pcb_data)
+    _gate = gates.clears
+
+    def clears(x1, y1, x2, y2, layer, net_id, w):
+        return (_gate(x1, y1, x2, y2, layer, net_id, w)
+                and _filled_graphics_clear(_fills, x1, y1, x2, y2, layer,
+                                           net_id, w, _clr))
+    gates.clears = clears
+    routed = {}
+    for r in results:
+        for s in r.get('new_segments') or []:
+            routed[id(s)] = r
+    vias_by_net = defaultdict(list)
+    for v in pcb_data.vias:
+        vias_by_net[v.net_id].append(v)
+    nets = sorted({s.net_id for s in pcb_data.segments if s.net_id
+                   and (scope_net_ids is None or s.net_id in scope_net_ids)
+                   and s.net_id not in skip})
+    removed_ids, strip, added = set(), [], []
+    rebuilt = 0
+    copper = list(getattr(getattr(pcb_data, 'board_info', None),
+                          'copper_layers', None) or ['F.Cu', 'B.Cu'])
+
+    def join(net_id, pad, pts, w, layer, next_dir_of, head, X, ux, uy):
+        """The run ``head`` + [X], joined octolinearly to the first vertex
+        of ``pts`` past the pad that keeps both bends at 90 degrees or wider
+        and grades clean: (path, j) or None."""
+        for j in range(1, len(pts)):
+            Q = pts[j]
+            if pad_depth(pad, *Q) > -(w / 2.0 + 1e-3):
+                continue
+            # the join stays octolinear (the direct leg only when it is)
+            for mids in _octolinear_bends(X, Q):
+                path = list(head) + [X] + list(mids) + [Q]
+                path = [p for k, p in enumerate(path)
+                        if k == 0 or math.hypot(p[0] - path[k - 1][0],
+                                                p[1] - path[k - 1][1]) > 1e-6]
+                ix = len(head)
+                if len(path) > ix + 1:
+                    ax, ay = path[ix + 1][0] - X[0], path[ix + 1][1] - X[1]
+                    if ax * ux + ay * uy < -1e-9:
+                        continue          # bend at X sharper than 90
+                lx_, ly_ = path[-1][0] - path[-2][0], path[-1][1] - path[-2][1]
+                nd = next_dir_of(j)
+                if nd is not None and lx_ * nd[0] + ly_ * nd[1] < -1e-9:
+                    continue              # bend at Q sharper than 90
+                if any(segment_pad_depth(pad, *path[k], *path[k + 1])
+                       > -(w / 2.0) + 1e-3 for k in range(ix, len(path) - 1)):
+                    continue              # back over the pad past X
+                if grade_pad_exit(pad, path + list(pts[j + 1:]), w):
+                    continue
+                if not all(gates.clears(*path[k], *path[k + 1], layer, net_id, w)
+                           for k in range(ix - 1, len(path) - 1)):
+                    continue
+                return path, j
+        return None
+
+    def plan(net_id, pad, pts, w, layer, next_dir_of, rules):
+        cx, cy = pad.global_x, pad.global_y
+        d = exit_distance(w)
+        far = pts[-1]
+        tx, ty = far[0] - cx, far[1] - cy
+        exits = []
+        for lx, ly in allowed_exits(pad):
+            ux, uy = to_board_dir(pad, lx, ly)
+            h = abs(lx) * pad.size_x / 2.0 + abs(ly) * pad.size_y / 2.0
+            exits.append((-(ux * tx + uy * ty), ux, uy, h))
+        exits.sort()
+        for _, ux, uy, h in exits:
+            X = (round(cx + ux * (h + d), 4), round(cy + uy * (h + d), 4))
+            if not gates.clears(cx, cy, X[0], X[1], layer, net_id, w):
+                continue
+            got = join(net_id, pad, pts, w, layer, next_dir_of, [(cx, cy)],
+                       X, ux, uy)
+            if got:
+                return got
+        # SMD To Corner alone: the run already leaves straight through an
+        # edge (a fine pin's exit the grid set off its axis, clear of the
+        # neighbours a centred one would graze). Keep its own exit line and
+        # carry the bend out to the exit distance.
+        cross = exit_crossing(pad, pts)
+        if rules == {'smd-to-corner'} and cross is not None:
+            k, (kx, ky) = cross
+            vx, vy = pts[k + 1][0] - pts[k][0], pts[k + 1][1] - pts[k][1]
+            lv = math.hypot(vx, vy)
+            ux, uy = vx / lv, vy / lv
+            X = (round(kx + ux * d, 4), round(ky + uy * d, 4))
+            return join(net_id, pad, pts, w, layer, next_dir_of,
+                        list(pts[:k + 1]), X, ux, uy)
+        return None
+
+    for net_id in nets:
+        segs = [s for s in pcb_data.segments if s.net_id == net_id]
+        vias = vias_by_net.get(net_id, [])
+        pads = pcb_data.pads_by_net.get(net_id, [])
+        found = smd_exit_violations(segs, vias, pads, net_id)
+        for item in found:
+            s, (ex, ey), pad, pts, csegs, reason, rules = item
+            if any(id(c) in removed_ids for c in csegs):
+                continue
+            if any(getattr(c, 'graphic', False) or is_immutable_copper(c)
+                   or _sense_copper(c) or (editable and not editable(c))
+                   for c in csegs):
+                if stats is not None:
+                    stats['read_only'] = stats.get('read_only', 0) + 1
+                continue
+            w, layer = s.width, s.layer
+
+            def next_dir_of(j, pts=pts):
+                if j + 1 < len(pts):
+                    return (pts[j + 1][0] - pts[j][0], pts[j + 1][1] - pts[j][1])
+                return None
+            got = plan(net_id, pad, pts, w, layer, next_dir_of, rules)
+            if got is None:
+                if stats is not None:
+                    stats['no_clear_exit'] = stats.get('no_clear_exit', 0) + 1
+                continue
+            path, j = got
+            gone = csegs[:j]
+            gone_ids = {id(c) for c in gone}
+            # nothing else may hang on the copper being replaced
+            new = [Segment(start_x=path[k][0], start_y=path[k][1],
+                           end_x=path[k + 1][0], end_y=path[k + 1][1],
+                           width=w, layer=layer, net_id=net_id)
+                   for k in range(len(path) - 1)]
+
+            def covered(x, y, r):
+                """(x, y)'s copper (radius r) still meets the new exit."""
+                return any(_pt_seg_dist(x, y, n.start_x, n.start_y, n.end_x, n.end_y)
+                           <= (n.width / 2.0 + r) for n in new)
+
+            # nothing may be left hanging on the copper being replaced: a
+            # track end or via touching it must touch the pad or the new exit
+            # (a joint that becomes one by overlap alone is refused below)
+            touched = False
+            for o in segs:
+                if id(o) in gone_ids or o.layer != layer:
+                    continue
+                for (x, y) in ((o.start_x, o.start_y), (o.end_x, o.end_y)):
+                    if not any(_pt_seg_dist(x, y, c.start_x, c.start_y, c.end_x, c.end_y)
+                               <= (c.width + o.width) / 2.0 for c in gone):
+                        continue
+                    if pad_depth(pad, x, y) > 0:
+                        continue
+                    # a true T on the replaced copper stays a true T on the
+                    # new exit (overlap alone is a KiCad-dangling joint); an
+                    # end that only overlapped it may overlap the new one
+                    was_t = any(_pt_seg_dist(x, y, c.start_x, c.start_y,
+                                             c.end_x, c.end_y) <= 1e-4 for c in gone)
+                    if (any(_pt_seg_dist(x, y, n.start_x, n.start_y, n.end_x, n.end_y)
+                            <= 1e-4 for n in new) if was_t
+                            else covered(x, y, o.width / 2.0)):
+                        continue
+                    touched = True
+            for v in vias:
+                vr = (getattr(v, 'size', 0) or 0) / 2.0
+                if any(_pt_seg_dist(v.x, v.y, c.start_x, c.start_y, c.end_x, c.end_y)
+                       <= c.width / 2.0 + vr for c in gone) and not covered(v.x, v.y, vr):
+                    touched = True
+            if touched:
+                if stats is not None:
+                    stats['copper_hangs_on_it'] = stats.get('copper_hangs_on_it', 0) + 1
+                continue
+            # a new piece an existing track already lays (another exit along
+            # the same axis) is not laid twice
+            kept_segs = [x for x in segs if id(x) not in gone_ids]
+            new = [n for n in new if not any(
+                o.layer == n.layer and o.width >= n.width - 1e-6
+                and _pt_seg_dist(n.start_x, n.start_y, o.start_x, o.start_y,
+                                 o.end_x, o.end_y) <= 1e-4
+                and _pt_seg_dist(n.end_x, n.end_y, o.start_x, o.start_y,
+                                 o.end_x, o.end_y) <= 1e-4 for o in kept_segs)]
+            trial = kept_segs + new
+            if _soft_joint_pairs(trial, vias, pads) - _soft_joint_pairs(
+                    segs, vias, pads):
+                if stats is not None:
+                    stats['soft_joint'] = stats.get('soft_joint', 0) + 1
+                continue
+            if _kicad_dangling_count(trial, vias, pads, copper) > \
+                    _kicad_dangling_count(segs, vias, pads, copper):
+                if stats is not None:
+                    stats['kicad_dangling'] = stats.get('kicad_dangling', 0) + 1
+                continue
+            if _shallow_entry_keys(trial, vias, pads) - _shallow_entry_keys(
+                    segs, vias, pads):
+                if stats is not None:
+                    stats['leaves_shallow'] = stats.get('leaves_shallow', 0) + 1
+                continue
+            before = check_net_connectivity(net_id, segs, vias, pads, [])
+            after = check_net_connectivity(net_id, trial, vias, pads, [])
+            if (len(after.get('disconnected_pads') or [])
+                    > len(before.get('disconnected_pads') or [])
+                    or (after.get('num_components') or 1)
+                    > (before.get('num_components') or 1)):
+                if stats is not None:
+                    stats['would_disconnect'] = stats.get('would_disconnect', 0) + 1
+                continue
+            res = None
+            for c in gone:
+                if id(c) in routed:
+                    removed_ids.add(id(c))
+                    res = res or routed[id(c)]
+                else:
+                    strip.append(c)
+            if res is None:
+                res = {'new_segments': [], 'new_vias': [], 'cleanup': 'pad_exit'}
+                results.append(res)
+            res['new_segments'] = list(res.get('new_segments') or []) + new
+            added.extend(new)
+            pcb_data.segments = [x for x in pcb_data.segments
+                                 if id(x) not in gone_ids] + new
+            segs = trial
+            rebuilt += 1
+            if hasattr(pcb_data, '_foreign_seg_arr_cache'):
+                pcb_data._foreign_seg_arr_cache = None
+    if removed_ids:
+        for r in results:
+            if r.get('new_segments'):
+                r['new_segments'] = [x for x in r['new_segments']
+                                     if id(x) not in removed_ids]
+    if added:
+        try:
+            delattr(pcb_data, '_plane_fill_models')
+        except AttributeError:
+            pass
+        try:
+            import plane_fill_model as _pfm
+            _pfm._MODELS_BY_ZONE_ID.clear()
+        except Exception:
+            pass
+    return rebuilt, strip, added
+
+
+def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
+                             clearance: float = 0.1,
+                             keep_input_copper: bool = False,
+                             net_clearances=None,
+                             board_edge_clearance: float = 0.0,
+                             config=None,
+                             skip_net_ids=None,
+                             dry_run: bool = False,
+                             min_gain: float = 0.01,
+                             max_net_segs: int = 400,
+                             max_chain_segs: int = 100):
+    """Collapse grid-A* staircase micro-jogs into octolinear shortcuts (#536).
+
+    Walks each net's simple track chains (split at junctions, same-net vias,
+    pad landings, width changes, layer changes) and greedily replaces the
+    farthest reachable sub-path with an octolinear connector -- the direct
+    segment when the span is already on a 45-degree bearing, else a single
+    diagonal+axis elbow (_octolinear_bends). Output stays STRICTLY octolinear;
+    no arbitrary-angle chords. A span is only replaced when the connector
+
+      * keeps clearance from all foreign copper (pads / segments / vias),
+        NPTH holes at their higher floor, and the board edge -- with a
+        .kicad_dru layer rule replacing the base clearance on ruled layers
+        (#498, which the older graze passes never honored) and a .kicad_dru
+        TRACK rule raising the seg-vs-seg term on top of it (#735);
+      * is shorter than the copper it replaces by at least min_gain, or
+        (#958, in a second greedy phase over the shortened chain, which
+        also takes the strictly shorter connectors the first phase's new
+        bends expose) equal in length to floating-point roundoff with
+        strictly fewer emitted legs -- a jog that is already a shortest
+        octolinear path loses its needless corner at the same length;
+        min_gain is never an allowance to get longer;
+      * strands no same-net copper: mid-span via taps, pad touches, and
+        T/X-touching sibling tracks hold their span un-collapsed unless the
+        touch sits at a kept endpoint.
+
+    Per net, the result is committed only if check_net_connectivity does not
+    grade it worse than the original. The guard runs WITHOUT pour credit:
+    endpoints are preserved by construction, so the track/via/pad graph
+    alone must not degrade -- raw zone-outline credit would mask a real
+    track loss behind fill the refill may not produce.
+
+    POURS the moving copper carves are deliberately not consulted -- the
+    same pour-blind convention routing follows; the plane finalize /
+    kicad-oracle recheck downstream owns that damage (see the comment at
+    the clears() block). dry_run=True measures without mutating anything --
+    the #536 "is it worth it on OUR output" instrument. Soft costs are
+    deliberately not consulted (the router's corridors are a routing-time
+    concept); callers gate this to the final chain step -- see
+    cleanup_pipeline.
+
+    Returns (changed_count, nets_changed, original_segments_to_remove,
+    added_segments, stats)."""
+    from collections import defaultdict
+    from check_connected import check_net_connectivity
+    from geometry_utils import segment_to_segment_closest_points, segments_intersect
+    from single_ended_routing import (_seg_foreign_pad_dist, _seg_foreign_seg_dist,
+                                      _seg_foreign_via_dist, _seg_foreign_hole_dist)
+    from routing_defaults import NPTH_TO_TRACK_CLEARANCE
+    from check_drc import (board_edge_geometry, _point_on_board,
+                           _segment_to_rings_distance, point_to_pad_distance,
+                           npth_slot_capsules, segment_to_npth_slots_distance)
+    from connectivity import COINCIDENCE_TOL
+    from obstacle_map import resolve_hole_clearance
+
+    _gates = _copper_clearance_gates(pcb_data, clearance, net_clearances,
+                                     board_edge_clearance, config)
+    npth_clr = _gates.npth_clr
+    eff_clr = _gates.eff_clr
+    pair_base = _gates.pair_base
+    _trk_clr = _gates._trk_clr
+    edge_rings = _gates.edge_rings
+    edge_outer = _gates.edge_outer
+    edge_cutouts = _gates.edge_cutouts
+    board_bounds = _gates.board_bounds
+    _edge_clr = _gates._edge_clr
+    _slot_caps = _gates._slot_caps
+    edge_clears = _gates.edge_clears
+    _keepout_areas = _gates._keepout_areas
+    _ko_on_layer = _gates._ko_on_layer
+    keepout_clears = _gates.keepout_clears
+    clears = _gates.clears
+    # FINE-PITCH PAD FIELDS, from the board's OWN helpers -- `detect_bga_pitch`
+    # and `get_footprint_bounds`, the two `auto_detect_bga_exclusion_zones` is
+    # itself built from. A dense field's inter-pad space is escape corridor: the
+    # only way out for a pad that still needs one.
+    #
+    # Keyed on PITCH, not on the package name. `find_components_by_type('BGA')`
+    # is the obvious reuse and it is the wrong set here: ft2232h_jtag's U4 --
+    # the part whose corridor this fix exists for -- is
+    # `Package_QFP:LQFP-64_10x10mm_P0.5mm`, so `detect_package_type` calls it
+    # QFP and the BGA filter returns nothing. (Its log line "BGA Grid Analysis
+    # for U4" is the FANOUT's grid analyser, which runs on any candidate and
+    # finds a pitch in a QFP's peripheral rows.) What makes the space a corridor
+    # is the pitch, not the ball/lead distinction, so a 0.5mm QFP and a 0.65mm
+    # BGA both qualify and ottercast's 0.2mm QFN does too.
+    #
+    # A static REGION deliberately, not "pads that currently lack copper": that
+    # set changes on every route pass, so a guard keyed on it fires differently
+    # each lap. Measured -- an earlier cut keyed on waiting pads and
+    # destabilised ottercast_audio's five-pass chain (2 -> 4 nets incomplete)
+    # while fixing ft2232h_jtag. A package does not move between passes.
+    _dense_boxes = []
+    try:
+        from kicad_parser import detect_bga_pitch, get_footprint_bounds
+        for _fp in pcb_data.footprints.values():
+            if not pad_field_is_corridor(
+                    _fp, getattr(config, 'track_width', None) or 0.15,
+                    clearance):
+                continue
+            _dense_boxes.append(get_footprint_bounds(_fp, margin=0.0))
+    except Exception:
+        _dense_boxes = []
+
+    def _in_dense_field(x1, y1, x2, y2):
+        for (bx0, by0, bx1, by1) in _dense_boxes:
+            if (min(x1, x2) <= bx1 and max(x1, x2) >= bx0
+                    and min(y1, y2) <= by1 and max(y1, y2) >= by0):
+                return True
+        return False
 
     def vk(x, y):
         return (round(x, 3), round(y, 3))
