@@ -7678,6 +7678,11 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                         hands_off_nets=sorted(_hands_off9(pcb_data)),
                         power_nets=power_nets,
                         power_nets_widths=power_nets_widths,
+                        # The run's per-net widths (net class / .kicad_dru /
+                        # impedance): under --escalation off/board the region
+                        # joins keep each plane net at its own width / floor.
+                        net_track_widths=dict(config.net_track_widths or {}),
+                        net_layer_widths=dict(config.net_layer_widths or {}),
                         # #658: the chain's layer economics reach the
                         # finalize legs (previously uniform 1.0 -- welds
                         # traveled priced-up layers for free).
@@ -7771,6 +7776,11 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                         hands_off_nets=sorted(_hands_off9(pcb_data)),
                         power_nets=power_nets,
                         power_nets_widths=power_nets_widths,
+                        # The run's per-net widths (net class / .kicad_dru /
+                        # impedance): under --escalation off/board the region
+                        # joins keep each plane net at its own width / floor.
+                        net_track_widths=dict(config.net_track_widths or {}),
+                        net_layer_widths=dict(config.net_layer_widths or {}),
                         # #658: same layer economics as the GUI leg above.
                         # 34d2e448 forwarded layer_costs to the _gui9 branch
                         # ONLY, so on the CLI -- every replay, stress and
