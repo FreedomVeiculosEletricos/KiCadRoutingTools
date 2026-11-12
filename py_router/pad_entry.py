@@ -22,13 +22,31 @@ full-width path into the pad without moving routed copper. Detection
 
 Pads: rect, roundrect, oval and circle, any rotation. Custom-polygon pads are
 not graded (no closed-form outline), as for the #416 web test.
+
+On an SMD pad the EXIT is graded too, by Altium's SMT rules
+(``grade_pad_exit``):
+
+  * SMD Entry -- the track crosses the pad outline perpendicular to an edge,
+    its centreline on the edge's straight part and its copper inside the
+    edge's span (to SMD_ENTRY_OVERHANG_MM): never through a corner, never at
+    an angle. The ends (short edges) are always allowed, the sides when
+    SMD_ENTRY_SIDE (as Altium, a pad whose side is not > 2x its end has no
+    distinct side). A round pad is met radially;
+  * SMD To Corner -- the track runs straight from the outline for at least
+    ``exit_distance(width)`` before its first bend, so no bend's copper sits
+    on the pad edge.
+
+pcb_modification.rebuild_pad_exits rebuilds an exit that fails either as
+Altium's router lays one: from the pad centre, straight out through an
+allowed edge to the exit distance, then back onto the route.
 """
 from __future__ import annotations
 
 import math
 from typing import Iterable, Optional, Tuple
 
-from routing_defaults import PAD_ENTRY_MARGIN_MM
+from routing_defaults import (PAD_ENTRY_MARGIN_MM, SMD_TO_CORNER_MM, SMD_ENTRY_SIDE,
+                              SMD_ENTRY_OVERHANG_MM)
 from routing_utils import _to_pad_frame
 
 #: Depth tolerance (mm): a track run exactly on a narrow pad's medial axis
@@ -156,3 +174,180 @@ def on_via(vias: Iterable, x, y) -> bool:
     """Does (x, y) lie in a via barrel (a via terminal, not a pad entry)?"""
     return any(math.hypot(x - v.x, y - v.y) <= (getattr(v, 'size', 0.0) or 0.0) / 2.0 + 0.01
                for v in vias)
+
+
+# ---------------------------------------------------------------------------
+# SMD exit (Altium SMD Entry / SMD To Corner)
+# ---------------------------------------------------------------------------
+
+#: Direction tolerance of a perpendicular exit (sine of 1 degree).
+ANGLE_TOL = math.sin(math.radians(1.0))
+
+
+def is_smd(pad) -> bool:
+    """An SMD pad: no drill (Altium's SMT rules bind single-layer pads only)."""
+    return not (getattr(pad, 'drill', 0) or 0) and getattr(
+        pad, 'pad_type', 'smd') not in ('thru_hole', 'np_thru_hole')
+
+
+def smd_gradable(pad, layer: str) -> bool:
+    return is_smd(pad) and gradable_pad(pad, layer)
+
+
+def exit_distance(width: float) -> float:
+    """SMD To Corner: the straight run a ``width`` track keeps from the pad
+    outline to its first bend -- SMD_TO_CORNER_MM, and never less than its
+    half-width (a bend closer than that puts its copper on the pad edge)."""
+    return max(SMD_TO_CORNER_MM, width / 2.0)
+
+
+def _round_pad(pad) -> bool:
+    return (getattr(pad, 'shape', None) in ('circle', 'oval')
+            and abs(pad.size_x - pad.size_y) < 1e-9)
+
+
+def _rot(pad):
+    rr = math.radians(getattr(pad, 'rect_rotation', 0.0) or 0.0)
+    return math.cos(rr), math.sin(rr)
+
+
+def to_local_dir(pad, dx, dy):
+    c, s = _rot(pad)
+    return dx * c + dy * s, -dx * s + dy * c
+
+
+def to_board_dir(pad, lx, ly):
+    c, s = _rot(pad)
+    return lx * c - ly * s, lx * s + ly * c
+
+
+def allowed_exits(pad, allow_side: bool = SMD_ENTRY_SIDE):
+    """The pad-frame unit normals a track may leave ``pad`` along, ends first.
+    The ends are the short edges (all four on a square pad); the sides are
+    allowed with ``allow_side`` or when they are not > 2x the ends."""
+    hx, hy = pad.size_x / 2.0, pad.size_y / 2.0
+    xs = [(1.0, 0.0), (-1.0, 0.0)]          # normals of the x-edges (length 2hy)
+    ys = [(0.0, 1.0), (0.0, -1.0)]          # normals of the y-edges (length 2hx)
+    if abs(hx - hy) < 1e-9:
+        return xs + ys
+    ends, sides = (xs, ys) if hx > hy else (ys, xs)
+    long_, short_ = max(hx, hy), min(hx, hy)
+    if allow_side or long_ <= 2.0 * short_:
+        return ends + sides
+    return ends
+
+
+def _collinear(ax, ay, bx, by) -> bool:
+    la, lb = math.hypot(ax, ay), math.hypot(bx, by)
+    if la < 1e-9 or lb < 1e-9:
+        return True
+    return (abs(ax * by - ay * bx) <= ANGLE_TOL * la * lb
+            and ax * bx + ay * by > 0)
+
+
+def terminal_chain(seg, ex, ey, adj, key, vias=(), max_len: float = 8.0):
+    """The track run from the free end (ex, ey) of ``seg`` outward, through
+    plain degree-2 vertices of the same layer and width: ``(pts, segs,
+    reason)`` with ``pts`` from the end outward. It stops at a junction, a
+    via, a width change or after ``max_len`` mm (``reason``: 'junction',
+    'via', 'width', 'length', 'end'). ``adj`` maps ``key(x, y)`` to the
+    same-net same-layer segments with an end there."""
+    pts = [(ex, ey)]
+    segs = []
+    s = seg
+    x, y = ex, ey
+    total = 0.0
+    while True:
+        segs.append(s)
+        if key(s.start_x, s.start_y) == key(x, y):
+            nx, ny = s.end_x, s.end_y
+        else:
+            nx, ny = s.start_x, s.start_y
+        total += math.hypot(nx - x, ny - y)
+        pts.append((nx, ny))
+        x, y = nx, ny
+        others = [o for o in adj.get(key(x, y), ()) if o is not s]
+        if not others:
+            return pts, segs, 'end'
+        if len(others) > 1:
+            return pts, segs, 'junction'
+        if on_via(vias, x, y):
+            return pts, segs, 'via'
+        o = others[0]
+        if abs(o.width - s.width) > 1e-6:
+            return pts, segs, 'width'
+        if total >= max_len or any(o is t for t in segs):
+            return pts, segs, 'length'
+        s = o
+
+
+def exit_crossing(pad, pts):
+    """Where a run (``pts`` from its end inside the pad outward) leaves the
+    pad: ``(k, (x, y))`` with the crossing on segment pts[k]->pts[k+1]; None
+    when the end is not inside the pad or the run never leaves it."""
+    if pad_depth(pad, *pts[0]) <= 0:
+        return None
+    for k in range(len(pts) - 1):
+        if pad_depth(pad, *pts[k]) > 0 and pad_depth(pad, *pts[k + 1]) <= 0:
+            (ax, ay), (bx, by) = pts[k], pts[k + 1]
+            lo, hi = 0.0, 1.0
+            for _ in range(40):
+                mid = (lo + hi) / 2.0
+                if pad_depth(pad, ax + (bx - ax) * mid, ay + (by - ay) * mid) > 0:
+                    lo = mid
+                else:
+                    hi = mid
+            return k, (ax + (bx - ax) * hi, ay + (by - ay) * hi)
+    return None
+
+
+def grade_pad_exit(pad, pts, width, allow_side: bool = SMD_ENTRY_SIDE):
+    """Altium's SMD Entry and SMD To Corner on a track run entering an SMD
+    ``pad``: ``pts`` from the end inside the pad outward (terminal_chain).
+    Returns the set of rules it fails, of {'smd-entry', 'smd-to-corner'}; empty
+    when the end is not inside the pad (a shallow entry, graded apart) or the
+    run never leaves it."""
+    out = set()
+    cross = exit_crossing(pad, pts)
+    if cross is None:
+        return out
+    k, (kx, ky) = cross
+    (ax, ay), (bx, by) = pts[k], pts[k + 1]
+    vx, vy = bx - ax, by - ay
+    lvx, lvy = to_local_dir(pad, vx, vy)
+    lkx, lky = _to_pad_frame(kx, ky, pad)
+    lv = math.hypot(lvx, lvy)
+    if _round_pad(pad):
+        # radial: the run's line passes through the centre
+        if abs(lkx * lvy - lky * lvx) > 0.01 * lv or lkx * lvx + lky * lvy < 0:
+            out.add('smd-entry')
+    else:
+        hx, hy = pad.size_x / 2.0, pad.size_y / 2.0
+        rr = _corner_radius(pad)
+        ix, iy, tol = hx - rr, hy - rr, 1e-3
+        n = None
+        if abs(lky) <= iy + tol and abs(lkx) >= ix - tol:
+            n, t, span = (math.copysign(1.0, lkx), 0.0), lky, hy
+        elif abs(lkx) <= ix + tol and abs(lky) >= iy - tol:
+            n, t, span = (0.0, math.copysign(1.0, lky)), lkx, hx
+        r = width / 2.0
+        if (n is None or n not in allowed_exits(pad, allow_side)
+                or abs(lvx * n[1] - lvy * n[0]) > ANGLE_TOL * lv
+                or lvx * n[0] + lvy * n[1] <= 0
+                or abs(t) > span - rr + tol
+                or not (abs(t) + r <= span + SMD_ENTRY_OVERHANG_MM + tol
+                        or (r >= span - tol
+                            and abs(t) <= SMD_ENTRY_OVERHANG_MM + tol))):
+            out.add('smd-entry')
+    # straight run from the outline to the first bend
+    run = math.hypot(bx - kx, by - ky)
+    j = k + 1
+    while j < len(pts) - 1:
+        (px, py), (qx, qy), (sx, sy) = pts[j - 1], pts[j], pts[j + 1]
+        if not _collinear(qx - px, qy - py, sx - qx, sy - qy):
+            if run < exit_distance(width) - 1e-3:
+                out.add('smd-to-corner')
+            break
+        run += math.hypot(sx - qx, sy - qy)
+        j += 1
+    return out
