@@ -110,17 +110,22 @@ def test_full_overlap_untouched():
     print("PASS full overlap -> untouched")
 
 
-def test_perpendicular_edge_entry_untouched():
+def test_perpendicular_edge_entry_is_a_shallow_pad_entry():
     """A PERPENDICULAR crossing through an edge centre (cap far from any corner)
-    has a full-width web even though the cap centre sits just outside the edge.
-    The cheap pre-filter trips on it, but the exact erosion clears it, so NO
-    connector is added -- the false-positive churn is suppressed."""
+    has a full-width web even though the cap centre sits just outside the edge,
+    so it is NOT a #416 neck (the exact erosion clears it). It is still a
+    shallow pad entry (pad_entry.py): no copper margin inside the pad. The
+    pad-entry connector to the pad centre firms it, not a #416 web connector."""
     E = (10.0, 10.52)  # above the top edge, centred in x -> wide overlap band
     pcb = parse_kicad_pcb(_write([REF_SEG, ((10.0, 11.2), E, TERM_W, 1)]))
     assert terminal_web_neck_exact(pcb, 1, "F.Cu", E[0], E[1], FLOOR) is False
-    n = close_soft_joints([], pcb, {1}, _cfg())
-    assert n == 0, f"perpendicular edge entry must not be touched, got {n}"
-    print("PASS perpendicular edge entry -> untouched (no false positive)")
+    results = []
+    n = close_soft_joints(results, pcb, {1}, _cfg())
+    assert n == 1 and results[-1]['cleanup'] == 'pad_entry_connector', \
+        f"expected one pad-entry connector, got {n} {results}"
+    c = results[-1]['new_segments'][0]
+    assert (c.end_x, c.end_y) == (10.0, 10.0), "connector must reach the pad centre"
+    print("PASS perpendicular edge entry -> pad-entry connector (not a #416 neck)")
 
 
 def test_connector_refused_when_it_would_graze_foreign():
@@ -141,6 +146,6 @@ def test_connector_refused_when_it_would_graze_foreign():
 if __name__ == "__main__":
     test_corner_graze_gets_connector()
     test_full_overlap_untouched()
-    test_perpendicular_edge_entry_untouched()
+    test_perpendicular_edge_entry_is_a_shallow_pad_entry()
     test_connector_refused_when_it_would_graze_foreign()
     print("\nALL PASS")

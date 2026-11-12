@@ -571,7 +571,8 @@ def length_graded_net_ids(pcb_data: PCBData, config) -> set:
 
 
 def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
-                      clearance: float = None) -> int:
+                      clearance: float = None,
+                      pad_entries_only: bool = False) -> int:
     """Bridge same-net SOFT JOINTS with a TINY coincident segment (#soft-joint).
 
     A soft joint is a dangling free end (a segment terminus that is not a shared
@@ -586,6 +587,9 @@ def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
     soft-joint definition/tolerance so detection and repair agree. The bridge is
     only added when it clears every OTHER net's copper (it lives inside the two
     overlapping caps, so it normally does). Returns the number of bridges added.
+
+    ``pad_entries_only`` runs only the shallow pad-entry connector (route.py's
+    late pass over copper laid after the cleanup).
     """
     import math
     from collections import defaultdict
@@ -728,7 +732,7 @@ def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
                      layer=layer, net_id=nid)]))
 
     new_conns = []
-    for (net_id, layer), ends in dangles.items():
+    for (net_id, layer), ends in (() if pad_entries_only else dangles.items()):
         used = set()
         for i in range(len(ends)):
             if i in used:
@@ -769,7 +773,7 @@ def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
     # Some plane-flow callers pass a minimal namespace config with no
     # track_width (only clearance); fall back to the stock default.
     _vp_tw = getattr(config, 'track_width', 0) or 0.127
-    for vp_net, vobjs in vias_by_net.items():
+    for vp_net, vobjs in (() if pad_entries_only else vias_by_net.items()):
         if scope_net_ids is not None and vp_net not in scope_net_ids:
             continue
         # #1279: neither end of the stub may be sense copper.
@@ -823,6 +827,49 @@ def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
                     end_x=p.global_x, end_y=p.global_y,
                     width=w2, layer=vp_layer, net_id=vp_net))
 
+    # Shallow pad entry (pad_entry.py): a degree-1 free end that touches a
+    # same-net pad without its own width (plus PAD_ENTRY_MARGIN_MM) inside it
+    # is joined through less copper than the track -- connected and DRC-clean,
+    # but narrowed exactly at the joint. Firm it the soft-joint way (add
+    # copper, never move the routed track): a connector at the track's width
+    # from the end to the pad centre, where Altium starts a pad exit and Eagle
+    # requires a wire to end; the shortest connector meeting the depth when
+    # the centre's is refused. Same clears() gate as the bridges above; it
+    # lands on the net's OWN pad, so it cannot short or disconnect anything.
+    # An end it cannot firm is left for #416 below (a narrower web connector)
+    # and for check_weird's shallow-pad-entry report.
+    from pad_entry import shallow_pad_entry, entry_targets, on_via, on_other_track
+    entry_conns = []
+    entered = set()
+    _segs_by_nl = defaultdict(list)
+    for _s in pcb_data.segments:
+        _segs_by_nl[(_s.net_id, _s.layer)].append(_s)
+    for s in list(pcb_data.segments):
+        if scope_net_ids is not None and s.net_id not in scope_net_ids:
+            continue
+        if getattr(s, 'graphic', False) or _sense_copper(s):
+            continue  # art (#337); sense member copper (#1279)
+        for (ex, ey, nx, ny) in ((s.start_x, s.start_y, s.end_x, s.end_y),
+                                 (s.end_x, s.end_y, s.start_x, s.start_y)):
+            if ep_count[(s.net_id, s.layer, rk(ex, ey))] != 1:
+                continue  # not a free end
+            if on_via(vias_by_net.get(s.net_id, []), ex, ey):
+                continue  # a via terminal, not a pad entry
+            if on_other_track(_segs_by_nl[(s.net_id, s.layer)], s, ex, ey):
+                continue  # a T into copper that carries on
+            pads = [p for p in pcb_data.pads_by_net.get(s.net_id, [])
+                    if not _sense_copper(p)]
+            hit = shallow_pad_entry(pads, s.layer, ex, ey, nx, ny, s.width)
+            if hit is None:
+                continue
+            for bx, by in entry_targets(hit[0], ex, ey, s.width):
+                if clears(s.net_id, ex, ey, bx, by, s.layer, s.width):
+                    entry_conns.append(Segment(start_x=ex, start_y=ey,
+                                               end_x=bx, end_y=by, width=s.width,
+                                               layer=s.layer, net_id=s.net_id))
+                    entered.add((s.net_id, s.layer, rk(ex, ey)))
+                    break
+
     # Terminal corner-graze web (issue #416): a degree-1 free end whose cap
     # overlaps a same-net pad only near a CORNER joins through a sub-floor copper
     # web -- connected and DRC-clean, but a fab hazard. Firm it the soft-joint
@@ -831,12 +878,13 @@ def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
     # overlap with the pad is a full floor-width band -- a parallel path that
     # lifts the joint web to the floor (see the header above terminal_pad_web_
     # shortfall). Same clears() gate as the bridges above; it lands on the net's
-    # OWN pad, so it cannot short or disconnect anything.
+    # OWN pad, so it cannot short or disconnect anything. An end the pad-entry
+    # connector above already firmed is skipped.
     from routing_utils import _to_pad_frame
     web_conns = []
     F416 = _board_min_track_width(pcb_data, scope_net_ids, config)
     e416 = F416 / 2.0
-    for s in list(pcb_data.segments):
+    for s in ([] if pad_entries_only else list(pcb_data.segments)):
         if scope_net_ids is not None and s.net_id not in scope_net_ids:
             continue
         if getattr(s, 'graphic', False) or _sense_copper(s):
@@ -849,6 +897,8 @@ def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
                                  (s.end_x, s.end_y, s.start_x, s.start_y)):
             if ep_count[(s.net_id, s.layer, rk(ex, ey))] != 1:
                 continue  # not a free end
+            if (s.net_id, s.layer, rk(ex, ey)) in entered:
+                continue  # firmed by its pad-entry connector
             if any(math.hypot(ex - vx, ey - vy) <= vr + 0.01
                    for vx, vy, vr in via_by_net.get(s.net_id, [])):
                 continue  # anchored on a same-net via: a via terminal, not this
@@ -930,7 +980,8 @@ def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
                and (scope_net_ids is None or v.net_id in scope_net_ids)
                and not _sense_copper(v)]
     done_ends = set()
-    for s, end, v, d in off_centre_via_ends(oc_segs, oc_vias, _copper or None):
+    for s, end, v, d in ([] if pad_entries_only else
+                         off_centre_via_ends(oc_segs, oc_vias, _copper or None)):
         ex, ey = (s.start_x, s.start_y) if end == 0 else (s.end_x, s.end_y)
         ox, oy = (s.end_x, s.end_y) if end == 0 else (s.start_x, s.start_y)
         key = (s.net_id, s.layer, rk(ex, ey))
@@ -962,14 +1013,17 @@ def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
         centre_conns.append(Segment(start_x=bx, start_y=by, end_x=v.x, end_y=v.y,
                                     width=w, layer=s.layer, net_id=s.net_id))
 
-    if new_conns or web_conns or via_pad_conns or centre_conns:
-        for c in new_conns + web_conns + via_pad_conns + centre_conns:
+    if new_conns or entry_conns or web_conns or via_pad_conns or centre_conns:
+        for c in new_conns + entry_conns + web_conns + via_pad_conns + centre_conns:
             pcb_data.segments.append(c)
         # Tagged so accounting/summary code can tell this cleanup copper from a
         # net's routed result (it has no net-level identity of its own).
         if new_conns:
             results.append({'new_segments': new_conns, 'new_vias': [],
                             'cleanup': 'soft_joint_bridge'})
+        if entry_conns:
+            results.append({'new_segments': entry_conns, 'new_vias': [],
+                            'cleanup': 'pad_entry_connector'})
         if web_conns:
             results.append({'new_segments': web_conns, 'new_vias': [],
                             'cleanup': 'terminal_web_connector'})
@@ -979,7 +1033,8 @@ def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
         if centre_conns:
             results.append({'new_segments': centre_conns, 'new_vias': [],
                             'cleanup': 'via_centre_bridge'})
-    return len(new_conns) + len(web_conns) + len(via_pad_conns) + len(centre_conns)
+    return (len(new_conns) + len(entry_conns) + len(web_conns)
+            + len(via_pad_conns) + len(centre_conns))
 
 
 # ---------------------------------------------------------------------------
@@ -1893,7 +1948,54 @@ def _restore_soft_joint_bridges(kept, removed, vias, pads):
                 break
         if not restored:
             break  # gap not attributable to these removals; leave it
+    # Same guard for a SHALLOW PAD ENTRY (pad_entry.py): removing the
+    # pad-entry connector close_soft_joints lays (or any copper that carried
+    # an end into its pad) re-exposes a track end joined to its pad through
+    # less than its own width. The overlap model calls that copper redundant;
+    # put it back, as StrictRemovalModel refuses it.
+    baseline = _shallow_entry_keys(list(kept) + list(removed), vias, pads)
+    for _ in range(len(removed)):
+        hot = _shallow_entry_keys(kept, vias, pads) - baseline
+        if not hot:
+            break
+        back = [r for r in removed
+                if (r.layer, _rk3(r.start_x, r.start_y)) in hot
+                or (r.layer, _rk3(r.end_x, r.end_y)) in hot]
+        if not back:
+            break
+        kept.append(back[0])
+        removed.remove(back[0])
     return kept, removed
+
+
+def _shallow_entry_keys(segs, vias, pads):
+    """(layer, 1um point) of every degree-1 track end that enters a pad
+    shallow (pad_entry.shallow_pad_entry): the soft-joint guard's twin."""
+    from collections import defaultdict
+    from pad_entry import shallow_pad_entry, on_via, on_other_track
+    if not pads:
+        return set()
+    deg = defaultdict(int)
+    for s in segs:
+        deg[(s.layer, _rk3(s.start_x, s.start_y))] += 1
+        deg[(s.layer, _rk3(s.end_x, s.end_y))] += 1
+    out = set()
+    for s in segs:
+        if getattr(s, 'graphic', False) or _sense_copper(s):
+            continue
+        for (ex, ey, nx, ny) in ((s.start_x, s.start_y, s.end_x, s.end_y),
+                                 (s.end_x, s.end_y, s.start_x, s.start_y)):
+            key = (s.layer, _rk3(ex, ey))
+            if deg[key] != 1 or on_via(vias, ex, ey):
+                continue
+            if on_other_track(segs, s, ex, ey):
+                continue
+            net_pads = [p for p in pads if p.net_id == s.net_id
+                        and not _sense_copper(p)]
+            if shallow_pad_entry(net_pads, s.layer, ex, ey, nx, ny,
+                                 s.width) is not None:
+                out.add(key)
+    return out
 
 
 def sweep_dead_ends(results, pcb_data: PCBData, scope_net_ids=None,
@@ -2333,7 +2435,7 @@ STRICT_REMOVAL_MAX_SEGS = 500
 #: connectivity by construction -- the via already holds the end -- and is
 #: there for KiCad's length measure, so the collapse never takes it back.
 CLOSE_SOFT_JOINT_KINDS = frozenset({'soft_joint_bridge', 'terminal_web_connector',
-                                    'via_centre_bridge'})
+                                    'via_centre_bridge', 'pad_entry_connector'})
 
 
 def _rk_node(layer, x, y):
@@ -2665,6 +2767,31 @@ class StrictRemovalModel:
         return terminal_web_neck_exact(view, self.net_id, s.layer, ex, ey,
                                        self._web_floor) is not False
 
+    def _shallow_terminal(self, node, E):
+        """check_weird's shallow-pad-entry test (pad_entry.shallow_pad_entry)
+        on the one end left at ``node`` once E is gone: an end touching a
+        same-net pad without its own width inside it. The model refuses to
+        CREATE one -- which keeps it off the pad-entry connectors
+        close_soft_joints lays to cure exactly this."""
+        rest = [i for i in self._node_ends[node] if i not in E]
+        if len(rest) != 1:
+            return False
+        i = rest[0]
+        s = self.segs[i]
+        if getattr(s, 'graphic', False) or _sense_copper(s):
+            return False
+        from pad_entry import shallow_pad_entry, on_via, on_other_track
+        if self._seg_nodes[i][0] == node:
+            ex, ey, nx, ny = s.start_x, s.start_y, s.end_x, s.end_y
+        else:
+            ex, ey, nx, ny = s.end_x, s.end_y, s.start_x, s.start_y
+        if on_via(self.vias, ex, ey) or on_other_track(
+                [x for k, x in enumerate(self.segs) if k not in E], s, ex, ey):
+            return False
+        pads = [p for p in self.pads if not _sense_copper(p)]
+        return shallow_pad_entry(pads, s.layer, ex, ey, nx, ny,
+                                 s.width or 0.0) is not None
+
     def _dangle_ok(self, E, D, prev_E, prev_D):
         nodes = set()
         for i in E:
@@ -2686,6 +2813,9 @@ class StrictRemovalModel:
             if self._is_dangle(n, E, D) and not self._is_dangle(n, prev_E, prev_D):
                 return False
             if self._narrow_terminal(n, E) and not self._narrow_terminal(n, prev_E):
+                return False
+            if (self._shallow_terminal(n, E)
+                    and not self._shallow_terminal(n, prev_E)):
                 return False
         # #1161: removed copper narrows a terminal's web wherever it sat in
         # the exact test's window, not only at its own ends -- an in-pad

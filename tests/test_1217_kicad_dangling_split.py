@@ -75,7 +75,9 @@ def repro_board(tmp, tag, copper=True, locked_host=False):
     """The shipped /+3.3V copper around the joint, with a pad at each end."""
     rb = RoutingBoard(w=160, h=120)
     rb.pad('P1', 135.1, 96.4, NET)
-    rb.pad('P2', 140.2, 96.4, NET, sx=0.8, sy=0.325)    # U1.5's place
+    # U1.5's place, centred on B's end: B ending on the pad's edge would be a
+    # shallow pad entry (pad_entry.py), which is not what this test is about.
+    rb.pad('P2', 139.8, 96.4, NET, sx=0.8, sy=0.325)
     rb.pad('P3', 138.1, 98.9, NET)
     base = os.path.join(tmp, f'{tag}_base.kicad_pcb')
     with open(base, 'w', encoding='utf-8') as fh:

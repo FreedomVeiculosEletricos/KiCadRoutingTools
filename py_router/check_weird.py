@@ -72,6 +72,14 @@ Categories:
                      size, so --tolerance never filters it (as for soft-joint:
                      for a web, THINNER is worse, so a size filter would drop
                      the severe findings and keep the marginal ones).
+  shallow-pad-entry  a degree-1 track end that touches a same-net pad
+                     without its own width plus PAD_ENTRY_MARGIN_MM inside it
+                     (the medial axis of a pad narrower than that): joined
+                     through less copper than the track, at the etch
+                     tolerance. Altium starts a pad exit at the pad centre and
+                     Eagle connects a wire only there; close_soft_joints lays
+                     the connector that cures it (pad_entry.py). Always
+                     reported (no size).
   kicad-dangling     a joint segment whose two ends both lie on other
                      same-net TRACKS that hold the other end too (#1217):
                      KiCad counts such an item for one end only, so its DRC
@@ -134,7 +142,7 @@ from pcb_modification import (_point_anchored, _prune_net_cycles, _pt_seg_dist,
 CATEGORIES = ['dangling-end', 'soft-joint', 'redundant-cycle',
               'removable-segment', 'stacked-copper', 'unsupported-via',
               'dangling-via', 'orphan-island', 'narrow-pad-joint',
-              'kicad-dangling', 'off-centre-via-end']
+              'kicad-dangling', 'off-centre-via-end', 'shallow-pad-entry']
 # Reported, but not counted in the headline or the exit code (see the module
 # docstring): check_complete blocks DONE on that exit code.
 ADVISORY_CATEGORIES = frozenset({'off-centre-via-end'})
@@ -1070,6 +1078,52 @@ def _check_terminal_web(pcb_data, net_id, name, net_segs, net_pads, floor,
                     size=None))
 
 
+def _check_shallow_pad_entry(name, net_segs, net_vias, net_pads, findings):
+    """Flag degree-1 track ends that touch a same-net pad without their own
+    width (plus PAD_ENTRY_MARGIN_MM) inside it -- pad_entry.shallow_pad_entry,
+    the predicate close_soft_joints' pad-entry connector repairs. An end
+    already reported as a narrow-pad-joint (the worse, sub-floor case) is not
+    repeated. Read-only; no size (a shallower entry is worse)."""
+    if not net_pads or not net_segs:
+        return
+    from pad_entry import shallow_pad_entry, on_via, on_other_track
+    from pcb_modification import _sense_copper
+    # #1279: sense copper and sense pads are never bridged, so not graded.
+    net_pads = [p for p in net_pads if not _sense_copper(p)]
+
+    def k(layer, x, y):
+        return (layer, round(x, 4), round(y, 4))
+
+    narrow = {k(f['layer'], f['x'], f['y']) for f in findings
+              if f['category'] == 'narrow-pad-joint' and f['net'] == name}
+    deg = {}
+    for s in net_segs:
+        if getattr(s, 'graphic', False):
+            continue
+        for x, y in ((s.start_x, s.start_y), (s.end_x, s.end_y)):
+            deg[k(s.layer, x, y)] = deg.get(k(s.layer, x, y), 0) + 1
+    for s in net_segs:
+        if getattr(s, 'graphic', False):
+            continue
+        for (ex, ey, nx, ny) in ((s.start_x, s.start_y, s.end_x, s.end_y),
+                                 (s.end_x, s.end_y, s.start_x, s.start_y)):
+            key = k(s.layer, ex, ey)
+            if deg.get(key, 0) != 1 or key in narrow or _sense_copper(s):
+                continue
+            if on_via(net_vias, ex, ey) or on_other_track(net_segs, s, ex, ey):
+                continue
+            hit = shallow_pad_entry(net_pads, s.layer, ex, ey, nx, ny, s.width)
+            if hit is None:
+                continue
+            pad, depth, need = hit
+            findings.append(_finding(
+                'shallow-pad-entry', name, s.layer, ex, ey,
+                f"{s.width:.3f}mm track enters pad {pad.component_ref}."
+                f"{pad.pad_number} {depth:.3f}mm deep, needs {need:.3f}mm "
+                f"(its half-width + margin): joined through less copper than "
+                f"the track", size=None))
+
+
 def check_weird(pcb_data: PCBData, net_patterns: Optional[List[str]] = None,
                 thorough: bool = False, quiet: bool = True,
                 tolerance: float = 0.1
@@ -1151,6 +1205,7 @@ def check_weird(pcb_data: PCBData, net_patterns: Optional[List[str]] = None,
                                 net_zones, copper_layers, findings)
         _check_terminal_web(pcb_data, net_id, name, net_segs, net_pads,
                             min_track_w, findings)
+        _check_shallow_pad_entry(name, net_segs, net_vias, net_pads, findings)
 
     if tolerance and tolerance > 0:
         findings = [f for f in findings
@@ -1229,7 +1284,8 @@ def main():
                              'gap, duplicated-copper length, via diameter); '
                              'smaller findings are dropped. Default 0.1; use '
                              '0 to report everything. soft-joint, '
-                             'narrow-pad-joint, kicad-dangling and '
+                             'narrow-pad-joint, shallow-pad-entry, '
+                             'kicad-dangling and '
                              'off-centre-via-end carry no size and are ALWAYS '
                              'reported -- smaller is worse, or KiCad treats '
                              'any amount alike.')

@@ -623,11 +623,19 @@ def run_post_route_cleanup(results, pcb_data, scope_net_ids, config, *,
         counts['soft_joints_bridged'] = 0
     else:
         _prog("soft-joint bridging")
+        _n_res = len(results)
         _bridged = close_soft_joints(results, pcb_data, scope_net_ids, config)
+        _entries = sum(len(r.get('new_segments') or []) for r in results[_n_res:]
+                       if r.get('cleanup') == 'pad_entry_connector')
+        _bridged -= _entries
         counts['soft_joints_bridged'] = _bridged
+        counts['pad_entries_firmed'] = _entries
         if _bridged:
             print(f"{label}Bridged {_bridged} same-net soft joint(s) with a tiny "
                   f"connector")
+        if _entries:
+            print(f"{label}Pad entry: {_entries} track end(s) short of their own "
+                  f"width inside the pad, connected to the pad centre")
 
     # Final strict collapse (#1063). Two passes above ADD the copper
     # check_weird counts as removable, after the collapse has run: octolinear

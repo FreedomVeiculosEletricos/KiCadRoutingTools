@@ -3065,6 +3065,13 @@ category each:
 - `narrow-pad-joint` -- a track end that meets a same-net pad only near a
   corner, through a copper web thinner than the min-track floor (#416, KiCad's
   `connection_width`);
+- `shallow-pad-entry` -- a track end that touches a same-net pad without its
+  own width plus `PAD_ENTRY_MARGIN_MM` (0.05 mm) inside it, or off the medial
+  axis of a pad narrower than that: joined through less copper than the track,
+  with no margin over the fab's etch tolerance. Connectivity and DRC pass it.
+  route.py's cleanup lays a connector from the end to the pad centre (as
+  Altium's router starts a pad exit); what remains is an end that connector
+  could not clear (`pad_entry.py`);
 - `kicad-dangling` -- a joint segment whose ends both lie on other same-net
   tracks, which KiCad's DRC reports as `track_dangling` (#1217);
 - `off-centre-via-end` -- a track end inside a same-net via's copper, on a
@@ -3104,7 +3111,8 @@ Options:
   --tolerance FLOAT     Minimum finding size in mm (dangle/tail length, gap,
                         duplicated-copper length, via diameter); smaller findings are
                         dropped. Default: 0.1; use 0 to report everything.
-                        soft-joint, narrow-pad-joint, kicad-dangling and
+                        soft-joint, narrow-pad-joint, shallow-pad-entry,
+                        kicad-dangling and
                         off-centre-via-end carry no size and are always reported
   --max-print INT       Max findings printed per category (<=0 prints all; default 20)
 ```

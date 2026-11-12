@@ -1565,7 +1565,8 @@ def _merge_staged_oracle_copper(orc, results_data, pcb_data,
 
 
 def _late_soft_joint_bridge984(pcb_data, output_file, return_results,
-                               results_data, write_model, scope_names, config):
+                               results_data, write_model, scope_names, config,
+                               pad_entries_only=False):
     """Bridge the soft joints copper laid AFTER the run's cleanup left (#984).
 
     close_soft_joints lives in run_post_route_cleanup, which runs before the
@@ -1577,6 +1578,10 @@ def _late_soft_joint_bridge984(pcb_data, output_file, return_results,
     the SAME pass over the nets those legs touched, on the board the run
     ships -- the written file on the CLI, the write model on the GUI -- and
     puts its connectors on that board's channel. Returns connectors added.
+
+    ``pad_entries_only``: the pad-entry connector alone (pad_entry.py), over
+    every net the run owns -- plane taps and other late copper land on pads
+    after the cleanup that firms them, on nets no oracle leg touched.
     """
     import copy as _copy
     from pcb_modification import close_soft_joints
@@ -1597,7 +1602,8 @@ def _late_soft_joint_bridge984(pcb_data, output_file, return_results,
         if not scope:
             return 0
         added = []
-        n = close_soft_joints(added, board, scope, config)
+        n = close_soft_joints(added, board, scope, config,
+                              pad_entries_only=pad_entries_only)
         conns = [c for r in added for c in (r.get('new_segments') or [])]
         if not conns:
             return 0
@@ -1619,8 +1625,12 @@ def _late_soft_joint_bridge984(pcb_data, output_file, return_results,
             _c = _c[:lp] + '\n'.join(sexprs) + '\n' + _c[lp:]
             with open(output_file, 'w', encoding='utf-8') as _f:
                 _f.write(_c)
-        print(f"  Soft joints after the oracle (#984): {n} connector(s) on "
-              f"{', '.join(sorted(names))}")
+        if pad_entries_only:
+            print(f"  Pad entry (late): {n} track end(s) connected to the pad "
+                  f"centre")
+        else:
+            print(f"  Soft joints after the oracle (#984): {n} connector(s) on "
+                  f"{', '.join(sorted(names))}")
         return n
     except Exception as _e:                                     # noqa: BLE001
         print(f"  (post-oracle soft-joint bridge skipped: "
@@ -9151,6 +9161,18 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
              if _n not in pcb_data.nets
              or pcb_data.nets[_n].name not in _finished1525},
             keep_input_copper, skip_routing)
+    # Pad entry (pad_entry.py): the finalize's plane taps and the other legs
+    # above land on pads after the in-run cleanup that firms shallow entries,
+    # on nets beyond the oracle's, and the late sweeps above may clear the
+    # copper that refused a connector in-run. Firm them on every net the run
+    # owns, after the last pass that removes copper.
+    if (final_reconcile and not skip_routing and not _ckpt_stop
+            and quick < 2 and not env_knobs.NO_SOFT_JOINT_BRIDGE):
+        _late_soft_joint_bridge984(
+            pcb_data, output_file, return_results,
+            locals().get('results_data'), _gui_write_model,
+            {pcb_data.nets[_n].name for _n in sweep_scope_ids
+             if _n in pcb_data.nets}, config, pad_entries_only=True)
     if _skew_before1798:
         _late_skew1798 = _late_skew_snapshot1798(
             pcb_data, output_file, return_results, locals().get('results_data'),

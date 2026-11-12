@@ -114,10 +114,19 @@ def coupled_gaps(path):
     pcb = quiet(parse_kicad_pcb, path)
     nm = {n.net_id: n.name for n in pcb.nets.values()}
     out, widths = {}, set()
+    centres = {(round(p.global_x, 3), round(p.global_y, 3))
+               for pads in pcb.pads_by_net.values() for p in pads}
+
+    def run(s):
+        # A pad-entry connector (pad_entry.py) ends on its pad's centre: pad
+        # copper, not part of the coupled run.
+        return not ({(round(s.start_x, 3), round(s.start_y, 3)),
+                     (round(s.end_x, 3), round(s.end_y, 3))} & centres)
     for base in ('DPA', 'DPB'):
         ps = [s for s in pcb.segments if nm.get(s.net_id) == base + '_P']
         ns = [s for s in pcb.segments if nm.get(s.net_id) == base + '_N']
         widths |= {round(s.width, 4) for s in ps + ns}
+        ps, ns = [s for s in ps if run(s)], [s for s in ns if run(s)]
         gaps = set()
         for p in ps:
             vp = (p.end_x - p.start_x, p.end_y - p.start_y)

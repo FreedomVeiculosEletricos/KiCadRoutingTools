@@ -213,9 +213,19 @@ def run():
         _joined = _c['num_components'] == 1 and not _c['disconnected_pads']
         check(f"check_connected joins the landing pad ({_label}): expected "
               f"{_want_joined}", _joined is _want_joined)
-        _n = close_soft_joints([], _pcb, None, _cfg())
+        _res = []
+        close_soft_joints(_res, _pcb, None, _cfg())
+        _n = sum(len(r['new_segments']) for r in _res
+                 if r.get('cleanup') != 'pad_entry_connector')
+        _e = sum(len(r['new_segments']) for r in _res
+                 if r.get('cleanup') == 'pad_entry_connector')
         check(f"close_soft_joints writes {0 if _want_joined else 1} bridge "
               f"({_label})", _n == (0 if _want_joined else 1), f"added {_n}")
+        # Ends 0.05 mm short of the pad edge are joined but shallow pad
+        # entries (pad_entry.py): each gets its connector to the pad centre.
+        check(f"close_soft_joints firms {2 if _want_joined else 0} pad "
+              f"entr(ies) ({_label})", _e == (2 if _want_joined else 0),
+              f"added {_e}")
 
     # LAYER guard: crediting a pad by CAP RADIUS without checking the pad
     # actually carries copper on the end's layer buys a new UNDER-report --
