@@ -263,13 +263,24 @@ def apply_copper(board, result_pcb, pcbnew, dry_run=False, order_board=None):
             continue
         made = make_track(item) if kind == 'seg' else make_via(item)
         if uuid and uuid not in uuids:
-            made.SetUuid(pcbnew.KIID(uuid))
+            _set_uuid(made, uuid, pcbnew)
             uuids.add(uuid)
         _append(board, made, pcbnew)
         out['nets'].append((made, made.GetNetCode()))
     print(f"Apply: {len(kept)} unchanged track(s)/via(s) kept, {len(removed)} "
           f"removed, {len(add_segs)} track(s) and {len(add_vias)} via(s) added")
     return out
+
+
+def _set_uuid(item, uuid, pcbnew):
+    """Give a board ITEM the uuid string UUID. KiCad 10's bindings have no
+    EDA_ITEM.SetUuid and expose m_Uuid read-only, but m_Uuid is the item's
+    own KIID, and KIID.Clone copies another uuid into it in place."""
+    kiid = pcbnew.KIID(uuid)
+    if hasattr(item, 'SetUuid'):
+        item.SetUuid(kiid)
+    else:
+        item.m_Uuid.Clone(kiid)
 
 
 def _append(board, item, pcbnew):
@@ -321,7 +332,7 @@ def _move_to_end(board, item, pcbnew, new_uuid=None):
     board.RemoveNative(item)
     item.ClearFlags(pcbnew.STRUCT_DELETED)
     if new_uuid:
-        item.SetUuid(pcbnew.KIID(new_uuid))
+        _set_uuid(item, new_uuid, pcbnew)
     _append(board, item, pcbnew)
     if group is not None and item.GetParentGroup() is None:
         group.AddItem(item)

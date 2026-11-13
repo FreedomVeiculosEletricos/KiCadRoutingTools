@@ -2660,9 +2660,16 @@ class RoutingDialog(wx.Dialog):
             self.progress_bar.SetValue(0)
 
             for i, (name, net_id) in enumerate(uncached_nets):
-                is_connected = self._is_net_connected(net_id)
-                self._connectivity_cache[net_id] = is_connected
+                # wx.Yield below runs pending events, and one of them can run
+                # this check again inside this loop (_deferred_init's refresh,
+                # or a tab's on_complete clicked meanwhile). The nested check
+                # caches what it checks and leaves the gauge with ITS range:
+                # skip the nets it cached, and restore this loop's range, or
+                # SetValue past the nested range fails a GTK wx assertion.
+                if net_id not in self._connectivity_cache:
+                    self._connectivity_cache[net_id] = self._is_net_connected(net_id)
 
+                self.progress_bar.SetRange(len(uncached_nets))
                 self.progress_bar.SetValue(i + 1)
                 self.status_text.SetLabel(f"Checking connectivity... {i + 1}/{len(uncached_nets)}")
                 wx.Yield()
