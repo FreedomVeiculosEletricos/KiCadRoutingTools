@@ -79,13 +79,7 @@ def octolinear(s):
 
 
 def end_pads(ex, ey):
-    """Through-hole end pads: an SMD pad's exit run is pinned by the SMD
-    exit guard (test_smooth_smd_exit_guard), and these cases are about the
-    collapse itself."""
-    pads = [_pad('U1', 10.0, 10.0, 1, '/SIG'), _pad('U2', ex, ey, 1, '/SIG')]
-    for p in pads:
-        p.drill = 0.3
-    return {1: pads}
+    return {1: [_pad('U1', 10.0, 10.0, 1, '/SIG'), _pad('U2', ex, ey, 1, '/SIG')]}
 
 
 def test_staircase_collapses():

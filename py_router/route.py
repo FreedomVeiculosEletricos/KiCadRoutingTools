@@ -2432,7 +2432,6 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                 turn_cost: int = 1000,
                 max_turn_angle: float = defaults.MAX_TURN_ANGLE,
                 acute_turn_cost: int = defaults.ACUTE_TURN_COST,
-                smd_exit_funnel: bool = defaults.SMD_EXIT_FUNNEL,
                 min_corner_angle: float = defaults.MIN_CORNER_ANGLE,
                 direction_preference_cost: int = defaults.DIRECTION_PREFERENCE_COST,
                 bus_enabled: bool = False,
@@ -3359,7 +3358,6 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     config_kwargs['power_tap_neckdown'] = power_tap_neckdown
     config_kwargs['max_turn_angle'] = max_turn_angle
     config_kwargs['acute_turn_cost'] = acute_turn_cost
-    config_kwargs['smd_exit_funnel'] = bool(smd_exit_funnel)
     config_kwargs['min_corner_angle'] = min_corner_angle
     # #1253: the rules the board's design brief declares join the caller's,
     # read here in the engine so the CLI and the GUI both get them with no
@@ -6447,10 +6445,6 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     print("\n" + "=" * 60)
     print("Routing complete")
     print("=" * 60)
-    from single_ended_routing import funnel_summary
-    _fsum = funnel_summary()
-    if _fsum:
-        print(_fsum)
     if single_ended_nets:
         if failed_single or open_single:
             _bad_bits = []
@@ -10519,16 +10513,6 @@ For differential pair routing, use route_diff.py:
                         help="Extra cost per 45 degrees a corner turns past 90 (an acute corner), on "
                              "top of --turn-cost, so the router lays one only where nothing else "
                              f"fits; 0 = off (default: {defaults.ACUTE_TURN_COST})")
-    _fn = parser.add_mutually_exclusive_group()
-    _fn.add_argument("--smd-exit-funnel", dest="smd_exit_funnel", action="store_true",
-                     default=defaults.SMD_EXIT_FUNNEL,
-                     help="Reach an SMD pad only straight out through an allowed edge, running "
-                          "straight to the SMD To Corner distance before the first bend "
-                          "(Altium's SMD Entry / SMD To Corner, laid by the router instead of "
-                          "rebuilt afterwards); signal routes and plane taps. ON by default.")
-    _fn.add_argument("--no-smd-exit-funnel", dest="smd_exit_funnel", action="store_false",
-                     help="Route SMD pad exits freely; the end-of-run pad-exit pass rebuilds "
-                          "the ones that fail.")
     parser.add_argument("--min-corner-angle", type=float, default=defaults.MIN_CORNER_ANGLE,
                         help="Interior angle every same-net corner must keep, in degrees (Altium's "
                              "Acute Angle rule). The end-of-run cleanup cuts sharper corners "
@@ -11295,7 +11279,6 @@ For differential pair routing, use route_diff.py:
                 turn_cost=args.turn_cost,
                 max_turn_angle=args.max_turn_angle,
                 acute_turn_cost=args.acute_turn_cost,
-                smd_exit_funnel=args.smd_exit_funnel,
                 min_corner_angle=args.min_corner_angle,
                 direction_preference_cost=args.direction_preference_cost,
                 bus_enabled=args.bus,

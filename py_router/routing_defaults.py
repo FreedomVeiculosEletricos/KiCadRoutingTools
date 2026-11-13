@@ -96,17 +96,6 @@ PAD_ENTRY_MARGIN_MM = 0.05
 #    edges too (Altium: only on a pad whose side is > 2x its end).
 SMD_TO_CORNER_MM = 0.25
 SMD_ENTRY_SIDE = True
-# The router reaches a terminal SMD pad only through an exit funnel
-# (pad_entry.exit_funnel): straight out of an allowed edge to the SMD To
-# Corner distance, so its exits meet both rules as laid.
-SMD_EXIT_FUNNEL = True
-# What a step off the funnel costs, in vias: a route may still leave a pad
-# off its funnel (through a corner, or bending before the SMD To Corner
-# distance) where the compliant way costs more -- in practice two vias or a
-# long detour. A hard funnel (0) walls a pad in, and the search then reads
-# the pad as boxed and drops a via into it; across a 9-board A/B this soft
-# funnel laid 12 fewer vias than the hard one, at the same exit grades.
-SMD_EXIT_FUNNEL_PENALTY = 0.5
 # How far a straight edge exit's copper may overhang the pad's side: half a
 # 0.05 mm routing grid step, so an exit the grid set a quantum off a fine
 # pin's axis (clear of its neighbours) is an end exit, not a corner one.

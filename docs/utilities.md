@@ -3078,9 +3078,7 @@ category each:
   radially);
 - `smd-to-corner` -- a track bending within `SMD_TO_CORNER_MM` (0.25 mm, and
   never less than its half-width) of an SMD pad's outline (Altium's SMD To
-  Corner). route.py's router lays both by construction where it can (the
-  exit funnels, `--smd-exit-funnel`), its copper-moving cleanup passes keep
-  them, and its cleanup rebuilds the rest from the pad centre, straight out
+  Corner). route.py's cleanup rebuilds both from the pad centre, straight out
   through an allowed edge, then onto the route (`rebuild_pad_exits`); what
   remains is an exit no rebuild could clear;
 - `acute-corner` -- two same-net tracks meeting at an interior angle under

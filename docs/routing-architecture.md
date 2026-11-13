@@ -386,7 +386,6 @@ Move costs:
 - Orthogonal move: 1000 (1 grid step), diagonal move: 1414 (sqrt(2) grid steps), each times the layer's cost multiplier (`--layer-costs`, 1000 = 1.0x)
 - Turn: `--turn-cost` (default 1000) per 90° of direction change, so a 45° kink costs half
 - Corner: the heading change over the last steps of the path (as many as the net's track width covers) is one corner -- three 45° turns one cell apart are a 135° corner once the track has width. A corner past 90° pays `--acute-turn-cost` (default 4000) per 45° it grows; `--max-turn-angle` forbids corners past its value (default 180 = free)
-- SMD pad exits: around a terminal SMD pad only its exit funnels are free (`--smd-exit-funnel`, `pad_entry.exit_funnel`): from the pad's centre cell straight out along each allowed edge normal, on the grid line nearest the pad's axis, to the SMD To Corner distance past the outline; every other cell the track would touch the pad from costs `smd_exit_funnel_penalty` vias per step (GridObstacleMap move masks), and no via goes inside a funnel. Plane taps use the same funnel (`route_planes._tap_search`)
 - Via (layer change): `via_cost * 1000`, scaled so a via costs the same mm-equivalent detour at any grid step (`--via-cost`, default 75); free at a same-net through-hole pad
 - Soft costs: stub and track proximity, plane fragility, history congestion, a layer-direction preference, minus a cross-layer attraction bonus
 

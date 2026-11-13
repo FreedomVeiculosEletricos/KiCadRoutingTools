@@ -1604,18 +1604,6 @@ class RoutingDialog(wx.Dialog):
             "nets and OFF at 149, so disabling it costs ~20 nets. Uncheck only to A/B.")
         options_inner.Add(self.smoothing, 0, wx.ALL, 3)
 
-        # SMD pad exit funnels (pad_entry.exit_funnel), ON by default. Named
-        # `smd_exit_funnel` to match the engine param.
-        self.smd_exit_funnel = wx.CheckBox(options_scroll, label="SMD exit funnels")
-        self.smd_exit_funnel.SetValue(defaults.SMD_EXIT_FUNNEL)
-        self.smd_exit_funnel.SetToolTip(
-            "The router reaches an SMD pad only straight out through an edge and "
-            "keeps straight to the SMD To Corner distance before it turns "
-            "(Altium's SMD Entry and SMD To Corner), so its exits meet both rules "
-            "as laid instead of being rebuilt at the end of the run. "
-            "(CLI: --smd-exit-funnel)")
-        options_inner.Add(self.smd_exit_funnel, 0, wx.ALL, 3)
-
         # Layer costs
         layer_sizer = wx.BoxSizer(wx.HORIZONTAL)
         layer_sizer.Add(wx.StaticText(options_scroll, label="Layer Costs:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
@@ -3060,7 +3048,6 @@ class RoutingDialog(wx.Dialog):
         self.mps_layer_swap.SetValue(False)
         self.keep_input_copper.SetValue(False)
         self.smoothing.SetValue(True)
-        self.smd_exit_funnel.SetValue(defaults.SMD_EXIT_FUNNEL)
         self.mps_segment_intersection.SetValue(False)
         self.bus_enabled.SetValue(False)
         self.bus_detection_radius.SetValue(defaults.BUS_DETECTION_RADIUS)
@@ -3471,7 +3458,6 @@ class RoutingDialog(wx.Dialog):
             'mps_layer_swap': self.mps_layer_swap.GetValue(),
             'keep_input_copper': self.keep_input_copper.GetValue(),
             'smoothing': self.smoothing.GetValue(),
-            'smd_exit_funnel': self.smd_exit_funnel.GetValue(),
             'force_reroute': self.force_reroute.GetValue(),
             'mps_segment_intersection': self.mps_segment_intersection.GetValue(),
             # Bus routing options
@@ -4018,7 +4004,6 @@ class RoutingDialog(wx.Dialog):
                     mps_layer_swap=config.get('mps_layer_swap', False),
                     keep_input_copper=config.get('keep_input_copper', False),
                     smoothing=config.get('smoothing', True),
-                    smd_exit_funnel=config.get('smd_exit_funnel', defaults.SMD_EXIT_FUNNEL),
                     mps_segment_intersection=config.get('mps_segment_intersection', False),
                     bus_enabled=config.get('bus_enabled', False),
                     bus_detection_radius=config.get('bus_detection_radius', 5.0),

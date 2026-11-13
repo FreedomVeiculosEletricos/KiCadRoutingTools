@@ -136,13 +136,6 @@ CASES = [
          param=('net_clearances_path', '{tmp}/' + _NCL_FILE),
          probe='net_clearances_path_planes',
          want=('{tmp}/' + _NCL_FILE,) * 2, default=('', '')),
-    # An inverted bool (INVERTED_BOOL_FLAGS): the --no- flag unticks the
-    # Route tab's "SMD exit funnels" box, and the next step ticks it again.
-    dict(label='route --no-smd-exit-funnel',
-         cmd='python3 py_router/route.py {src} {dst} --nets "*"',
-         flag='--no-smd-exit-funnel',
-         param=('smd_exit_funnel', False), probe='smd_exit_funnel',
-         want=(False, False), default=(True, True)),
     dict(label='route --fab-overrides (relative file)',
          cmd='python3 py_router/route.py {src} {dst} --nets "*"',
          flag='--fab-overrides ' + _FAB_FILE,
@@ -183,8 +176,6 @@ def _probes(dlg):
                                 route_cfg.get('net_clearances_path')),
         'fab_overrides_path': (dlg.fab_overrides_path.GetValue(),
                                route_cfg.get('fab_overrides_path')),
-        'smd_exit_funnel': (dlg.smd_exit_funnel.GetValue(),
-                            route_cfg.get('smd_exit_funnel')),
         'net_clearances_path_diff': (dlg.net_clearances_path.GetValue(),
                                      diff_cfg.get('net_clearances_path')),
         'net_clearances_path_planes': (dlg.net_clearances_path.GetValue(),

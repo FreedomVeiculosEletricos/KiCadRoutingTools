@@ -412,16 +412,14 @@ def find_via_position(
         # One search, seeded from all candidates; generous budget since it
         # replaces K per-candidate searches.
         ms_iters = max(10000, min(60000, len(phase_cells) * 4))
-        path, iterations, _ = _tap_search(
-            routing_obstacles, pad, pad_layer, config,
-            lambda: router.route_with_frontier(
-                routing_obstacles, phase_cells, [(pad_gx, pad_gy, layer_idx)], ms_iters,
-                env_knobs.COLLINEAR_VIAS,  # collinear_vias (#487: KICAD_COLLINEAR_VIAS=1)
-                0,      # via_exclusion_radius
-                None,   # start_direction
-                None,   # end_direction
-                0       # direction_steps
-            ))
+        path, iterations, _ = router.route_with_frontier(
+            routing_obstacles, phase_cells, [(pad_gx, pad_gy, layer_idx)], ms_iters,
+            env_knobs.COLLINEAR_VIAS,  # collinear_vias (#487: KICAD_COLLINEAR_VIAS=1)
+            0,      # via_exclusion_radius
+            None,   # start_direction
+            None,   # end_direction
+            0       # direction_steps
+        )
         routing_obstacles.clear_source_target_cells()
         if path:
             break
@@ -496,29 +494,6 @@ def _audit_plane_via_map(obstacles, pcb_data, config, net_id,
             print(f"      leaked block at grid {cell}")
     except Exception as e:
         print(f"  [OBSTACLE AUDIT route_planes] skipped ({e})")
-
-
-def _tap_search(routing_obstacles, pad, pad_layer, config, search):
-    """Run a plane tap's ``search()`` (a route_with_frontier call ending on
-    ``pad``'s cell) with the pad's SMD exit funnel on ``routing_obstacles``
-    (pad_entry.install_pad_funnel), so a tap leaves an SMD pad straight out
-    through an edge, as a signal route does; when the funnel leaves no path
-    the search runs once more without it. The funnel never outlives the
-    call."""
-    n = 0
-    if (config is not None and pad_layer
-            and getattr(config, 'smd_exit_funnel', False)):
-        from pad_entry import install_pad_funnel
-        n = install_pad_funnel(routing_obstacles, pad, pad_layer, config)
-    try:
-        out = search()
-        if n and out[0] is None:
-            routing_obstacles.clear_move_masks()
-            out = search()
-        return out
-    finally:
-        if n:
-            routing_obstacles.clear_move_masks()
 
 
 def _path_to_segments(path, via_pos, pad, pad_layer, net_id, config, coord):
@@ -700,16 +675,14 @@ def route_via_to_pad(
             proximity_heuristic_cost=config.get_proximity_heuristic_cost()
         )
 
-    path, iterations, blocked_cells = _tap_search(
-        routing_obstacles, pad, pad_layer, config,
-        lambda: router.route_with_frontier(
-            routing_obstacles, sources, targets, max_iterations,
-            env_knobs.COLLINEAR_VIAS,  # collinear_vias (#487: KICAD_COLLINEAR_VIAS=1)
-            0,      # via_exclusion_radius
-            None,   # start_direction
-            None,   # end_direction
-            0       # direction_steps
-        ))
+    path, iterations, blocked_cells = router.route_with_frontier(
+        routing_obstacles, sources, targets, max_iterations,
+        env_knobs.COLLINEAR_VIAS,  # collinear_vias (#487: KICAD_COLLINEAR_VIAS=1)
+        0,      # via_exclusion_radius
+        None,   # start_direction
+        None,   # end_direction
+        0       # direction_steps
+    )
 
     if path is None:
         if verbose:
@@ -808,16 +781,14 @@ def route_multi_source_to_pad(
 
     # One search seeded from all candidates; generous budget since it replaces K.
     ms_iters = max(max_iterations, min(60000, len(source_cells) * 4))
-    path, iterations, blocked_cells = _tap_search(
-        routing_obstacles, pad, pad_layer, config,
-        lambda: router.route_with_frontier(
-            routing_obstacles, source_cells, [(pad_gx, pad_gy, layer_idx)], ms_iters,
-            env_knobs.COLLINEAR_VIAS,  # collinear_vias (#487: KICAD_COLLINEAR_VIAS=1)
-            0,      # via_exclusion_radius
-            None,   # start_direction
-            None,   # end_direction
-            0       # direction_steps
-        ))
+    path, iterations, blocked_cells = router.route_with_frontier(
+        routing_obstacles, source_cells, [(pad_gx, pad_gy, layer_idx)], ms_iters,
+        env_knobs.COLLINEAR_VIAS,  # collinear_vias (#487: KICAD_COLLINEAR_VIAS=1)
+        0,      # via_exclusion_radius
+        None,   # start_direction
+        None,   # end_direction
+        0       # direction_steps
+    )
     routing_obstacles.clear_source_target_cells()
 
     if path is None:

@@ -108,15 +108,11 @@ def helpers(td):
 def _u_route(b_net):
     # net A: a U detour between its two pads, which the smoothing would
     # collapse to the straight run at y=10 -- 0.3 mm (edge) from a short
-    # track of `b_net` at y=9.5. Through-hole pads: off an SMD pad the
-    # smoothing keeps the straight exits (Altium's SMD Entry), and the
-    # diagonal shortcut the HV rule leaves would leave the pad at 45 degrees.
+    # track of `b_net` at y=9.5
     segs = [(5, 10, 5, 12, 0.2, 'F.Cu', 1), (5, 12, 15, 12, 0.2, 'F.Cu', 1),
             (15, 12, 15, 10, 0.2, 'F.Cu', 1), (8, 9.5, 12, 9.5, 0.2, 'F.Cu', b_net)]
-    fps = [{'ref': 'U1', 'x': 5, 'y': 10, 'net_id': 1, 'net_name': 'A', 'size': 0.4,
-            'drill': 0.2},
-           {'ref': 'U2', 'x': 15, 'y': 10, 'net_id': 1, 'net_name': 'A', 'size': 0.4,
-            'drill': 0.2}]
+    fps = [{'ref': 'U1', 'x': 5, 'y': 10, 'net_id': 1, 'net_name': 'A', 'size': 0.4},
+           {'ref': 'U2', 'x': 15, 'y': 10, 'net_id': 1, 'net_name': 'A', 'size': 0.4}]
     return segs, fps
 
 

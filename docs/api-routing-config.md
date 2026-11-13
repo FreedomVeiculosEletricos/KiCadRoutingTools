@@ -58,8 +58,6 @@ Default net class, else `routing_defaults.py` (`TRACK_WIDTH` 0.3,
 | `turn_cost` | `1000` | Penalty per direction change (straighter routes) |
 | `max_turn_angle` | `180.0` | Sharpest corner the A* may lay, degrees of heading change (180 = free, 90 = no acute corner, 45 = no right angle); over a window of the net's track width (`corner_kwargs`) |
 | `acute_turn_cost` | `4000` | Extra cost per 45 degrees a corner turns past 90 (0 = off) |
-| `smd_exit_funnel` | `True` | The single-ended search and the plane taps reach an SMD pad through its exit funnels (`pad_entry.exit_funnel`, `--smd-exit-funnel`) |
-| `smd_exit_funnel_penalty` | `0.5` | Cost of each grid step a route takes off a funnel, in vias (`routing_defaults.SMD_EXIT_FUNNEL_PENALTY`); 0 bars it (a hard funnel) |
 | `min_corner_angle` | `90.0` | Interior angle the acute-corner cleanup restores and check_weird grades; `min_interior_angle()` raises it to 180 - `max_turn_angle` (0 = off) |
 | `direction_order` | `'forward'` | Try `'forward'` or `'backward'` direction first |
 

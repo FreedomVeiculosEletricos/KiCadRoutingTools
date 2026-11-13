@@ -239,19 +239,17 @@ def routed_esp_prog():
         pcb = parse_kicad_pcb(out)
         c, f = _cats(pcb)
         # The pad-exit rules (pad_entry.py) grade what no removal touches:
-        # beside U2's copper tab, U2.3 and C3.2 keep exits neither the exit
-        # funnels nor a rebuild can lay straight in the room left there
-        # (without the funnels it was U2.2 and U1's 0.5 mm QFN pins),
-        # reported as such. Everything the removal contract owns must still
-        # be clean.
+        # esp_prog's U1 (0.5 mm QFN) and U2.2 beside U2's copper tab keep a
+        # few exits no rebuild can clear, reported as such. Everything the
+        # removal contract owns must still be clean.
         exits = ('smd-entry', 'smd-to-corner', 'shallow-pad-entry')
         rest = {k: v for k, v in c.items() if k not in exits}
         check("check_weird finds nothing but unclearable pad exits", not rest,
               '; '.join([f"{x['category']} {x['net']} {x['detail']}" for x in f
                          if x['category'] not in exits][:5]))
-        check("the exits left are only U2.3 and C3.2 beside U2's tab",
+        check("the exits left are only U1's fine pins and U2.2",
               all(f"{x['detail']}".split(' pad ')[-1].split(' ')[0].rstrip(':')
-                  in ('U2.3', 'C3.2') for x in f if x['category'] in exits),
+                  in ('U1.15', 'U1.6', 'U2.2') for x in f if x['category'] in exits),
               '; '.join(x['detail'] for x in f if x['category'] in exits))
         nets = _net_state(pcb)
         check("every net is connected",

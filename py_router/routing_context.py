@@ -768,8 +768,6 @@ def prepare_obstacles_inplace(
     working_obstacles.clear_cross_layer_tracks()
     working_obstacles.clear_free_vias()
     working_obstacles.clear_source_target_cells()  # Clear source/target overrides from previous route
-    if hasattr(working_obstacles, 'clear_move_masks'):
-        working_obstacles.clear_move_masks()       # SMD exit funnels are per route
     # Terminal escape rects (route_net_with_obstacles, the #189 via unblock)
     # are per route too; left on the map they opened BGA-zone cells for every
     # later net, and clone_fresh() copied them into Phase 3's maps.
@@ -1050,8 +1048,6 @@ def restore_obstacles_inplace(
     # Clear per-route data
     working_obstacles.clear_stub_proximity()
     working_obstacles.clear_endpoint_exempt()   # C5 hygiene: no stale disks for Phase-3 clones
-    if hasattr(working_obstacles, 'clear_move_masks'):
-        working_obstacles.clear_move_masks()       # SMD exit funnels are per route
     working_obstacles.clear_layer_proximity()
     working_obstacles.clear_cross_layer_tracks()
     working_obstacles.clear_free_vias()
