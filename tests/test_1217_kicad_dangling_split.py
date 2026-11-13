@@ -51,7 +51,7 @@ for p in (ROOT, TESTS_DIR, os.path.join(ROOT, 'py_router')):
 from synth import RoutingBoard                                  # noqa: E402
 from kicad_parser import parse_kicad_pcb                        # noqa: E402
 from improvement_gate import copper_signature                   # noqa: E402
-from check_weird import check_weird, kicad_dangling_end         # noqa: E402
+from check_weird import check_weird, kicad_dangling_end, blocking_findings  # noqa: E402
 from check_connected import check_net_connectivity              # noqa: E402
 from pcb_modification import (split_kicad_dangling_hosts,        # noqa: E402
                               collapse_strict_redundant, _pt_seg_dist)
@@ -99,7 +99,7 @@ def is_(s, spec):
 
 
 def kd(pcb):
-    return [f for f in check_weird(pcb, tolerance=0)[0]
+    return [f for f in blocking_findings(check_weird(pcb, tolerance=0)[0])
             if f['category'] == 'kicad-dangling']
 
 
@@ -153,7 +153,7 @@ def split(tmp):
           and host not in pcb.segments and all(p in pcb.segments for p in pieces))
     check('C and D are untouched', sum(is_(s, C) or is_(s, D)
                                        for s in pcb.segments) == 2)
-    w = check_weird(pcb, tolerance=0)[0]
+    w = blocking_findings(check_weird(pcb, tolerance=0)[0])
     check('check_weird is clean after', not w,
           f"{[x['category'] for x in w]}")
     check('connectivity unchanged', connected(pcb) == before == (True, 0),
@@ -234,7 +234,7 @@ def two_joints(tmp):
     cuts = [(p.start_x, p.end_x) for _h, ps in pairs for p in ps]
     check('the trunk is cut at both joints', cuts == [(10, 15), (15, 15.6), (15.6, 20)],
           f'{cuts}')
-    w = check_weird(pcb, tolerance=0)[0]
+    w = blocking_findings(check_weird(pcb, tolerance=0)[0])
     check('check_weird is clean after', not w, f"{[x['category'] for x in w]}")
 
 
@@ -258,18 +258,18 @@ def exposed_tail(tmp):
         fh.write(rb.text())
     pcb = parse_kicad_pcb(path)
     check('flagged once before', [f['category'] for f in
-                                  check_weird(pcb, tolerance=0)[0]] == ['kicad-dangling'])
+                                  blocking_findings(check_weird(pcb, tolerance=0)[0])] == ['kicad-dangling'])
     pcb = parse_kicad_pcb(path)
     collapse_strict_redundant([], pcb, None)
     split_kicad_dangling_hosts(pcb, None)
-    w = [f['category'] for f in check_weird(pcb, tolerance=0)[0]]
+    w = [f['category'] for f in blocking_findings(check_weird(pcb, tolerance=0)[0])]
     check('witness: collapse THEN split leaves the exposed stretch removable',
           w == ['removable-segment'], f'{w}')
     pcb = parse_kicad_pcb(path)
     split_kicad_dangling_hosts(pcb, None)
     n, _strip = collapse_strict_redundant([], pcb, None)
     split_kicad_dangling_hosts(pcb, None)
-    w = check_weird(pcb, tolerance=0)[0]
+    w = blocking_findings(check_weird(pcb, tolerance=0)[0])
     gone = not any(abs(s.end_x - 113.4) < 1e-6 or abs(s.start_x - 113.4) < 1e-6
                    for s in pcb.segments)
     check('split, collapse, split (route.py\'s order): the stretch goes, clean',
@@ -316,7 +316,7 @@ def cli(tmp):
                                        sig_of(base), {NET}, False)
     pcb = parse_kicad_pcb(evidence(path, 'the split board'))
     check('one track split in the file, one more segment, check_weird clean',
-          n == 1 and len(pcb.segments) == 5 and not check_weird(pcb, tolerance=0)[0],
+          n == 1 and len(pcb.segments) == 5 and not blocking_findings(check_weird(pcb, tolerance=0)[0]),
           f'split {n}, {len(pcb.segments)} segments')
     check('the pieces are in the file, B is not',
           not any(is_(s, B) for s in pcb.segments)

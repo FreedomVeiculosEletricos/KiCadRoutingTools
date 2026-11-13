@@ -385,6 +385,7 @@ f(n) = g(n) + h(n) * heuristic_weight
 Move costs:
 - Orthogonal move: 1000 (1 grid step), diagonal move: 1414 (sqrt(2) grid steps), each times the layer's cost multiplier (`--layer-costs`, 1000 = 1.0x)
 - Turn: `--turn-cost` (default 1000) per 90° of direction change, so a 45° kink costs half
+- Corner: the heading change over the last steps of the path (as many as the net's track width covers) is one corner -- three 45° turns one cell apart are a 135° corner once the track has width. A corner past 90° pays `--acute-turn-cost` (default 4000) per 45° it grows; `--max-turn-angle` forbids corners past its value (default 180 = free)
 - Via (layer change): `via_cost * 1000`, scaled so a via costs the same mm-equivalent detour at any grid step (`--via-cost`, default 75); free at a same-net through-hole pad
 - Soft costs: stub and track proximity, plane fragility, history congestion, a layer-direction preference, minus a cross-layer attraction bonus
 

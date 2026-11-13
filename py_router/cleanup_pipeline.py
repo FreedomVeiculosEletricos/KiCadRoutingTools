@@ -50,6 +50,7 @@ from pcb_modification import (
     neck_wide_segments_grazing_pads,
     smooth_octolinear_chains,
     rebuild_pad_exits,
+    fix_acute_corners,
     close_soft_joints,
     merge_collinear_segments,
     CLOSE_SOFT_JOINT_KINDS,
@@ -177,6 +178,7 @@ def run_post_route_cleanup(results, pcb_data, scope_net_ids, config, *,
                            progress_callback=None,
                            smooth: bool = False,
                            pad_exits: bool = False,
+                           acute_corners: bool = False,
                            merge_collinear: bool = True,
                            strict_collapse: bool = True,
                            ) -> CleanupOutcome:
@@ -653,6 +655,27 @@ def run_post_route_cleanup(results, pcb_data, scope_net_ids, config, *,
         if _px_n:
             print(f"{label}SMD pad exits: rebuilt {_px_n} exit(s) straight out "
                   f"through an edge")
+
+    # Acute corners (corner_angle.py, Altium's Acute Angle rule): a same-net
+    # corner sharper than config.min_interior_angle() is cut, octolinearly,
+    # where the cut clears. After the pad exits, whose rebuilds keep their own
+    # bends at 90 degrees or wider; before close (#319 ordering). Same nets
+    # skipped as the pad exits (their geometry or length is the spec). Front
+    # switch ``acute_corners``: ON with ``pad_exits``.
+    if acute_corners and not _judge:
+        _prog("acute corners")
+        _routed_ids = {id(x) for r in results for x in (r.get('new_segments') or [])}
+        _ac_n, _ac_strip, _ac_added = fix_acute_corners(
+            results, pcb_data, _sub_scope, config,
+            editable=(None if not keep_input_copper
+                      else (lambda x: id(x) in _routed_ids)),
+            skip_net_ids=pad_exit_skip_net_ids(pcb_data, config))
+        counts['acute_corners_cut'] = _ac_n
+        _trace('acute_corners')
+        strip.extend(_ac_strip)
+        if _ac_n:
+            print(f"{label}Acute corners: cut {_ac_n} corner(s) to "
+                  f"{config.min_interior_angle():g} degrees or wider")
 
     # FINAL copper step (#319 ordering): nothing below may remove copper.
     # KICAD_NO_SOFT_JOINT_BRIDGE=1 is an A/B ablation knob (like

@@ -88,6 +88,15 @@ Categories:
                      Altium's SMD To Corner. Always reported. route.py's
                      cleanup rebuilds both from the pad centre
                      (rebuild_pad_exits).
+  acute-corner       two same-net tracks meeting at an interior angle under
+                     --min-corner-angle (90 by default, Altium's Acute Angle
+                     rule): end to end, or a track end on another's body (a
+                     T). The notch traps etchant and the point beside it is
+                     a sliver. Not graded inside the net's own pad or via
+                     copper. Always reported (no size), advisory: not counted
+                     in the exit code, since a corner no cut clears is the
+                     designer's call. route.py's cleanup removes what it can
+                     (fix_acute_corners).
   kicad-dangling     a joint segment whose two ends both lie on other
                      same-net TRACKS that hold the other end too (#1217):
                      KiCad counts such an item for one end only, so its DRC
@@ -151,10 +160,10 @@ CATEGORIES = ['dangling-end', 'soft-joint', 'redundant-cycle',
               'removable-segment', 'stacked-copper', 'unsupported-via',
               'dangling-via', 'orphan-island', 'narrow-pad-joint',
               'kicad-dangling', 'off-centre-via-end', 'shallow-pad-entry',
-              'smd-entry', 'smd-to-corner']
+              'smd-entry', 'smd-to-corner', 'acute-corner']
 # Reported, but not counted in the headline or the exit code (see the module
 # docstring): check_complete blocks DONE on that exit code.
-ADVISORY_CATEGORIES = frozenset({'off-centre-via-end'})
+ADVISORY_CATEGORIES = frozenset({'off-centre-via-end', 'acute-corner'})
 # Cost cap for the removable scan (skip unless --thorough): the removal pass's
 # own cap (#1063), so the checker never grades a net the pass may not clean.
 MAX_SEGS_PER_NET = STRICT_REMOVAL_MAX_SEGS
@@ -1159,17 +1168,39 @@ def _check_smd_exit(name, net_segs, net_vias, net_pads, findings):
                 f"{exit_distance(s.width):.3f}mm from SMD pad {ref}", size=None))
 
 
+def _check_acute_corners(name, net_segs, net_vias, net_pads, min_angle,
+                         findings):
+    """Flag same-net corners sharper than ``min_angle`` degrees
+    (corner_angle.acute_corners, what fix_acute_corners cuts). Read-only; no
+    size."""
+    if not net_segs or not min_angle:
+        return
+    from corner_angle import acute_corners
+    for c in acute_corners(net_segs, net_vias, net_pads, min_angle):
+        what = ("tracks meet" if c.kind == 'corner'
+                else "a track ends on another's body")
+        findings.append(_finding(
+            'acute-corner', name, c.layer, c.x, c.y,
+            f"{what} at {c.angle:.0f} degrees, under {min_angle:g}",
+            size=None))
+
+
 def check_weird(pcb_data: PCBData, net_patterns: Optional[List[str]] = None,
                 thorough: bool = False, quiet: bool = True,
-                tolerance: float = 0.1
+                tolerance: float = 0.1,
+                min_corner_angle: Optional[float] = None
                 ) -> Tuple[List[Dict], List[Tuple[str, int]]]:
     """Run every check. Returns (findings, skipped_nets) where each finding is
     {'category', 'net', 'layer', 'x', 'y', 'detail', 'size'} and skipped_nets
     lists (net_name, segment_count) nets the removable-segment scan skipped.
     Findings whose characteristic size (mm) is below `tolerance` are dropped
-    (0 = report everything). Read-only: pcb_data is not modified."""
+    (0 = report everything). ``min_corner_angle``: the acute-corner limit in
+    degrees (None = routing_defaults.MIN_CORNER_ANGLE, 0 = not graded). Read-only: pcb_data is not modified."""
     findings: List[Dict] = []
     skipped_nets: List[Tuple[str, int]] = []
+    if min_corner_angle is None:
+        from routing_defaults import MIN_CORNER_ANGLE
+        min_corner_angle = MIN_CORNER_ANGLE
 
     segs_by_net = defaultdict(list)
     for s in pcb_data.segments:
@@ -1250,6 +1281,8 @@ def check_weird(pcb_data: PCBData, net_patterns: Optional[List[str]] = None,
         _check_shallow_pad_entry(name, net_segs, net_vias, net_pads, findings)
         if net_id not in smd_skip:
             _check_smd_exit(name, net_segs, net_vias, net_pads, findings)
+            _check_acute_corners(name, net_segs, net_vias, net_pads,
+                                 min_corner_angle, findings)
 
     if tolerance and tolerance > 0:
         findings = [f for f in findings
@@ -1329,11 +1362,19 @@ def main():
                              'smaller findings are dropped. Default 0.1; use '
                              '0 to report everything. soft-joint, '
                              'narrow-pad-joint, shallow-pad-entry, smd-entry, '
-                             'smd-to-corner, '
+                             'smd-to-corner, acute-corner, '
                              'kicad-dangling and '
                              'off-centre-via-end carry no size and are ALWAYS '
                              'reported -- smaller is worse, or KiCad treats '
                              'any amount alike.')
+    parser.add_argument('--min-corner-angle', type=float, default=None,
+                        help='Interior angle (degrees) under which two '
+                             'same-net tracks meeting form an acute-corner '
+                             'finding; 0 = not graded. Default: '
+                             'routing_defaults.MIN_CORNER_ANGLE (90), the '
+                             'value route.py cleans to unless its '
+                             '--min-corner-angle / --max-turn-angle said '
+                             'otherwise.')
     parser.add_argument('--max-print', type=int, default=20,
                         help='Max findings printed per category '
                              '(<=0 prints all; default 20)')
@@ -1343,7 +1384,8 @@ def main():
     pcb_data = parse_kicad_pcb(args.pcb)
     findings, skipped_nets = check_weird(pcb_data, args.nets,
                                           tolerance=args.tolerance,
-                                         thorough=args.thorough, quiet=False)
+                                         thorough=args.thorough, quiet=False,
+                                         min_corner_angle=args.min_corner_angle)
     print_report(findings, skipped_nets, max_print=args.max_print)
     sys.exit(1 if blocking_findings(findings) else 0)
 

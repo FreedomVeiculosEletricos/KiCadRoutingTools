@@ -2664,6 +2664,7 @@ def route_disconnected_regions(
         via_cost=config.via_cost_units(),
         h_weight=config.heuristic_weight,
         turn_cost=config.turn_cost,
+        **config.corner_kwargs(),
         via_proximity_cost=0,
         # One cost per layer_map index, by NAME (#1185).
         layer_costs=config.layer_costs_for(routing_layers),
@@ -3943,6 +3944,7 @@ def route_plane_connection_wide(
             via_cost=config.via_cost_units(),
             h_weight=config.heuristic_weight,
             turn_cost=config.turn_cost,
+            **config.corner_kwargs(),
             via_proximity_cost=0,
             # One cost per routing_layers index, by NAME (#1185).
             layer_costs=config.layer_costs_for(routing_layers),

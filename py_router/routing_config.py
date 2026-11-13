@@ -194,6 +194,14 @@ class GridRouteConfig:
     # global plan's replace() clone; never on a config that emits copper.
     plan_probe: bool = False
     turn_cost: int = 1000  # Penalty for direction changes (encourages straighter paths)
+    # Corners (routing_defaults.MAX_TURN_ANGLE / ACUTE_TURN_COST /
+    # MIN_CORNER_ANGLE): the sharpest corner the A* may lay (degrees of
+    # heading change, 180 = free), the extra cost per 45 degrees a corner
+    # turns past 90, and the interior angle the cleanup restores and
+    # check_weird grades.
+    max_turn_angle: float = 180.0
+    acute_turn_cost: int = 4000
+    min_corner_angle: float = 90.0
     # BGA exclusion zones (auto-detected from PCB) - vias blocked inside these areas
     bga_exclusion_zones: List[Tuple[float, float, float, float]] = field(default_factory=list)
     stub_proximity_radius: float = 2.0  # mm - radius around stubs to penalize
@@ -926,6 +934,34 @@ class GridRouteConfig:
             if name and c:
                 out[name] = float(c)
         return out
+
+    def corner_kwargs(self, net_id: Optional[int] = None) -> Dict[str, int]:
+        """GridRouter's corner arguments: ``max_turn_units`` (max_turn_angle
+        in 45-degree units, 4 = free), ``acute_turn_cost`` and
+        ``turn_window`` -- the grid steps over which consecutive turns count
+        as ONE corner: the net's widest track width (the track's own copper
+        merges turns closer than that into one corner), at least one step."""
+        import math as _m
+        units = max(1, min(4, int(round(float(self.max_turn_angle) / 45.0))))
+        w = self.track_width
+        if net_id is not None:
+            try:
+                w = max([w] + [self.get_net_track_width(net_id, l)
+                               for l in self.layers])
+            except Exception:
+                pass
+        window = max(1, min(32, int(_m.ceil(w / self.grid_step - 1e-6))))
+        return dict(max_turn_units=units,
+                    acute_turn_cost=max(0, int(self.acute_turn_cost)),
+                    turn_window=window)
+
+    def min_interior_angle(self) -> float:
+        """The interior angle every corner must keep (degrees): the cleanup
+        restores it and check_weird grades it. min_corner_angle, raised to
+        180 - max_turn_angle when the router was held to less; 0 = off."""
+        if not self.min_corner_angle:
+            return 0.0
+        return max(float(self.min_corner_angle), 180.0 - float(self.max_turn_angle))
 
     def get_track_width(self, layer: str) -> float:
         """Get track width for a specific layer (impedance-aware).

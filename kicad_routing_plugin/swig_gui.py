@@ -1114,6 +1114,23 @@ class RoutingDialog(wx.Dialog):
             ('max_iterations', 'Max Iterations:', defaults.MAX_ITERATIONS, "Maximum A* iterations per net before giving up"),
             ('max_probe_iterations', 'Probe Iterations:', defaults.MAX_PROBE_ITERATIONS, "Iterations for quick probe routing attempts"),
             ('turn_cost', 'Turn Cost:', defaults.TURN_COST, "Penalty for 90-degree turns (encourages straighter routes)"),
+            ('max_turn_angle', 'Max Turn Angle (°):', int(defaults.MAX_TURN_ANGLE),
+             "Sharpest corner the router may lay, as heading change in degrees, "
+             "in steps of 45: 180 = free (default), 135, 90 = no corner sharper "
+             "than a right angle, 45 = no right angles either. Turns closer than "
+             "the net's track width count as one corner. A hard limit: a net "
+             "that only fits with a sharper corner stays unrouted. "
+             "(CLI: --max-turn-angle)"),
+            ('acute_turn_cost', 'Acute Turn Cost:', defaults.ACUTE_TURN_COST,
+             "Extra cost per 45 degrees a corner turns past 90 (an acute "
+             "corner), on top of Turn Cost, so the router lays one only where "
+             "nothing else fits; 0 = off (CLI: --acute-turn-cost)"),
+            ('min_corner_angle', 'Min Corner Angle (°):', int(defaults.MIN_CORNER_ANGLE),
+             "Interior angle every same-net corner must keep (Altium's Acute "
+             "Angle rule). The end-of-run cleanup cuts sharper corners where "
+             "the cut clears, and check_weird reports what is left as "
+             "acute-corner; 0 = off. A Max Turn Angle below 180 raises it to "
+             "180 minus that angle. (CLI: --min-corner-angle)"),
             ('direction_preference_cost', 'Dir. Pref. Cost:', defaults.DIRECTION_PREFERENCE_COST, "Penalty for routing against layer's preferred direction"),
         ]
         for name, label, default, tooltip in int_params:
@@ -1123,6 +1140,8 @@ class RoutingDialog(wx.Dialog):
             ctrl.SetToolTip(tooltip)
             setattr(self, name, ctrl)
             grid.Add(ctrl, 0, wx.EXPAND)
+        # The router turns in 45-degree units; the arrows step one unit
+        self.max_turn_angle.SetIncrement(45)
 
         # Heuristic weight
         r = defaults.PARAM_RANGES['heuristic_weight']
@@ -2975,6 +2994,9 @@ class RoutingDialog(wx.Dialog):
         self.heuristic_weight.SetValue(defaults.HEURISTIC_WEIGHT)
         self.proximity_heuristic_factor.SetValue(defaults.PROXIMITY_HEURISTIC_FACTOR)
         self.turn_cost.SetValue(defaults.TURN_COST)
+        self.max_turn_angle.SetValue(int(defaults.MAX_TURN_ANGLE))
+        self.acute_turn_cost.SetValue(defaults.ACUTE_TURN_COST)
+        self.min_corner_angle.SetValue(int(defaults.MIN_CORNER_ANGLE))
         self.direction_preference_cost.SetValue(defaults.DIRECTION_PREFERENCE_COST)
         self.ordering_strategy.SetSelection(0)
         self.fab_tier.SetStringSelection(defaults.FAB_TIER)
@@ -3357,6 +3379,10 @@ class RoutingDialog(wx.Dialog):
             'heuristic_weight': self.heuristic_weight.GetValue(),
             'proximity_heuristic_factor': self.proximity_heuristic_factor.GetValue(),
             'turn_cost': self.turn_cost.GetValue(),
+            # Snapped to the 45-degree units the CLI's choices allow
+            'max_turn_angle': 45.0 * max(1, min(4, round(self.max_turn_angle.GetValue() / 45.0))),
+            'acute_turn_cost': self.acute_turn_cost.GetValue(),
+            'min_corner_angle': float(self.min_corner_angle.GetValue()),
             'direction_preference_cost': self.direction_preference_cost.GetValue(),
             'max_ripup': self.max_ripup.GetValue(),
             'ripup_abandon_metric': self.ripup_abandon_metric.GetString(
@@ -3932,6 +3958,9 @@ class RoutingDialog(wx.Dialog):
                         'proximity_heuristic_factor',
                         defaults.PROXIMITY_HEURISTIC_FACTOR),
                     turn_cost=config['turn_cost'],
+                    max_turn_angle=config.get('max_turn_angle', defaults.MAX_TURN_ANGLE),
+                    acute_turn_cost=config.get('acute_turn_cost', defaults.ACUTE_TURN_COST),
+                    min_corner_angle=config.get('min_corner_angle', defaults.MIN_CORNER_ANGLE),
                     direction_preference_cost=config.get('direction_preference_cost', defaults.DIRECTION_PREFERENCE_COST),
                     max_rip_up_count=config['max_ripup'],
                     ripup_abandon_metric=config.get('ripup_abandon_metric', defaults.RIPUP_ABANDON_METRIC),

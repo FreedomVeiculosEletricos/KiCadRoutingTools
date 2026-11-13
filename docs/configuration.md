@@ -547,6 +547,9 @@ See [Power Net Analysis](power-nets.md) for automatic detection, AI-powered anal
 | `--max-probe-iterations` | 5000 | Quick probe per direction to detect stuck routes |
 | `--heuristic-weight` | 2.3 | A* greediness (>1 = faster, <1 = more optimal). 2.3 is the corpus dose-response peak (#586); 1.9 was the default before it |
 | `--turn-cost` | 1000 | Penalty for direction changes (encourages straighter paths) |
+| `--max-turn-angle` | 180 (free) | Sharpest corner the router may lay, in degrees of heading change: 45, 90, 135 or 180. 90 = no corner sharper than a right angle (no acid traps); 45 = no right angles either. Turns closer together than the net's track width count as one corner. A hard limit: a net that only fits with a sharper corner stays unrouted. Raises `--min-corner-angle` to 180 minus this value. GUI: **Max Turn Angle** (steps of 45). `route.py` |
+| `--acute-turn-cost` | 4000 | Extra cost per 45 degrees a corner turns past 90 (an acute corner), on top of `--turn-cost`, so the router lays one only where nothing else fits; 0 = off. GUI: **Acute Turn Cost**. `route.py` |
+| `--min-corner-angle` | 90 | Interior angle every same-net corner must keep (Altium's Acute Angle rule). The cleanup cuts sharper corners where the cut clears (`fix_acute_corners`) and `check_weird` reports what is left as `acute-corner`; 0 = off. GUI: **Min Corner Angle**. `route.py` |
 | `--direction-preference-cost` | 250 | Penalty for a move off the layer's preferred direction (layers alternate horizontal / vertical, horizontal on top; 0 = off). `route.py`, `route_diff.py` |
 | `--max-ripup` | 3 | Max blockers to rip up at once during rip-up and retry |
 | `--quick [LEVEL]` | 0 (off) | Route to judge, not to ship. `--quick` (level 1), a placement review's first round: the main pass only, without the net rescue, the terminal escalation, the plane finalize and the reconciliation laps; what stays open and what costs most names what to move (`py_tools/route_review.py`). `--quick 2`, the seed judge: also skips every pass that only polishes copper for shipping (the cleanup's graze, cycle and neck passes, smoothing, the seam re-asks, the plane-fragility field, the late collapse and sweeps, the final re-grade, the improvement gate, the via-protection stamp), about half the time of level 1. `route_diff.py --quick 2` skips the cleanup polish, the seam re-asks and the plane-fragility field; level 1 changes nothing there. The board is a diagnosis, not one to ship, and `route.py`'s JSON_SUMMARY says so (`quick`: level and skipped stages) |
@@ -961,6 +964,9 @@ class GridRouteConfig:
     max_probe_iterations: int = 5000  # quick probe per direction to detect stuck routes
     heuristic_weight: float = 2.3
     turn_cost: int = 1000         # penalty for direction changes (straighter paths)
+    max_turn_angle: float = 180.0 # sharpest corner the A* may lay (180 = free)
+    acute_turn_cost: int = 4000   # extra cost per 45 deg a corner turns past 90 (0 = off)
+    min_corner_angle: float = 90.0  # interior angle the cleanup restores (0 = off)
     direction_preference_cost: int = 250  # off-direction move penalty (layers alternate H/V; 0 = off)
     max_rip_up_count: int = 3     # max blockers to rip up at once (progressive N+1)
     ripup_abandon_metric: str = 'stranded'  # tap rip-up abandon rule (docs/rip-up-reroute.md)

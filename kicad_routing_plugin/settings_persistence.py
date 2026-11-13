@@ -90,6 +90,9 @@ def get_dialog_settings(dialog):
         'max_probe_iterations': dialog.max_probe_iterations.GetValue(),
         'heuristic_weight': dialog.heuristic_weight.GetValue(),
         'turn_cost': dialog.turn_cost.GetValue(),
+        'max_turn_angle': dialog.max_turn_angle.GetValue(),
+        'acute_turn_cost': dialog.acute_turn_cost.GetValue(),
+        'min_corner_angle': dialog.min_corner_angle.GetValue(),
         'direction_preference_cost': dialog.direction_preference_cost.GetValue(),
         'ordering_strategy': dialog.ordering_strategy.GetSelection(),
         'fab_tier': dialog.fab_tier.GetSelection(),
@@ -438,6 +441,9 @@ def restore_dialog_settings(dialog, settings):
         dialog.heuristic_weight.SetValue(settings['heuristic_weight'])
     if 'turn_cost' in settings:
         dialog.turn_cost.SetValue(settings['turn_cost'])
+    for key in ('max_turn_angle', 'acute_turn_cost', 'min_corner_angle'):
+        if key in settings:
+            getattr(dialog, key).SetValue(int(settings[key]))
     if 'direction_preference_cost' in settings:
         dialog.direction_preference_cost.SetValue(settings['direction_preference_cost'])
     if 'ordering_strategy' in settings:

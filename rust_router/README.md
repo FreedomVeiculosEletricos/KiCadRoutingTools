@@ -5,7 +5,7 @@ The compiled half of KiCad Routing Tools: the Python extension module
 searches and obstacle map, the placer's per-move kernels, and the grid searches
 of the `awx/` whole-route bus router. The rest is Python that calls in here.
 
-**Current Version: 0.23.7** (the crate version in `Cargo.toml`)
+**Current Version: 0.23.8** (the crate version in `Cargo.toml`)
 
 > **Release note:** the newest published release is
 > [v0.23.7](https://github.com/drandyhaas/KiCadRoutingTools/releases/tag/v0.23.7)
@@ -291,7 +291,8 @@ router = GridRouter(via_cost, h_weight, turn_cost=None, via_proximity_cost=1,
                     layer_costs=None, proximity_heuristic_cost=None,
                     layer_direction_preferences=None, direction_preference_cost=0,
                     attraction_radius=0, attraction_bonus=0,
-                    attraction_cross_layer_pct=0, attraction_potential=0)
+                    attraction_cross_layer_pct=0, attraction_potential=0,
+                    max_turn_units=4, acute_turn_cost=0, turn_window=1)
 ```
 
 Parameters:
@@ -306,6 +307,9 @@ Parameters:
 - `attraction_radius`, `attraction_bonus`: bus path attraction to the path given by `set_attraction_path` -- a discount on moves in the same direction as the path near it, `attraction_bonus / 50` percent at full strength, capped at 90% (0 = off)
 - `attraction_cross_layer_pct`: percent of that attraction granted on layers other than the path's (0 = same layer only)
 - `attraction_potential`: strength of the potential-shaped attraction (#656): moves are charged the change in a potential that peaks on the path, so cycles never pay and a via onto the path's layer earns a one-time gain (0 = off)
+- `turn_window`: how many of the last same-layer steps one corner spans (1-32; a via starts a new window). A move's corner is its heading change against every heading in the window, so turns closer together than that count as one corner. Python passes the net's track width in grid steps (`GridRouteConfig.corner_kwargs`)
+- `max_turn_units`: the sharpest corner allowed, in 45-degree units (4 = free, 2 = no corner sharper than 90 degrees, 1 = no right angles); a move whose corner exceeds it is not expanded
+- `acute_turn_cost`: charged per 45 degrees a corner grows past 90 degrees, on top of `turn_cost` (0 = off), so a corner spread over several cells pays once, like a sharp one
 
 Methods:
 - `route_multi(obstacles, sources, targets, max_iterations, collinear_vias=False, via_exclusion_radius=0, start_direction=None, end_direction=None, direction_steps=2, track_margin=0.0, max_iterations_ceiling=0, quantum_cells=2.0, quantum_pct=2.0, grace_tranches=0, via_rung=0)` -- a path from any source to any target; sources and targets are lists of (gx, gy, layer)
@@ -451,6 +455,16 @@ src/
 - **Placement kernels**: the trees and gap trees keep the Python's float expressions in order; the crossing and pad-hit kernels skip pairs whose boxes cannot meet; the congestion kernels sum a move's change over the cells it reaches, so their totals can differ from a whole-window Python sum in the last bits
 
 ## Version History
+
+### 0.23.8 (2026-11-13)
+- **Corners over a window** (`router.rs`): `GridRouter(..., max_turn_units=4,
+  acute_turn_cost=0, turn_window=1)`. The corner a move makes is its heading
+  change against the last `turn_window` same-layer steps, not only the last
+  one: the angle-proportional turn cost priced three 45-degree turns one cell
+  apart like one 135-degree hairpin, so forbidding the hairpin per step alone
+  would let the search lay the same acute corner in three steps.
+  `max_turn_units` forbids corners past it; `acute_turn_cost` is charged per
+  45 degrees a corner grows past 90. The defaults keep the search as before.
 
 ### 0.23.7 (2026-10-18)
 - **Congestion priced only where it can change** (`placement_kernels.rs`):

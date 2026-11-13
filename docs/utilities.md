@@ -3081,6 +3081,14 @@ category each:
   Corner). route.py's cleanup rebuilds both from the pad centre, straight out
   through an allowed edge, then onto the route (`rebuild_pad_exits`); what
   remains is an exit no rebuild could clear;
+- `acute-corner` -- two same-net tracks meeting at an interior angle under
+  `--min-corner-angle` (90 by default, Altium's Acute Angle rule), end to end
+  or as a T (a track end on another's body): the notch traps etchant and the
+  point beside it is a sliver. Not graded inside the net's own pad or via
+  copper. route.py's cleanup cuts the corner octolinearly, squares a branch
+  off along its trunk, or removes a fold (`fix_acute_corners`); what remains
+  is a corner no change could clear. Advisory: reported, not counted in the
+  exit code;
 - `kicad-dangling` -- a joint segment whose ends both lie on other same-net
   tracks, which KiCad's DRC reports as `track_dangling` (#1217);
 - `off-centre-via-end` -- a track end inside a same-net via's copper, on a
@@ -3121,8 +3129,12 @@ Options:
                         duplicated-copper length, via diameter); smaller findings are
                         dropped. Default: 0.1; use 0 to report everything.
                         soft-joint, narrow-pad-joint, shallow-pad-entry,
-                        smd-entry, smd-to-corner, kicad-dangling and
-                        off-centre-via-end carry no size and are always reported
+                        smd-entry, smd-to-corner, acute-corner, kicad-dangling
+                        and off-centre-via-end carry no size and are always
+                        reported
+  --min-corner-angle DEG
+                        Interior angle under which same-net tracks meeting are an
+                        acute-corner finding; 0 = not graded (default 90)
   --max-print INT       Max findings printed per category (<=0 prints all; default 20)
 ```
 

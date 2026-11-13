@@ -6259,6 +6259,286 @@ def rebuild_pad_exits(results, pcb_data: PCBData, scope_net_ids, config,
     return rebuilt, strip, added
 
 
+def fix_acute_corners(results, pcb_data: PCBData, scope_net_ids, config,
+                      min_angle=None, editable=None, skip_net_ids=None,
+                      stats=None):
+    """Remove every same-net corner sharper than ``min_angle`` degrees
+    (default config.min_interior_angle(); corner_angle.acute_corners), as
+    Altium's gloss / Recorner does:
+
+    - a corner of two tracks A-V-C is cut: A-P-Q-C, P on VA and Q on VC, the
+      cut P-Q octolinear, both new corners at ``min_angle`` or wider, the cut
+      far enough from V to remove the copper notch -- the largest cut that
+      clears first;
+    - a branch leaving a trunk at an acute angle (a Y joint of three or more
+      tracks at V, or a T whose end lies on the trunk's body) is moved along
+      the trunk to P and squared off: the trunk is split at P and the branch
+      runs P-Q-C, meeting the trunk at ``min_angle`` or wider on both sides;
+    - a fold (two tracks leaving V in the same direction, copper doubled back
+      on itself) is replaced by the one track A-C it overlaps, or dropped.
+
+    A change is committed only when its new copper passes the placing passes'
+    clearance gates (_copper_clearance_gates) and stays out of filled
+    footprint copper, no corner sharper than ``min_angle`` appears where it
+    joins, nothing else touches the copper it removes, and no soft joint,
+    KiCad-dangling joint, shallow pad entry or worse connectivity results.
+    Only ``editable(seg)`` copper is changed (default: all); locked, graphic
+    and sense copper never is. Write-list / strip contract as
+    rebuild_pad_exits. Returns (fixed, input_segments_to_strip,
+    added_segments); ``stats``, if given, counts the corners left as they
+    are, by reason."""
+    import math
+    from collections import defaultdict
+    from check_connected import check_net_connectivity
+    from corner_angle import (acute_corners, corner_cut_candidates,
+                              tee_cut_candidates, interior_angle, _key)
+    if min_angle is None:
+        min_angle = (config.min_interior_angle()
+                     if hasattr(config, 'min_interior_angle') else 90.0)
+    if not min_angle or min_angle <= 0:
+        return 0, [], []
+    skip = set(skip_net_ids or ())
+    for _attr in ('_foreign_seg_arr_cache', '_foreign_via_arr_cache',
+                  '_foreign_pad_arr_cache'):
+        if getattr(pcb_data, _attr, None) is not None:
+            setattr(pcb_data, _attr, None)
+    gates = _copper_clearance_gates(
+        pcb_data, getattr(config, 'clearance', 0.1),
+        getattr(config, 'net_clearances', None) or None,
+        getattr(config, 'board_edge_clearance', 0.0) or 0.0, config)
+    from check_drc import filled_graphic_shapes
+    _clr = getattr(config, 'clearance', 0.1)
+    _fills = filled_graphic_shapes(pcb_data)
+
+    def clears(x1, y1, x2, y2, layer, net_id, w):
+        return (gates.clears(x1, y1, x2, y2, layer, net_id, w)
+                and _filled_graphics_clear(_fills, x1, y1, x2, y2, layer,
+                                           net_id, w, _clr))
+    step = max(0.01, float(getattr(config, 'grid_step', 0.1) or 0.1) / 2.0)
+    routed = {}
+    for r in results:
+        for s in r.get('new_segments') or []:
+            routed[id(s)] = r
+    vias_by_net = defaultdict(list)
+    for v in pcb_data.vias:
+        vias_by_net[v.net_id].append(v)
+    nets = sorted({s.net_id for s in pcb_data.segments if s.net_id
+                   and (scope_net_ids is None or s.net_id in scope_net_ids)
+                   and s.net_id not in skip})
+    removed_ids, strip, added = set(), [], []
+    fixed = 0
+    copper = list(getattr(getattr(pcb_data, 'board_info', None),
+                          'copper_layers', None) or ['F.Cu', 'B.Cu'])
+
+    def count(reason):
+        if stats is not None:
+            stats[reason] = stats.get(reason, 0) + 1
+
+    def other_end(s, V):
+        if _key(s.start_x, s.start_y) == _key(*V):
+            return (s.end_x, s.end_y)
+        return (s.start_x, s.start_y)
+
+    def seg(a, b, w, layer, net_id):
+        return Segment(start_x=a[0], start_y=a[1], end_x=b[0], end_y=b[1],
+                       width=w, layer=layer, net_id=net_id)
+
+    def plans(c, segs, net_id):
+        """(gone, new, removed_spans) alternatives for corner ``c``, best
+        first; removed_spans = [(X, Y, w)] copper taken away that something
+        else might hang on."""
+        layer = c.layer
+        V = (c.x, c.y)
+        s1, s2 = c.segs
+        if c.kind == 'tee':
+            # s2 is the trunk, V lies on its body; the branch s1 leaves V
+            branch, trunk = s1, s2
+            C = other_end(branch, V)
+            bx, by = C[0] - V[0], C[1] - V[1]
+            for A, B in (((trunk.start_x, trunk.start_y), (trunk.end_x, trunk.end_y)),
+                         ((trunk.end_x, trunk.end_y), (trunk.start_x, trunk.start_y))):
+                if interior_angle(A[0] - V[0], A[1] - V[1], bx, by) >= min_angle - 0.5:
+                    continue      # the acute side is towards A
+                for P, Q in tee_cut_candidates(V, A, C, min_angle, step,
+                                               width=max(trunk.width, branch.width)):
+                    new = [seg(B, P, trunk.width, layer, net_id),
+                           seg(P, A, trunk.width, layer, net_id),
+                           seg(P, Q, branch.width, layer, net_id)]
+                    if math.hypot(C[0] - Q[0], C[1] - Q[1]) > 1e-6:
+                        new.append(seg(Q, C, branch.width, layer, net_id))
+                    yield [trunk, branch], new, [(V, Q, branch.width)], [(P, Q, branch.width)]
+            return
+        at_v = [o for o in segs if o.layer == layer
+                and _key(*V) in (_key(o.start_x, o.start_y), _key(o.end_x, o.end_y))]
+        A, C = other_end(s1, V), other_end(s2, V)
+        if c.angle < 1.0 and len(at_v) == 2:
+            # a fold: both tracks leave V the same way; keep the copper they
+            # overlap as one track
+            w = max(s1.width, s2.width)
+            new = ([seg(A, C, w, layer, net_id)]
+                   if math.hypot(C[0] - A[0], C[1] - A[1]) > 1e-6 else [])
+            yield [s1, s2], new, [(V, A, s1.width), (V, C, s2.width)], []
+            return
+        if len(at_v) == 2:
+            w = max(s1.width, s2.width)
+            extra = []
+            for (ex, ey) in (A, C):
+                lx, ly = ex - V[0], ey - V[1]
+                if abs(lx) > 1e-6 and abs(ly) > 1e-6 and abs(abs(lx) - abs(ly)) > 1e-4:
+                    extra += [(-ly, lx), (ly, -lx)]   # a leg off the 45 grid
+            for P, Q in corner_cut_candidates(V, A, C, min_angle, step, extra, width=w):
+                new = [n for n in (seg(A, P, s1.width, layer, net_id),
+                                   seg(P, Q, w, layer, net_id),
+                                   seg(Q, C, s2.width, layer, net_id))
+                       if math.hypot(n.end_x - n.start_x, n.end_y - n.start_y) > 1e-6]
+                yield [s1, s2], new, [(V, P, s1.width), (V, Q, s2.width)], [(P, Q, w)]
+            return
+        # a Y joint: one of the pair is the trunk, the other the branch
+        for trunk, branch in ((s1, s2), (s2, s1)):
+            At, Cb = other_end(trunk, V), other_end(branch, V)
+            for P, Q in tee_cut_candidates(V, At, Cb, min_angle, step,
+                                           width=max(trunk.width, branch.width)):
+                new = [seg(V, P, trunk.width, layer, net_id),
+                       seg(P, At, trunk.width, layer, net_id),
+                       seg(P, Q, branch.width, layer, net_id)]
+                if math.hypot(Cb[0] - Q[0], Cb[1] - Q[1]) > 1e-6:
+                    new.append(seg(Q, Cb, branch.width, layer, net_id))
+                yield [trunk, branch], new, [(V, Q, branch.width)], [(P, Q, branch.width)]
+
+    for net_id in nets:
+        segs = [s for s in pcb_data.segments if s.net_id == net_id]
+        vias = vias_by_net.get(net_id, [])
+        pads = pcb_data.pads_by_net.get(net_id, [])
+        tried = set()
+        for _round in range(6):
+            found = acute_corners(segs, vias, pads, min_angle)
+            if not found:
+                break
+            done_here = 0
+            for c in found:
+                _now = {id(x) for x in segs}
+                if any(id(x) not in _now for x in c.segs):
+                    continue
+                ck = (c.layer, _key(c.x, c.y), c.kind)
+                if ck in tried:
+                    continue
+                tried.add(ck)
+                if any(getattr(x, 'graphic', False) or is_immutable_copper(x)
+                       or _sense_copper(x) or (editable and not editable(x))
+                       for x in c.segs):
+                    count('read_only')
+                    continue
+                layer = c.layer
+                committed = False
+                for gone, new, spans, laid in plans(c, segs, net_id):
+                    if not all(clears(P[0], P[1], Q[0], Q[1], layer, net_id, w)
+                               for P, Q, w in laid):
+                        continue
+                    gone_ids = {id(g) for g in gone}
+                    others = [o for o in segs if id(o) not in gone_ids]
+
+                    def covered(x, y, r):
+                        return any(_pt_seg_dist(x, y, n.start_x, n.start_y, n.end_x, n.end_y)
+                                   <= n.width / 2.0 + r for n in new + others
+                                   if n.layer == layer)
+                    # nothing may hang on the copper taken away
+                    hang = False
+                    for (X, Y, wd) in spans:
+                        for o in others:
+                            if o.layer != layer:
+                                continue
+                            for (x, y) in ((o.start_x, o.start_y), (o.end_x, o.end_y)):
+                                if (_pt_seg_dist(x, y, X[0], X[1], Y[0], Y[1])
+                                        <= o.width / 2.0 + wd / 2.0
+                                        and not any(_pt_seg_dist(x, y, n.start_x, n.start_y,
+                                                                 n.end_x, n.end_y)
+                                                    <= n.width / 2.0 + o.width / 2.0
+                                                    for n in new)
+                                        and not any(_pt_seg_dist(x, y, n.start_x, n.start_y,
+                                                                 n.end_x, n.end_y) <= 1e-4
+                                                    for n in others if n is not o)):
+                                    hang = True
+                        for v in vias:
+                            vr = (getattr(v, 'size', 0) or 0) / 2.0
+                            if (_pt_seg_dist(v.x, v.y, X[0], X[1], Y[0], Y[1]) <= vr + wd / 2.0
+                                    and not covered(v.x, v.y, vr)):
+                                hang = True
+                    if hang:
+                        continue
+                    trial = others + new
+                    near = set()
+                    for n in new:
+                        near.add(_key(n.start_x, n.start_y))
+                        near.add(_key(n.end_x, n.end_y))
+                    if any(_key(k.x, k.y) in near for k in acute_corners(
+                            [x for x in trial if x.layer == layer], vias, pads,
+                            min_angle)):
+                        continue
+                    if _soft_joint_pairs(trial, vias, pads) - _soft_joint_pairs(
+                            segs, vias, pads):
+                        continue
+                    if _kicad_dangling_count(trial, vias, pads, copper) > \
+                            _kicad_dangling_count(segs, vias, pads, copper):
+                        continue
+                    if _shallow_entry_keys(trial, vias, pads) - _shallow_entry_keys(
+                            segs, vias, pads):
+                        continue
+                    before = check_net_connectivity(net_id, segs, vias, pads, [])
+                    after = check_net_connectivity(net_id, trial, vias, pads, [])
+                    if (len(after.get('disconnected_pads') or [])
+                            > len(before.get('disconnected_pads') or [])
+                            or (after.get('num_components') or 1)
+                            > (before.get('num_components') or 1)):
+                        continue
+                    res = None
+                    for g in gone:
+                        removed_ids.add(id(g))
+                        if id(g) in routed:
+                            res = res or routed[id(g)]
+                        else:
+                            strip.append(g)
+                    if res is None:
+                        res = {'new_segments': [], 'new_vias': [],
+                               'cleanup': 'acute_corner'}
+                        results.append(res)
+                    res['new_segments'] = list(res.get('new_segments') or []) + new
+                    for n in new:
+                        routed[id(n)] = res
+                    added.extend(new)
+                    pcb_data.segments = [x for x in pcb_data.segments
+                                         if id(x) not in gone_ids] + new
+                    segs = trial
+                    fixed += 1
+                    done_here += 1
+                    committed = True
+                    if hasattr(pcb_data, '_foreign_seg_arr_cache'):
+                        pcb_data._foreign_seg_arr_cache = None
+                    break
+                if not committed:
+                    count('no_clear_fix')
+            if not done_here:
+                break
+    if removed_ids:
+        for r in results:
+            if r.get('new_segments'):
+                r['new_segments'] = [x for x in r['new_segments']
+                                     if id(x) not in removed_ids]
+    # input copper replaced and then replaced again is stripped once
+    strip = [x for i, x in enumerate(strip) if all(x is not y for y in strip[:i])]
+    if added:
+        added = [x for x in added if id(x) not in removed_ids]
+        try:
+            delattr(pcb_data, '_plane_fill_models')
+        except AttributeError:
+            pass
+        try:
+            import plane_fill_model as _pfm
+            _pfm._MODELS_BY_ZONE_ID.clear()
+        except Exception:
+            pass
+    return fixed, strip, added
+
+
 def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
                              clearance: float = 0.1,
                              keep_input_copper: bool = False,

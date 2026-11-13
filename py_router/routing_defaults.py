@@ -56,6 +56,18 @@ UNBLOCK_REFIT_MARGIN_MM = 0.05  # mm (absolute; NOT a fraction like check_drc's 
 VIA_COST = 75  # 50 -> 75: #586 corpus (via75: -8 verdict, DRC -13, and composes with hw 2.3)
 VIA_PROXIMITY_COST = 10
 TURN_COST = 1000
+# Corners (GridRouter's windowed corner, the acute-corner cleanup, check_weird):
+# MAX_TURN_ANGLE is the sharpest corner the A* may lay, in degrees of heading
+# change (180 = free; 90 = no corner sharper than a right angle; 45 = no
+# right angles either). ACUTE_TURN_COST is charged per 45 degrees a corner
+# turns past 90 (an acute corner, an acid trap) on top of TURN_COST, so the
+# router takes one only where nothing else fits. MIN_CORNER_ANGLE is the
+# interior angle the cleanup restores and check_weird grades (Altium's Acute
+# Angle rule, 90 by default); a stricter MAX_TURN_ANGLE raises it to
+# 180 - MAX_TURN_ANGLE.
+MAX_TURN_ANGLE = 180.0
+ACUTE_TURN_COST = 4000
+MIN_CORNER_ANGLE = 90.0
 STUB_PROXIMITY_COST = 0.2
 TRACK_PROXIMITY_COST = 0.0
 
@@ -393,6 +405,9 @@ PARAM_RANGES = {
     'heuristic_weight': {'min': 1.0, 'max': 10.0, 'inc': 0.1, 'digits': 1},
     'proximity_heuristic_factor': {'min': 0.0, 'max': 0.2, 'inc': 0.01, 'digits': 2},
     'turn_cost': {'min': 0, 'max': 10000},
+    'max_turn_angle': {'min': 45, 'max': 180},
+    'acute_turn_cost': {'min': 0, 'max': 100000},
+    'min_corner_angle': {'min': 0, 'max': 180},
     'direction_preference_cost': {'min': 0, 'max': 10000},
     'max_ripup': {'min': 0, 'max': 50},
     'stub_proximity_radius': {'min': 0.0, 'max': 10.0, 'inc': 0.5, 'digits': 1},

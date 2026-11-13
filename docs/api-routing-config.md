@@ -56,6 +56,9 @@ Default net class, else `routing_defaults.py` (`TRACK_WIDTH` 0.3,
 | `heuristic_weight` | `2.3` | A* greediness (>1 = faster, possibly non-optimal paths); 1.9 -> 2.3 from the #586 corpus dose-response (peak at 2.3, both neighbors worse) |
 | `via_cost` | `75` | Via penalty, in grid steps at the reference grid; 50 -> 75 from the #586 corpus (DRC -13, composes with heuristic 2.3) |
 | `turn_cost` | `1000` | Penalty per direction change (straighter routes) |
+| `max_turn_angle` | `180.0` | Sharpest corner the A* may lay, degrees of heading change (180 = free, 90 = no acute corner, 45 = no right angle); over a window of the net's track width (`corner_kwargs`) |
+| `acute_turn_cost` | `4000` | Extra cost per 45 degrees a corner turns past 90 (0 = off) |
+| `min_corner_angle` | `90.0` | Interior angle the acute-corner cleanup restores and check_weird grades; `min_interior_angle()` raises it to 180 - `max_turn_angle` (0 = off) |
 | `direction_order` | `'forward'` | Try `'forward'` or `'backward'` direction first |
 
 ### Proximity penalties (soft costs)

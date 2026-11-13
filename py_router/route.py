@@ -296,6 +296,7 @@ def _dump_engine_config(engine, cfg):
 _FINALIZE_ROUTE_KNOBS = (
     'via_cost', 'ordering_strategy', 'direction_order', 'max_iterations',
     'max_probe_iterations', 'heuristic_weight', 'turn_cost',
+    'max_turn_angle', 'acute_turn_cost', 'min_corner_angle',
     'direction_preference_cost', 'proximity_heuristic_factor',
     'stub_proximity_radius', 'stub_proximity_cost', 'via_proximity_cost',
     'bga_proximity_radius', 'bga_proximity_cost', 'bga_exclusion_zones',
@@ -1649,7 +1650,7 @@ def _late_pad_exits(pcb_data, output_file, return_results, results_data,
     from collections import Counter
     from improvement_gate import copper_item_key
     from pcb_modification import (rebuild_pad_exits, close_soft_joints,
-                                  collapse_strict_redundant)
+                                  collapse_strict_redundant, fix_acute_corners)
     from cleanup_pipeline import pad_exit_skip_net_ids
     try:
         if return_results:
@@ -1684,16 +1685,27 @@ def _late_pad_exits(pcb_data, output_file, return_results, results_data,
         before = list(board.segments)
         added_res = []
         n_x = 0
+        n_ac = 0
         skip = pad_exit_skip_net_ids(board, config)
         left = {}
+        corners_left = {}
         for _round in range(3):
             left = {}
+            corners_left = {}
             n, _strip, added = rebuild_pad_exits(
                 added_res, board, scope, config,
                 editable=(None if not keep_input_copper
                           else (lambda x: id(x) in owned)),
                 skip_net_ids=skip, stats=left)
             n_x += n
+            n_c, _strip_c, added_c = fix_acute_corners(
+                added_res, board, scope, config,
+                editable=(None if not keep_input_copper
+                          else (lambda x: id(x) in owned)),
+                skip_net_ids=skip, stats=corners_left)
+            n_ac += n_c
+            added = list(added) + list(added_c)
+            n += n_c
             if not n:
                 break
             owned |= {id(x) for x in added}
@@ -1711,6 +1723,10 @@ def _late_pad_exits(pcb_data, output_file, return_results, results_data,
             print("  Pad exits (end of run): left as routed -- "
                   + ", ".join(f"{k.replace('_', ' ')} {v}"
                               for k, v in sorted(left.items())))
+        if corners_left:
+            print("  Acute corners (end of run): left as routed -- "
+                  + ", ".join(f"{k.replace('_', ' ')} {v}"
+                              for k, v in sorted(corners_left.items())))
         if not (removed or new):
             return 0, 0
         if return_results:
@@ -1750,6 +1766,9 @@ def _late_pad_exits(pcb_data, output_file, return_results, results_data,
                     _f.write(_c)
         print(f"  Pad exits (end of run): rebuilt {n_x} SMD exit(s) straight "
               f"out through an edge, {n_e} pad-entry connector(s)")
+        if n_ac:
+            print(f"  Acute corners (end of run): cut {n_ac} corner(s) to "
+                  f"{config.min_interior_angle():g} degrees or wider")
         return n_x, n_e
     except Exception as _e:                                     # noqa: BLE001
         print(f"  (end-of-run pad exits skipped: {type(_e).__name__}: {_e})")
@@ -2411,6 +2430,9 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                 max_probe_iterations: int = 5000,
                 heuristic_weight: float = defaults.HEURISTIC_WEIGHT,
                 turn_cost: int = 1000,
+                max_turn_angle: float = defaults.MAX_TURN_ANGLE,
+                acute_turn_cost: int = defaults.ACUTE_TURN_COST,
+                min_corner_angle: float = defaults.MIN_CORNER_ANGLE,
                 direction_preference_cost: int = defaults.DIRECTION_PREFERENCE_COST,
                 bus_enabled: bool = False,
                 bus_detection_radius: float = 5.0,
@@ -3334,6 +3356,9 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
         debug_memory=debug_memory, layer_costs=layer_costs
     )
     config_kwargs['power_tap_neckdown'] = power_tap_neckdown
+    config_kwargs['max_turn_angle'] = max_turn_angle
+    config_kwargs['acute_turn_cost'] = acute_turn_cost
+    config_kwargs['min_corner_angle'] = min_corner_angle
     # #1253: the rules the board's design brief declares join the caller's,
     # read here in the engine so the CLI and the GUI both get them with no
     # flag. Only the OUTERMOST call reads the brief: the nested sub-runs (the
@@ -5462,6 +5487,7 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
         # per step; KICAD_SMOOTH_ROUTE=0/1 still overrides either way.
         smooth=smoothing,
         pad_exits=True,
+        acute_corners=True,
         # #1063: the strict collapse runs ONCE, at the end of the outermost
         # run (_late_strict_collapse1063), never here -- the plane finalize
         # and the reconciliation route around this copper, and collapsing it
@@ -10475,6 +10501,23 @@ For differential pair routing, use route_diff.py:
                         help=f"A* heuristic weight, higher=faster but less optimal (default: {defaults.HEURISTIC_WEIGHT})")
     parser.add_argument("--turn-cost", type=int, default=defaults.TURN_COST,
                         help=f"Penalty for direction changes, encourages straighter paths (default: {defaults.TURN_COST})")
+    parser.add_argument("--max-turn-angle", type=float, default=defaults.MAX_TURN_ANGLE,
+                        choices=[45.0, 90.0, 135.0, 180.0], metavar="{45,90,135,180}",
+                        help="Sharpest corner the router may lay, in degrees of heading change "
+                             "(180 = free, the default; 90 = no corner sharper than a right angle, "
+                             "no acid traps; 45 = no right angles either). Consecutive turns closer "
+                             "than the net's track width count as one corner. A hard limit: a net "
+                             "that only fits with a sharper corner stays unrouted. Also raises "
+                             "--min-corner-angle to 180 minus this value.")
+    parser.add_argument("--acute-turn-cost", type=int, default=defaults.ACUTE_TURN_COST,
+                        help="Extra cost per 45 degrees a corner turns past 90 (an acute corner), on "
+                             "top of --turn-cost, so the router lays one only where nothing else "
+                             f"fits; 0 = off (default: {defaults.ACUTE_TURN_COST})")
+    parser.add_argument("--min-corner-angle", type=float, default=defaults.MIN_CORNER_ANGLE,
+                        help="Interior angle every same-net corner must keep, in degrees (Altium's "
+                             "Acute Angle rule). The end-of-run cleanup cuts sharper corners "
+                             "where the cut clears, and check_weird reports what is left as "
+                             f"acute-corner; 0 = off (default: {defaults.MIN_CORNER_ANGLE:g})")
     parser.add_argument("--direction-preference-cost", type=int, default=defaults.DIRECTION_PREFERENCE_COST,
                         help=f"Penalty for non-preferred layer direction, 0=disabled (default: {defaults.DIRECTION_PREFERENCE_COST})")
     parser.add_argument("--bus", action="store_true",
@@ -11234,6 +11277,9 @@ For differential pair routing, use route_diff.py:
                 max_probe_iterations=args.max_probe_iterations,
                 heuristic_weight=args.heuristic_weight,
                 turn_cost=args.turn_cost,
+                max_turn_angle=args.max_turn_angle,
+                acute_turn_cost=args.acute_turn_cost,
+                min_corner_angle=args.min_corner_angle,
                 direction_preference_cost=args.direction_preference_cost,
                 bus_enabled=args.bus,
                 bus_detection_radius=args.bus_detection_radius,
