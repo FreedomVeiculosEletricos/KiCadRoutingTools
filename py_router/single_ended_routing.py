@@ -2578,6 +2578,168 @@ def _per_net_via_config(config: GridRouteConfig, pcb_data, net_id: int) -> GridR
         return config
 
 
+#: Per-run tally of the exit funnels (install_exit_funnels): pads funnelled,
+#: pads left without one by reason, searches retried without funnels.
+FUNNEL_STATS = {'pads': 0, 'skipped': {}, 'retried': 0}
+
+
+def funnel_summary() -> Optional[str]:
+    """One line on the exit funnels since the last summary (FUNNEL_STATS,
+    which it then zeroes), None when no search funnelled a pad."""
+    st = dict(FUNNEL_STATS)
+    FUNNEL_STATS.update(pads=0, skipped={}, retried=0)
+    if not st['pads'] and not st['skipped']:
+        return None
+    why = ', '.join(f"{k} {v}" for k, v in sorted(st['skipped'].items()))
+    return (f"SMD exit funnels: {st['pads']} pad exit(s) funnelled"
+            + (f"; left free: {why}" if why else '')
+            + (f"; {st['retried']} search(es) retried without them"
+               if st['retried'] else ''))
+
+
+def _funnel_skip_net_ids(pcb_data, config):
+    """Nets whose SMD exits are left as laid (cleanup_pipeline
+    pad_exit_skip_net_ids: protected, coupled, impedance, length-graded),
+    computed once per board."""
+    ids = getattr(pcb_data, '_funnel_skip_net_ids', None)
+    if ids is None:
+        try:
+            from cleanup_pipeline import pad_exit_skip_net_ids
+            ids = set(pad_exit_skip_net_ids(pcb_data, config))
+        except Exception:                                      # noqa: BLE001
+            ids = set()
+        try:
+            pcb_data._funnel_skip_net_ids = ids
+        except Exception:                                      # noqa: BLE001
+            pass
+    return ids
+
+
+def install_exit_funnels(obstacles, pcb_data, net_id, config, sources, targets,
+                         coord):
+    """Close the net's terminal SMD pads to every move but their exit
+    funnels (pad_entry.exit_funnel) on ``obstacles`` for this search, so it
+    lays Altium-compliant exits by construction.
+
+    A pad is funnelled when it is a terminal of ONE side: that side's rows
+    (``sources`` or ``targets``, get_net_endpoints row shape) hold its centre
+    cell, the other side has no row on it, and no via of the net lands on
+    it. The side's other rows on the pad (its island's landing cells, tap
+    points on copper already there) are dropped, so the search reaches the
+    pad at its centre, through a funnel. Returns ``(pads funnelled, sources, targets)``; the masks stay
+    on the map until clear_move_masks."""
+    if (not getattr(config, 'smd_exit_funnel', False)
+            or not hasattr(obstacles, 'set_move_masks_batch')
+            or net_id in _funnel_skip_net_ids(pcb_data, config)):
+        return 0, sources, targets
+    import math as _math
+    import numpy as _np
+    from pad_entry import exit_funnel, smd_gradable, pad_depth, funnel_penalty_units
+    layer_names = config.layers
+    sides = (list(sources), list(targets))
+    # The rows by cell, per side: a pad looks only at the cells around it (a
+    # tap's rows are every cell of the copper already laid -- thousands).
+    by_cell = []
+    for rows in sides:
+        d = {}
+        for r in rows:
+            d.setdefault((r[0], r[1], r[2]), []).append(r)
+        by_cell.append(d)
+    net_vias = [v for v in pcb_data.vias if v.net_id == net_id]
+    g = config.grid_step
+    masks = {}
+    drop = set()
+    n = 0
+    skipped = FUNNEL_STATS['skipped']
+
+    def _skip(why):
+        skipped[why] = skipped.get(why, 0) + 1
+
+    for pad in pcb_data.pads_by_net.get(net_id, []) or []:
+        cg = coord.to_grid(pad.global_x, pad.global_y)
+        for li, lname in enumerate(layer_names):
+            key = (cg[0], cg[1], li)
+            if key not in by_cell[0] and key not in by_cell[1]:
+                continue                  # no row at its centre: not a terminal
+            if not smd_gradable(pad, lname):
+                continue
+            width = config.get_net_track_width(net_id, lname)
+            reach = width / 2.0 + g
+            span = int(_math.ceil((_math.hypot(pad.size_x, pad.size_y) / 2.0
+                                   + reach) / g)) + 1
+
+            def near_rows(d):
+                out = []
+                for gx in range(cg[0] - span, cg[0] + span + 1):
+                    for gy in range(cg[1] - span, cg[1] + span + 1):
+                        for r in d.get((gx, gy, li), ()):
+                            if pad_depth(pad, *coord.to_float(gx, gy)) > -reach:
+                                out.append(r)
+                return out
+
+            near = [near_rows(d) for d in by_cell]
+            centre = [any((r[0], r[1]) == cg and (len(r) < 5 or (
+                abs(r[3] - pad.global_x) < 1e-3 and abs(r[4] - pad.global_y) < 1e-3))
+                for r in rows) for rows in near]
+            if not any(centre):
+                continue                  # not a terminal of this search
+            side = 0 if centre[0] else 1
+            if centre[1 - side] or near[1 - side]:
+                _skip('other-endpoint')
+                continue
+            # A via in the pad is the pad's own way out; tracks already on
+            # it are not -- their tap rows on the pad are dropped below and
+            # the search leaves the pad's centre through a funnel.
+            if any(pad_depth(pad, v.x, v.y) > -v.size / 2.0 for v in net_vias):
+                _skip('own-via')
+                continue
+            cells, why = exit_funnel(
+                pad, li, width, config.grid_step,
+                blocked=lambda gx, gy, _l=li: obstacles.is_blocked(gx, gy, _l))
+            if cells is None:
+                _skip(why)
+                continue
+            for k, m in cells.items():
+                masks[k] = masks[k] & m if k in masks else m
+            for r in near[side]:
+                if (r[0], r[1]) != cg and (r[0], r[1], li) in cells:
+                    drop.add((r[0], r[1], r[2]))
+            n += 1
+    if not n:
+        return 0, sources, targets
+    kept = [[r for r in rows if (r[0], r[1], r[2]) not in drop] for rows in sides]
+    if not kept[0] or not kept[1]:
+        return 0, sources, targets
+    obstacles.set_move_masks_batch(_np.array(
+        [(gx, gy, li, m) for (gx, gy, li), m in masks.items()], dtype=_np.int32))
+    obstacles.set_move_mask_penalty(funnel_penalty_units(config))
+    FUNNEL_STATS['pads'] += n
+    return n, kept[0], kept[1]
+
+
+def _search_with_funnels(obstacles, pcb_data, net_id, config, sources, targets,
+                         coord, search):
+    """Run ``search(sources, targets)`` (a _route_with_via_unblock call: its
+    result's first item is the path) with the exit funnels of the rows' pads
+    installed (install_exit_funnels); when the funnels leave no path, run it
+    once more without them, on the original rows. The funnels never outlive
+    the call."""
+    n, f_src, f_tgt = install_exit_funnels(obstacles, pcb_data, net_id, config,
+                                           sources, targets, coord)
+    try:
+        if not n:
+            return search(sources, targets)
+        out = search(f_src, f_tgt)
+        if out[0] is None:
+            obstacles.clear_move_masks()
+            FUNNEL_STATS['retried'] += 1
+            out = search(sources, targets)
+        return out
+    finally:
+        if n:
+            obstacles.clear_move_masks()
+
+
 def route_net_with_obstacles(pcb_data: PCBData, net_id: int, config: GridRouteConfig,
                               obstacles: GridObstacleMap, *args, **kwargs) -> Optional[dict]:
     """Route a single net on `obstacles`; see `_route_net_with_obstacles_impl`.
@@ -2587,10 +2749,25 @@ def route_net_with_obstacles(pcb_data: PCBData, net_id: int, config: GridRouteCo
     the layers a track ban forbids it are forbidden layers of the route
     (`net_keepouts.config_for_nets`, #1527)."""
     from net_keepouts import stamp as _nk_stamp, config_for_nets
+    _clear = getattr(obstacles, 'clear_move_masks', None)
     with _nk_stamp(obstacles, pcb_data, (net_id,), config):
-        return _route_net_with_obstacles_impl(
-            pcb_data, net_id, config_for_nets(pcb_data, (net_id,), config),
-            obstacles, *args, **kwargs)
+        _cfg = config_for_nets(pcb_data, (net_id,), config)
+        try:
+            res = _route_net_with_obstacles_impl(
+                pcb_data, net_id, _cfg, obstacles, *args, **kwargs)
+            funnelled = _clear is not None and obstacles.move_mask_count() > 0
+        finally:
+            if _clear is not None:
+                _clear()
+        if funnelled and (res is None or res.get('failed')):
+            # Exit funnels are a stage-1 construction: a pad whose allowed
+            # edges are all blocked would leave the net unrouted. Route it as
+            # before; the end-of-run pad-exit pass grades what it lays.
+            FUNNEL_STATS['retried'] += 1
+            res = _route_net_with_obstacles_impl(
+                pcb_data, net_id, replace(_cfg, smd_exit_funnel=False),
+                obstacles, *args, **kwargs)
+        return res
 
 
 def _route_net_with_obstacles_impl(pcb_data: PCBData, net_id: int, config: GridRouteConfig,
@@ -2761,6 +2938,15 @@ def _route_net_with_obstacles_impl(pcb_data: PCBData, net_id: int, config: GridR
     for gx, gy, layer in sources_grid + targets_grid:
         if _exempt_ok(gx, gy):
             obstacles.add_source_target_cell(gx, gy, layer)
+
+    # SMD pad exit funnels (pad_entry.exit_funnel): the search reaches a bare
+    # terminal SMD pad only straight out through an allowed edge. Cleared by
+    # route_net_with_obstacles after the route.
+    _nf, sources, targets = install_exit_funnels(
+        obstacles, pcb_data, net_id, config, sources, targets, coord)
+    if _nf:
+        sources_grid = [(s[0], s[1], s[2]) for s in sources]
+        targets_grid = [(t[0], t[1], t[2]) for t in targets]
 
     # Calculate vertical attraction parameters
     attraction_radius_grid = coord.to_grid_dist(config.vertical_attraction_radius) if config.vertical_attraction_radius > 0 else 0
@@ -5589,11 +5775,12 @@ def _route_multipoint_main_impl(
         # corridor waypoints (tap edges follow their own buckets later).
         (path, total_iterations, forward_blocked, backward_blocked, reversed_path,
          fwd_iters, bwd_iters, necked_down, uniform_width, main_unblock_vias,
-         main_unblock_segments) = _route_with_via_unblock(
-            router, obstacles, config, sources, targets, track_margin,
-            pcb_data, net_id, print_prefix="  ", direction_labels=("forward", "backward"),
-            waypoints=waypoint_buckets.get(frozenset((idx_a, idx_b)), [])
-        )
+         main_unblock_segments) = _search_with_funnels(
+            obstacles, pcb_data, net_id, config, sources, targets, coord,
+            lambda _s, _t: _route_with_via_unblock(
+                router, obstacles, config, _s, _t, track_margin,
+                pcb_data, net_id, print_prefix="  ", direction_labels=("forward", "backward"),
+                waypoints=waypoint_buckets.get(frozenset((idx_a, idx_b)), [])))
         cumulative_iterations += total_iterations
 
         if path is not None:
@@ -6628,12 +6815,13 @@ def _route_multipoint_taps_impl(
         with deferred_diagnostics(config) as _edge_diag:
             (path, tap_iterations, forward_blocked, backward_blocked, reversed_tap_path,
              _, _, necked_down, uniform_width, unblock_vias,
-             unblock_segments) = _route_with_via_unblock(
-                router, obstacles, config, sources, targets, track_margin,
-                pcb_data, net_id, print_prefix="      ", direction_labels=("forward", "backward"),
-                waypoints=waypoint_buckets.get(frozenset((src_idx, tgt_idx)), []),
-                pending_vias=all_vias, pad_sources=False
-            )
+             unblock_segments) = _search_with_funnels(
+                obstacles, pcb_data, net_id, config, sources, targets, coord,
+                lambda _s, _t: _route_with_via_unblock(
+                    router, obstacles, config, _s, _t, track_margin,
+                    pcb_data, net_id, print_prefix="      ", direction_labels=("forward", "backward"),
+                    waypoints=waypoint_buckets.get(frozenset((src_idx, tgt_idx)), []),
+                    pending_vias=all_vias, pad_sources=False))
 
             if path is None:
                 # Multipoint parity rung (#424): the #189 unblock inside the

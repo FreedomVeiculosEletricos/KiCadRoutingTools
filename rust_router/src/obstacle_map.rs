@@ -262,6 +262,17 @@ pub struct GridObstacleMap {
     /// Free via positions: positions where layer changes have zero cost
     /// (e.g., through-hole pads on the same net - reuse existing holes instead of adding vias)
     pub free_via_positions: FxHashSet<u64>,
+    /// SMD pad exit funnels (pad_entry.exit_funnel_masks): per layer, packed
+    /// (gx, gy) -> bitmask of the octants (router::octant_index) a move may
+    /// take INTO or OUT OF that cell. A cell with no entry is free; a cell
+    /// with mask 0 is closed to the net being routed. Per route, like the
+    /// source/target cells: set before the search, cleared after it.
+    pub move_masks: Vec<FxHashMap<u64, u8>>,
+    /// Cost of a move a move mask does not allow: 0 = the move is barred
+    /// (a hard funnel); > 0 = it is allowed at this extra cost (a soft
+    /// funnel: the search leaves a pad off its funnel only when the
+    /// compliant way costs more, e.g. a via).
+    pub move_mask_penalty: i32,
 }
 
 #[pymethods]
@@ -287,6 +298,8 @@ impl GridObstacleMap {
             endpoint_exempt_positions: Vec::new(),
             endpoint_exempt_radius: 0,
             free_via_positions: FxHashSet::default(),
+            move_masks: (0..num_layers).map(|_| FxHashMap::default()).collect(),
+            move_mask_penalty: 0,
         }
     }
 
@@ -313,6 +326,39 @@ impl GridObstacleMap {
         if layer < self.num_layers {
             self.source_target_cells[layer].insert(pack_xy(gx, gy));
         }
+    }
+
+    /// Set the move masks of a batch of cells: rows of [gx, gy, layer, mask],
+    /// mask a bitmask of router octants (bit k = octant k). Replaces any mask
+    /// a cell had. See `move_masks`.
+    pub fn set_move_masks_batch(&mut self, rows: PyReadonlyArray2<i32>) {
+        let a = rows.as_array();
+        for r in a.outer_iter() {
+            let layer = r[2] as usize;
+            if layer < self.num_layers {
+                self.move_masks[layer].insert(pack_xy(r[0], r[1]), (r[3] & 0xFF) as u8);
+            }
+        }
+    }
+
+    /// Drop every move mask (the end of a route); the penalty goes back to
+    /// 0 (hard).
+    pub fn clear_move_masks(&mut self) {
+        for m in &mut self.move_masks {
+            m.clear();
+        }
+        self.move_mask_penalty = 0;
+    }
+
+    /// Cost of a move the masks do not allow; 0 bars it. See
+    /// `move_mask_penalty`.
+    pub fn set_move_mask_penalty(&mut self, penalty: i32) {
+        self.move_mask_penalty = penalty.max(0);
+    }
+
+    /// Number of cells carrying a move mask, all layers.
+    pub fn move_mask_count(&self) -> usize {
+        self.move_masks.iter().map(|m| m.len()).sum()
     }
 
     /// Clear all source/target cells
@@ -344,6 +390,8 @@ impl GridObstacleMap {
             endpoint_exempt_positions: self.endpoint_exempt_positions.clone(),
             endpoint_exempt_radius: self.endpoint_exempt_radius,
             free_via_positions: self.free_via_positions.clone(),
+            move_masks: self.move_masks.clone(),
+            move_mask_penalty: self.move_mask_penalty,
         }
     }
 
@@ -371,6 +419,8 @@ impl GridObstacleMap {
             endpoint_exempt_positions: self.endpoint_exempt_positions.clone(),
             endpoint_exempt_radius: self.endpoint_exempt_radius,
             free_via_positions: self.free_via_positions.clone(),
+            move_masks: (0..self.num_layers).map(|_| FxHashMap::default()).collect(),
+            move_mask_penalty: 0,
         }
     }
 
@@ -1076,6 +1126,38 @@ impl GridObstacleMap {
                 }
             }
         }
+    }
+
+    /// May a same-layer move of octant `oct` go from (gx, gy) to (nx, ny)?
+    /// Both cells' move masks (when they have one) must allow that octant.
+    #[inline]
+    pub fn move_allowed(&self, gx: i32, gy: i32, nx: i32, ny: i32, layer: usize, oct: i32) -> bool {
+        let Some(m) = self.move_masks.get(layer) else { return true };
+        if m.is_empty() {
+            return true;
+        }
+        let bit = 1u8 << (oct as u8 & 7);
+        if let Some(&a) = m.get(&pack_xy(gx, gy)) {
+            if a & bit == 0 {
+                return false;
+            }
+        }
+        if let Some(&b) = m.get(&pack_xy(nx, ny)) {
+            if b & bit == 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// May a via go at (gx, gy)? Not inside an SMD exit funnel: a cell with
+    /// a move mask on any layer is part of a funnelled pad's copper zone or
+    /// exit line, and a layer change there would leave the pad around the
+    /// funnel (a via in the pad instead of the straight exit).
+    #[inline]
+    pub fn via_masked(&self, gx: i32, gy: i32) -> bool {
+        let key = pack_xy(gx, gy);
+        self.move_masks.iter().any(|m| !m.is_empty() && m.contains_key(&key))
     }
 
     /// Check if cell is blocked

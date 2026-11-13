@@ -95,8 +95,17 @@ def vertices(segs):
 
 
 def end_pads(points):
+    """Through-hole end pads: an SMD pad's exit run is pinned by the SMD
+    exit guard (test_smooth_smd_exit_guard), and these cases are about the
+    collapse itself."""
     (ax, ay), (bx, by) = points[0], points[-1]
-    return {1: [_pad('U1', ax, ay, 1, '/SIG'), _pad('U2', bx, by, 1, '/SIG')]}
+    return {1: [_tht(_pad('U1', ax, ay, 1, '/SIG')),
+                _tht(_pad('U2', bx, by, 1, '/SIG'))]}
+
+
+def _tht(pad):
+    pad.drill = 0.3
+    return pad
 
 
 def foreign_pad_ok(pcb):

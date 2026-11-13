@@ -202,6 +202,13 @@ class GridRouteConfig:
     max_turn_angle: float = 180.0
     acute_turn_cost: int = 4000
     min_corner_angle: float = 90.0
+    # SMD pad exit funnels (pad_entry.exit_funnel, routing_defaults
+    # SMD_EXIT_FUNNEL): the single-ended search reaches a terminal SMD pad
+    # only straight out through an allowed edge.
+    smd_exit_funnel: bool = True
+    # Cost of each grid step a route takes off a funnel, in vias
+    # (routing_defaults SMD_EXIT_FUNNEL_PENALTY); 0 = a hard funnel.
+    smd_exit_funnel_penalty: float = 0.5
     # BGA exclusion zones (auto-detected from PCB) - vias blocked inside these areas
     bga_exclusion_zones: List[Tuple[float, float, float, float]] = field(default_factory=list)
     stub_proximity_radius: float = 2.0  # mm - radius around stubs to penalize

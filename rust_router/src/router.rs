@@ -743,6 +743,19 @@ impl GridSearch {
                 let ngx = current.gx + dx;
                 let ngy = current.gy + dy;
 
+                // SMD pad exit funnels: around a terminal pad only the moves
+                // straight out through an allowed edge are open; any other
+                // move is barred (hard funnel) or pays the funnel penalty.
+                let funnel_cost = if obstacles.move_allowed(current.gx, current.gy, ngx, ngy,
+                                                            current.layer as usize, octant_index(dx, dy)) {
+                    0
+                } else if obstacles.move_mask_penalty > 0 {
+                    obstacles.move_mask_penalty
+                } else {
+                    sink.on_blocked(ngx, ngy, current.layer);
+                    continue;
+                };
+
                 if obstacles.segment_blocked(current.gx, current.gy, ngx, ngy,
                                              current.layer as usize,
                                              self.opts.track_margin.at(current.layer as usize)) {
@@ -839,7 +852,7 @@ impl GridSearch {
                         - router.path_attraction_potential(current.gx, current.gy, current.layer);
                     (step_cost - d_phi).max(move_cost / 10)
                 } else { step_cost };
-                let new_g = g + step_cost;
+                let new_g = g.saturating_add(step_cost).saturating_add(funnel_cost);
 
                 if new_g < existing_g {
                     if existing_g != i32::MAX {
@@ -919,7 +932,8 @@ impl GridSearch {
         // dropped a couple cells away beside a perfectly good via-in-pad.
         let free_here = obstacles.is_free_via(current.gx, current.gy);
         if can_place_via && (!via_too_close || free_here)
-            && (!obstacles.is_via_blocked_rung(current.gx, current.gy, self.opts.via_rung) || free_here) {
+            && (!obstacles.is_via_blocked_rung(current.gx, current.gy, self.opts.via_rung) || free_here)
+            && (free_here || !obstacles.via_masked(current.gx, current.gy)) {
             for layer in 0..obstacles.num_layers as u8 {
                 if layer == current.layer {
                     continue;

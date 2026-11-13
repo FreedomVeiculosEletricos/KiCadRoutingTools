@@ -351,3 +351,178 @@ def grade_pad_exit(pad, pts, width, allow_side: bool = SMD_ENTRY_SIDE):
         run += math.hypot(sx - qx, sy - qy)
         j += 1
     return out
+
+
+# --- exit funnels: the router lays compliant exits by construction ---------
+
+#: Router octant of a unit grid step (rust_router router.rs octant_index); a
+#: move mask's bit k allows octant k.
+_OCTANT = {(1, 0): 0, (1, 1): 1, (0, 1): 2, (-1, 1): 3,
+           (-1, 0): 4, (-1, -1): 5, (0, -1): 6, (1, -1): 7}
+
+
+
+def funnel_penalty_units(config) -> int:
+    """The router cost of one grid step off an exit funnel (the GridObstacleMap
+    move-mask penalty): ``config.smd_exit_funnel_penalty`` vias, 0 = barred."""
+    from routing_defaults import SMD_EXIT_FUNNEL_PENALTY
+    vias = getattr(config, 'smd_exit_funnel_penalty', SMD_EXIT_FUNNEL_PENALTY)
+    return max(0, int(round(vias * config.via_cost_units())))
+
+
+def _axis_rotation(pad) -> Optional[bool]:
+    """None when the pad is not at a multiple of 90 degrees; else whether its
+    x and y swap on the board (90 / 270)."""
+    rot = (getattr(pad, 'rect_rotation', 0.0) or 0.0) % 180.0
+    if abs(rot) < 1e-6 or abs(rot - 180.0) < 1e-6:
+        return False
+    if abs(rot - 90.0) < 1e-6:
+        return True
+    return None
+
+
+def exit_funnel(pad, layer_idx: int, width: float, grid_step: float,
+                allow_side: bool = SMD_ENTRY_SIDE, blocked=None):
+    """The move masks that make a grid route reach ``pad``'s centre only
+    through an Altium-compliant exit, as ``({(gx, gy, layer_idx): mask},
+    n_exits)``; ``(None, why)`` when the pad gets no funnel.
+
+    Around the pad, the cells where a ``width`` track's copper would touch it
+    are closed (mask 0), except the funnel lines: from the centre cell
+    straight out along each allowed edge normal (allowed_exits) that runs on a
+    grid line, to ``exit_distance(width)`` past the outline. A funnel cell
+    allows only moves along its line, so a route leaves the pad perpendicular
+    to an edge and keeps straight to the exit distance before it may turn
+    (SMD Entry and SMD To Corner), and no route grazes, crosses or ends on
+    the pad anywhere else. The centre cell allows every funnel's direction.
+
+    A pad whose centre is off the grid gets its funnel lines on the grid
+    lines nearest its axes: the line then crosses the edge a little off the
+    middle, which is still straight out through the edge as long as the
+    track's copper stays within the edge's span; an exit where it would not
+    (a fine-pitch pad half a grid step off) is left out. Every line is graded
+    as a finished exit (grade_pad_exit) before it is offered.
+
+    ``blocked(gx, gy)``, when given, says whether the search may not enter a
+    cell; an exit with a blocked cell on its line or at its mouth is left out,
+    so a funnel never offers a dead end.
+
+    Axis-aligned, non-round SMD pads only; a pad with no exit left gets no
+    funnel (``why`` 'off-grid' or 'blocked')."""
+    geo = _funnel_geometry(pad, width, grid_step, allow_side)
+    if isinstance(geo, str):
+        return None, geo
+    closed, exits = geo
+    lines = {}
+    n_exits = 0
+    n_blocked = 0
+    for line, mouth, bits in exits:
+        if blocked is not None and (blocked(*mouth)
+                                    or any(blocked(gx, gy) for gx, gy in line[1:])):
+            n_blocked += 1                # a dead end (the mouth included)
+            continue
+        for c in line:
+            lines[c] = lines.get(c, 0) | bits
+        n_exits += 1
+    if not lines:
+        return None, ('blocked' if n_blocked else 'off-grid')
+    out = {(gx, gy, layer_idx): 0 for gx, gy in closed if (gx, gy) not in lines}
+    for (gx, gy), m in lines.items():
+        out[(gx, gy, layer_idx)] = m
+    return out, n_exits
+
+
+#: _funnel_geometry results by pad geometry, track width, grid and side rule.
+#: A search installs the same pads' funnels many times (every tap, every
+#: retry); the geometry never changes, only which exits are blocked.
+_FUNNEL_GEOMETRY_CACHE = {}
+
+
+def _funnel_geometry(pad, width: float, grid_step: float, allow_side: bool):
+    """exit_funnel's board-independent half: ``(closed cells, exits)`` with
+    each exit ``(line cells incl. the centre cell, mouth cell, move bits)``
+    and every exit graded as laid (grade_pad_exit); or the reason the pad
+    gets no funnel ('round', 'rotation', 'off-grid'). Cached."""
+    key = (round(pad.global_x, 6), round(pad.global_y, 6), pad.size_x,
+           pad.size_y, getattr(pad, 'rect_rotation', 0.0) or 0.0,
+           getattr(pad, 'shape', None), _corner_radius(pad), round(width, 6),
+           round(grid_step, 6), bool(allow_side))
+    hit = _FUNNEL_GEOMETRY_CACHE.get(key)
+    if hit is not None:
+        return hit
+    if len(_FUNNEL_GEOMETRY_CACHE) > 50000:
+        _FUNNEL_GEOMETRY_CACHE.clear()
+    geo = _FUNNEL_GEOMETRY_CACHE[key] = _funnel_geometry_uncached(
+        pad, width, grid_step, allow_side)
+    return geo
+
+
+def _funnel_geometry_uncached(pad, width, grid_step, allow_side):
+    if _round_pad(pad):
+        return 'round'
+    swap = _axis_rotation(pad)
+    if swap is None:
+        return 'rotation'
+    g = float(grid_step)
+    cx, cy = pad.global_x, pad.global_y
+    hx, hy = pad.size_x / 2.0, pad.size_y / 2.0
+    if swap:
+        hx, hy = hy, hx
+    inv = 1.0 / g                         # GridCoord.to_grid, to the same cell
+    gcx, gcy = round(cx * inv), round(cy * inv)
+    r = width / 2.0
+    run = exit_distance(width)
+    exits = []
+    for lx, ly in allowed_exits(pad, allow_side):
+        bx, by = to_board_dir(pad, lx, ly)
+        nx, ny = int(round(bx)), int(round(by))
+        if (nx, ny) not in _OCTANT or (nx and ny):
+            continue
+        half = hx if nx else hy
+        bits = (1 << _OCTANT[(nx, ny)]) | (1 << _OCTANT[(-nx, -ny)])
+        k = 1
+        line = [(gcx, gcy)]
+        while True:
+            gx, gy = gcx + k * nx, gcy + k * ny
+            along = (gx * g - cx) * nx + (gy * g - cy) * ny
+            if along - half >= run - 1e-6:
+                break                     # the funnel's mouth: free to turn
+            line.append((gx, gy))
+            k += 1
+        # the exit as the router would lay it: the pad centre to the centre
+        # cell, along the line to its mouth, then a right-angle turn
+        mx, my = (gcx + k * nx) * g, (gcy + k * ny) * g
+        if grade_pad_exit(pad, [(cx, cy), (gcx * g, gcy * g), (mx, my),
+                                (mx - ny * g, my + nx * g)], width, allow_side):
+            continue                      # off its axis by more than the edge allows
+        exits.append((tuple(line), (gcx + k * nx, gcy + k * ny), bits))
+    if not exits:
+        return 'off-grid'
+    reach = r + g / 2.0                   # a diagonal step's centreline sag
+    span = int(math.ceil((max(hx, hy) + reach) / g)) + 1
+    closed = tuple((gx, gy)
+                   for gx in range(gcx - span, gcx + span + 1)
+                   for gy in range(gcy - span, gcy + span + 1)
+                   if pad_depth(pad, gx * g, gy * g) > -reach)
+    return closed, tuple(exits)
+
+
+def install_pad_funnel(obstacles, pad, layer_name: str, config,
+                       layer_idx: int = 0) -> int:
+    """Put ``pad``'s exit funnel for a ``config.track_width`` track on
+    ``obstacles`` (a GridObstacleMap; its ``layer_idx`` is ``layer_name``),
+    with the funnel penalty, for one search into the pad -- a plane tap's.
+    Returns the number of exits, 0 when the pad gets no funnel; the caller
+    clears the masks (clear_move_masks) after the search."""
+    if (not smd_gradable(pad, layer_name)
+            or not hasattr(obstacles, 'set_move_masks_batch')):
+        return 0
+    cells, n = exit_funnel(pad, layer_idx, config.track_width, config.grid_step,
+                           blocked=lambda gx, gy: obstacles.is_blocked(gx, gy, layer_idx))
+    if cells is None:
+        return 0
+    import numpy as np
+    obstacles.set_move_masks_batch(np.array(
+        [(gx, gy, li, m) for (gx, gy, li), m in cells.items()], dtype=np.int32))
+    obstacles.set_move_mask_penalty(funnel_penalty_units(config))
+    return n

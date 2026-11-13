@@ -68,8 +68,19 @@ DEFAULT_CLASS = {
 NETS = {1: 'A', 2: 'B', 3: 'C'}
 
 
-def _fp(ref, x, y, net_id, net_name, pad_clearance=None, size=1.0, layer='F.Cu'):
+def _fp(ref, x, y, net_id, net_name, pad_clearance=None, size=1.0, layer='F.Cu',
+        drill=None):
     clr = f" (clearance {pad_clearance})" if pad_clearance is not None else ""
+    if drill:                                    # a through-hole pad
+        return f'''
+  (footprint "Probe:Pad" (layer "{layer}") (at {x} {y})
+    (property "Reference" "{ref}" (at 0 -1.5 0) (layer "F.SilkS") (hide yes)
+      (effects (font (size 1 1) (thickness 0.15))))
+    (property "Value" "P" (at 0 1.5 0) (layer "F.Fab") (hide yes)
+      (effects (font (size 1 1) (thickness 0.15))))
+    (attr through_hole)
+    (pad "1" thru_hole circle (at 0 0) (size {size} {size}) (drill {drill}) (layers "*.Cu") (net {net_id} "{net_name}"){clr})
+  )'''
     return f'''
   (footprint "Probe:Pad" (layer "{layer}") (at {x} {y})
     (property "Reference" "{ref}" (at 0 -1.5 0) (layer "F.SilkS") (hide yes)

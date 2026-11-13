@@ -483,6 +483,7 @@ BOOL_FLAGS = {
 # replay routed WITH the #536 smoothing the flag exists to turn off.
 INVERTED_BOOL_FLAGS = {
     '--no-smoothing': 'smoothing',
+    '--no-smd-exit-funnel': 'smd_exit_funnel',
     '--no-stub-layer-swap': 'enable_layer_switch',
     '--no-power-tap-neckdown': 'power_tap_neckdown_check',
     # The shared "Fix DRC settings after routing" box (#160/#693): a step

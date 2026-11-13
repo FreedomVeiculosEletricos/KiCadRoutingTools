@@ -120,6 +120,7 @@ BOOL_FLAGS = {
 # name is present would pass a converter that TICKS it -- the exact inverse.
 NEGATED_BOOL_FLAGS = {
     '--no-smoothing': 'smoothing',
+    '--no-smd-exit-funnel': 'smd_exit_funnel',
     '--no-stub-layer-swap': 'enable_layer_switch',
     '--no-power-tap-neckdown': 'power_tap_neckdown_check',
     '--no-fix-drc-settings': 'fix_drc_check',

@@ -5,7 +5,7 @@ The compiled half of KiCad Routing Tools: the Python extension module
 searches and obstacle map, the placer's per-move kernels, and the grid searches
 of the `awx/` whole-route bus router. The rest is Python that calls in here.
 
-**Current Version: 0.23.8** (the crate version in `Cargo.toml`)
+**Current Version: 0.23.9** (the crate version in `Cargo.toml`)
 
 > **Release note:** the newest published release is
 > [v0.23.7](https://github.com/drandyhaas/KiCadRoutingTools/releases/tag/v0.23.7)
@@ -455,6 +455,18 @@ src/
 - **Placement kernels**: the trees and gap trees keep the Python's float expressions in order; the crossing and pad-hit kernels skip pairs whose boxes cannot meet; the congestion kernels sum a move's change over the cells it reaches, so their totals can differ from a whole-window Python sum in the last bits
 
 ## Version History
+
+### 0.23.9 (2026-11-13)
+- **Move masks** (`obstacle_map.rs`, `router.rs`): `GridObstacleMap.set_move_masks_batch(rows)`
+  takes rows `[gx, gy, layer, mask]`, `mask` a bitmask of the router's octants;
+  a same-layer move must be allowed by the masks of both its cells (a cell
+  without one is free, mask 0 closes it). `clear_move_masks()` drops them,
+  `move_mask_count()` counts them; `clone_fresh()` starts without. The
+  single-ended router uses them for SMD pad exit funnels
+  (`pad_entry.exit_funnel`). `set_move_mask_penalty(cost)`: 0 bars a move
+  the masks do not allow; a cost > 0 lets it through at that extra cost (a
+  soft funnel). A via may not go in a cell that carries a mask on any layer,
+  unless it is a free via. No masks set keeps the search as before.
 
 ### 0.23.8 (2026-11-13)
 - **Corners over a window** (`router.rs`): `GridRouter(..., max_turn_units=4,
