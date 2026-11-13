@@ -65,7 +65,10 @@ def main():
         for seed, kept in ((10, True), (5, False)):
             r = run(os.path.join(ROOT, 'py_placer', 'place_simple.py'), fixed,
                     os.path.join(td, f's{seed}.kicad_pcb'), '--groups', groups,
-                    '--intent', intent, '--seed', str(seed))
+                    '--intent', intent, '--seed', str(seed),
+                    # the grid snap runs after the face pass and moves the
+                    # shipped cost on; this test reads the face pass alone
+                    '--grid', '0', '--align-mm', '0')
             m = NOTE.search(r.stdout)
             ok(f'seed {seed}: the face pass ran', m, r.stdout[-300:])
             if not m:

@@ -266,6 +266,22 @@ among its neighbours, which no move of one part frees -- it is mended where it
 stands: each part still overlapping is shoved one straight step out of what it
 overlaps, the movable parts in its way pushed aside in turn.
 
+**The grid.** The anneal's moves are continuous, so it leaves every pad off
+the router's grid and neighbours a fraction of a millimetre out of line, and
+the router then joins its on-grid vias to the pads with jogs. After the anneal
+and the decap repair, `grid_align.py` snaps each legal part where most of its
+pads land on `--grid` (0.1 mm, route.py's default `--grid-step`; 0 turns it
+off), trying the grid poses within two steps nearest first and, while any part
+moves, the parts left over again (a neighbour's snap can make the room). Then
+neighbours on one face at one rotation modulo 180 whose centres stand within
+`--align-mm` (0.5 mm; 0 turns it off) across a row or column, no more than
+2 mm apart along it, are lined up on one coordinate: a fixed member's, else the
+one that moves them least. A move is kept only where the part stays legal and
+no decap or claim limit gets worse; edge-seated parts and `--legalise-only`
+boards are left as they are. The console line and the report's `grid` key name
+the parts snapped, lined up, and left off the grid with the reason (the
+courtyard gap they would break, or a limit).
+
 ## Judging seeds by routing
 
 A placement is judged by routing it: blocking nets first, then the joins
