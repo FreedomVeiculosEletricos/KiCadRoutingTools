@@ -3262,6 +3262,7 @@ def _route_net_with_obstacles_impl(pcb_data: PCBData, net_id: int, config: GridR
 
     router = GridRouter(via_cost=config.via_cost_units(), h_weight=config.heuristic_weight,
                         turn_cost=config.turn_cost, via_proximity_cost=config.via_proximity_cost_int(),
+                        **config.corner_kwargs(net_id),
                         vertical_attraction_radius=attraction_radius_grid,
                         vertical_attraction_bonus=attraction_bonus,
                         layer_costs=config.get_layer_costs(),
@@ -6223,6 +6224,7 @@ def _route_multipoint_main_impl(
     # Route farthest pair with probe routing (same as single-ended)
     router = GridRouter(via_cost=config.via_cost_units(), h_weight=config.heuristic_weight,
                         turn_cost=config.turn_cost, via_proximity_cost=config.via_proximity_cost_int(),
+                        **config.corner_kwargs(net_id),
                         vertical_attraction_radius=attraction_radius_grid,
                         vertical_attraction_bonus=attraction_bonus,
                         layer_costs=config.get_layer_costs(),
@@ -7124,6 +7126,7 @@ def _route_multipoint_taps_impl(
 
     router = GridRouter(via_cost=config.via_cost_units(), h_weight=config.heuristic_weight,
                         turn_cost=config.turn_cost, via_proximity_cost=config.via_proximity_cost_int(),
+                        **config.corner_kwargs(net_id),
                         vertical_attraction_radius=attraction_radius_grid,
                         vertical_attraction_bonus=attraction_bonus,
                         layer_costs=config.get_layer_costs(),

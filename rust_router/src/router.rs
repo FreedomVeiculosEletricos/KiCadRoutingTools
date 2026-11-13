@@ -24,6 +24,16 @@ fn octant_index(dx: i32, dy: i32) -> i32 {
     }
 }
 
+/// Angle between two octants in 45-degree units (0..=4).
+#[inline]
+fn octant_delta(a: i32, b: i32) -> i32 {
+    let d = (a - b).rem_euclid(8);
+    d.min(8 - d)
+}
+
+/// Longest corner window (grid steps) GridRouter honours; see `turn_window`.
+const MAX_TURN_WINDOW: usize = 32;
+
 /// S1-B (issue #384): tiled flat-array node store. Replaces the per-node
 /// FxHashMap<u64, NodeState> (S1-A) with 64x64-cell tiles per layer: a node
 /// lookup is one SMALL hashmap probe per tile plus direct array indexing, and
@@ -655,6 +665,38 @@ impl GridSearch {
             if pdx == 0 && pdy == 0 { (0, 0) } else { (pdx.signum(), pdy.signum()) }
         });
 
+        // Corner window (max_turn_units / acute_turn_cost): the headings of
+        // the last `turn_window` same-layer steps, newest first. A grid path
+        // can spread one corner over several consecutive turns (three
+        // 45-degree turns one cell apart ARE a 135-degree corner once the
+        // track has width), so the corner a move makes is its heading change
+        // against every heading in that window, not only the last one. A via
+        // starts a new window.
+        let corner_on = router.max_turn_units < 4 || router.acute_turn_cost > 0;
+        let mut win = [0i32; MAX_TURN_WINDOW];
+        let mut nwin = 0usize;
+        let mut corner_here = 0i32; // the corner already standing at `current`
+        if corner_on {
+            let cap = (router.turn_window.max(1) as usize).min(MAX_TURN_WINDOW);
+            let mut idx = current_idx;
+            let (mut cx, mut cy) = (current.gx, current.gy);
+            while nwin < cap {
+                let Some(p) = self.store.parent(idx) else { break };
+                let (px, py, pl) = self.store.coords(p);
+                if pl != current.layer || (px == cx && py == cy) {
+                    break;
+                }
+                win[nwin] = octant_index(cx - px, cy - py);
+                nwin += 1;
+                idx = p;
+                cx = px;
+                cy = py;
+            }
+            for k in 1..nwin {
+                corner_here = corner_here.max(octant_delta(win[0], win[k]));
+            }
+        }
+
         // Expand neighbors - 8 directions.
         // S6: the layer_forbidden(current.layer) test is hoisted out of the
         // direction loop (G2: no track on a forbidden source layer; it was an
@@ -681,6 +723,22 @@ impl GridSearch {
                         continue;
                     }
                 }
+
+                // The corner this move closes, in 45-degree units: its heading
+                // against the window's. Over max_turn_units the move is not
+                // allowed; past 90 degrees (2 units) it pays acute_turn_cost
+                // for each 45 degrees the corner GROWS here, so a corner
+                // spread over several cells pays once, like a sharp one.
+                let corner = if nwin > 0 {
+                    let di = octant_index(dx, dy);
+                    win[..nwin].iter().map(|&w| octant_delta(di, w)).max().unwrap_or(0)
+                } else { 0 };
+                if corner > router.max_turn_units {
+                    continue;
+                }
+                let acute_cost = if router.acute_turn_cost > 0 && corner > 2 {
+                    router.acute_turn_cost * (corner - corner_here.max(2)).max(0)
+                } else { 0 };
 
                 let ngx = current.gx + dx;
                 let ngy = current.gy + dy;
@@ -768,7 +826,7 @@ impl GridSearch {
                 // but is capped so it too cannot zero the step.
                 let path_discount_pct =
                     router.get_path_attraction_bonus(ngx, ngy, current.layer, dx, dy);
-                let base_step = move_cost + turn_cost + proximity_cost + direction_penalty;
+                let base_step = move_cost + turn_cost + acute_cost + proximity_cost + direction_penalty;
                 let after_vert = (base_step - attraction_bonus).max(move_cost / 10);
                 let step_cost = (after_vert * (100 - path_discount_pct) / 100)
                     .max(move_cost / 10);
@@ -950,6 +1008,13 @@ pub struct GridRouter {
     via_cost: i32,
     h_weight: f32,
     turn_cost: i32,
+    // Corner limits over a window of the last `turn_window` same-layer steps
+    // (see the expansion): the largest corner allowed, in 45-degree units
+    // (4 = free, 2 = no corner sharper than 90 degrees), and the extra cost
+    // per 45 degrees of a corner past 90 degrees (0 = off).
+    max_turn_units: i32,
+    acute_turn_cost: i32,
+    turn_window: i32,
     via_proximity_cost: i32,  // Multiplier on graded proximity cost when placing vias (0 = no extra cost)
     vertical_attraction_radius: i32,  // Grid units for cross-layer attraction lookup (0 = disabled)
     vertical_attraction_bonus: i32,   // Cost reduction for positions aligned with other-layer tracks
@@ -990,17 +1055,21 @@ pub struct GridRouter {
 #[pymethods]
 impl GridRouter {
     #[new]
-    #[pyo3(signature = (via_cost, h_weight, turn_cost=None, via_proximity_cost=1, vertical_attraction_radius=0, vertical_attraction_bonus=0, layer_costs=None, proximity_heuristic_cost=None, layer_direction_preferences=None, direction_preference_cost=0, attraction_radius=0, attraction_bonus=0, attraction_cross_layer_pct=0, attraction_potential=0))]
+    #[pyo3(signature = (via_cost, h_weight, turn_cost=None, via_proximity_cost=1, vertical_attraction_radius=0, vertical_attraction_bonus=0, layer_costs=None, proximity_heuristic_cost=None, layer_direction_preferences=None, direction_preference_cost=0, attraction_radius=0, attraction_bonus=0, attraction_cross_layer_pct=0, attraction_potential=0, max_turn_units=4, acute_turn_cost=0, turn_window=1))]
     pub fn new(via_cost: i32, h_weight: f32, turn_cost: Option<i32>, via_proximity_cost: Option<i32>,
                vertical_attraction_radius: i32, vertical_attraction_bonus: i32,
                layer_costs: Option<Vec<i32>>, proximity_heuristic_cost: Option<i32>,
                layer_direction_preferences: Option<Vec<u8>>, direction_preference_cost: i32,
                attraction_radius: i32, attraction_bonus: i32,
-               attraction_cross_layer_pct: i32, attraction_potential: i32) -> Self {
+               attraction_cross_layer_pct: i32, attraction_potential: i32,
+               max_turn_units: i32, acute_turn_cost: i32, turn_window: i32) -> Self {
         Self {
             via_cost,
             h_weight,
             turn_cost: turn_cost.unwrap_or(DEFAULT_TURN_COST),
+            max_turn_units: max_turn_units.clamp(1, 4),
+            acute_turn_cost: acute_turn_cost.max(0),
+            turn_window: turn_window.clamp(1, MAX_TURN_WINDOW as i32),
             via_proximity_cost: via_proximity_cost.unwrap_or(1),
             vertical_attraction_radius,
             vertical_attraction_bonus,

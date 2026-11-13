@@ -383,6 +383,7 @@ def find_via_position(
             via_cost=config.via_cost_units(),
             h_weight=config.heuristic_weight,
             turn_cost=config.turn_cost,
+            **config.corner_kwargs(),
             via_proximity_cost=0,
             layer_costs=config.get_layer_costs(),
             proximity_heuristic_cost=config.get_proximity_heuristic_cost()
@@ -668,6 +669,7 @@ def route_via_to_pad(
             via_cost=config.via_cost_units(),
             h_weight=config.heuristic_weight,
             turn_cost=config.turn_cost,
+            **config.corner_kwargs(),
             via_proximity_cost=0,
             layer_costs=config.get_layer_costs(),
             proximity_heuristic_cost=config.get_proximity_heuristic_cost()
@@ -771,6 +773,7 @@ def route_multi_source_to_pad(
             via_cost=config.via_cost_units(),
             h_weight=config.heuristic_weight,
             turn_cost=config.turn_cost,
+            **config.corner_kwargs(),
             via_proximity_cost=0,
             layer_costs=config.get_layer_costs(),
             proximity_heuristic_cost=config.get_proximity_heuristic_cost()
@@ -3666,6 +3669,7 @@ def create_plane(
         via_cost=config.via_cost_units(),
         h_weight=config.heuristic_weight,
         turn_cost=config.turn_cost,
+        **config.corner_kwargs(),
         via_proximity_cost=0,
         layer_costs=config.get_layer_costs(),
         proximity_heuristic_cost=config.get_proximity_heuristic_cost()
