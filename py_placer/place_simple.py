@@ -77,6 +77,14 @@ the same way.
    field are counted too (`bga_field`), and a `proximity` claim that names no
    pads but a limit is WARNED, being priced over legs the grade does not read
    (`claim_arity`).
+   Last, the GRID (`placement/grid_align.py`): the anneal's moves are
+   continuous, so each legal part is snapped where most of its pads land on
+   `--grid` (0.1 mm, route.py's default --grid-step), and neighbours on one
+   face at one rotation modulo 180 whose centres stand within `--align-mm`
+   (0.5 mm) across a row or column are lined up on one coordinate. A move is
+   kept only where the part stays legal and no decap or claim limit gets
+   worse; edge-seated parts and --legalise-only boards are left as they
+   are. The report's `grid` names what moved and what could not.
 
 LEGALISE ONLY (`--legalise-only`, #1756): no scatter and no anneal. The
 board's own poses are kept, and only the parts that are not legal to KICAD'S
@@ -181,6 +189,7 @@ import tempfile
 import time
 
 from kicad_parser import parse_kicad_pcb  # noqa: E402
+from placement.grid_align import ALIGN_MM, PLACE_GRID_MM  # noqa: E402
 
 
 def face_targets(intent, blocks, doc, pcb):
@@ -1229,6 +1238,13 @@ def build_parser():
                     help='with --preview: also write those boxes as draft blocks[] '
                          'to JSON, for the author to edit, check with check_floorplan '
                          '--plan-only and paste into the intent; never applied')
+    ap.add_argument('--grid', type=float, default=PLACE_GRID_MM, metavar='MM',
+                    help='snap each part so most of its pads land on this grid (default '
+                         f'{PLACE_GRID_MM:g} mm, route.py\'s --grid-step; 0 turns it off)')
+    ap.add_argument('--align-mm', type=float, default=ALIGN_MM, metavar='MM',
+                    help='line up neighbouring parts (same face, same rotation mod 180) '
+                         'whose centres stand within this across a row or column '
+                         f'(default {ALIGN_MM:g} mm; 0 turns it off)')
     ap.add_argument('--legalise-only', action='store_true',
                     help="keep the board's own poses and make legal only the parts that "
                          "are not, by KiCad's standard -- the checkers' (check_assembly, "
@@ -1803,6 +1819,40 @@ def main(argv=None):
                     and state.intent_clear(r, state.parts[r].grade_rects(x, y, rot)))
         mended = decap_repair.repair(model, movable, legal_at, seats=model.edge_seats)
         final = model.total()
+    # the grid and the rows/columns (grid_align.py): the anneal's continuous
+    # moves leave every pad off the router's grid and neighbours a fraction
+    # of a mm out of line. Legal parts only, never an edge seat.
+    from placement import grid_align
+    grid_rep = None
+    if movable and legalised is None and (a.grid > 0 or a.align_mm > 0):
+        bad = set(r for r in movable if not ok(r))
+        snappable = [r for r in movable if r not in model.edge_seats and r not in bad]
+
+        refusals = {}
+
+        def try_pose(r, x, y):
+            P = state.parts[r]
+            x0, y0 = P.x, P.y
+            state.apply_move(r, x, y, P.rot)
+            if ok(r):
+                return True
+            refusals.setdefault(r, illegal_reason(state, model, r))
+            state.apply_move(r, x0, y0, P.rot)
+            return False
+
+        def limits():
+            model.reprice_all()
+            model.total()
+            return (len(decap_repair.residual(model)), model.claims_broken())
+        sensitive = (set(getattr(model, '_cluster_of', {}) or {})
+                     | {c[0] for c in model.claims} | {c[1] for c in model.claims})
+        grid_rep = grid_align.snap_and_align(
+            state.parts, snappable,
+            [r for r in state.parts if r not in movable and r not in model.edge_seats],
+            grid=a.grid, align_mm=a.align_mm, try_pose=try_pose, limits=limits,
+            sensitive=sensitive, refusals=refusals)
+        model.reprice_all()
+        final = model.total()
     t2 = time.time()
     # each template member's drift from its template pose, worst pad
     from placement.templates import pad_deviation
@@ -1994,7 +2044,7 @@ def main(argv=None):
               'floorplan': fp, 'assembly': asm, 'bga_field': bga_field,
               'decap_residual': resid, 'decap_repair': mended, 'claims_left': claims_left,
               'unseated': model.edge_unseated, 'notes': notes, 'fold': model.fold,
-              'links': links,
+              'links': links, 'grid': grid_rep,
               'groups': model.groups, 'stats': res['stats'], 'templates': drift,
               'hints_saturated': saturated, 'template_keepout': tk, 'pad_overhang': wide,
               'pad_overhang_note': wide_note,
@@ -2009,7 +2059,7 @@ def main(argv=None):
                                            'illegal_why', 'tight',
                                            'refused', 'oversubscribed', 'claim_arity', 'floorplan',
                                            'assembly', 'bga_field', 'template_off', 'decap_residual', 'claims_left', 'hints_saturated', 'estimate_fallback',
-                                           'pad_overhang', 'pad_overhang_note', 'faces', 'fold', 'links', 'moves_total', 'seconds')}))
+                                           'pad_overhang', 'pad_overhang_note', 'faces', 'fold', 'links', 'grid', 'moves_total', 'seconds')}))
     return 4 if illegal or refused or model.edge_oversubscribed else 0
 
 
