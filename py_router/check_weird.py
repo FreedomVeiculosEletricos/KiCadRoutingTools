@@ -97,9 +97,8 @@ Categories:
                      rule): end to end, or a track end on another's body (a
                      T). The notch traps etchant and the point beside it is
                      a sliver. Not graded inside the net's own pad or via
-                     copper. Always reported (no size), advisory: not counted
-                     in the exit code, since a corner no cut clears is the
-                     designer's call. route.py's cleanup removes what it can
+                     copper. Always reported (no size), and counted.
+                     route.py's cleanup removes what it can
                      (fix_acute_corners).
   kicad-dangling     a joint segment whose two ends both lie on other
                      same-net TRACKS that hold the other end too (#1217):
@@ -119,11 +118,35 @@ Categories:
                      centre; from 10.0.4 the run is cut at the via pad and
                      measured to the centre), so a matched pair can ship
                      skewed (#1583). An end that is also a pad's terminal
-                     names the pad in the detail. ADVISORY: reported, with no size
-                     (KiCad treats any offset alike), but not counted in the
-                     headline or the exit code -- an end on a pad is how a
-                     via-in-pad is drawn, and a human-routed board carries
-                     many.
+                     names the pad in the detail. Reported with no size
+                     (KiCad treats any offset alike), and counted.
+  in-pad-off-axis    a track centreline running inside a same-net pad's
+                     copper off the pad's axes (pad_entry.in_pad_off_axis):
+                     the diagonal from an off-axis exit to the centre, a stub
+                     cut across a corner. No size.
+  via-in-smd-pad     a via whose barrel overlaps a same-net SMD pad
+                     (fab_notes.via_in_pad_sites): solder wicks down the
+                     barrel unless the fab fills and caps it.
+  necked-track       a track narrower than the board allows its net: the
+                     project's declared minimum track width (KiCad's
+                     track_width rule), else the net's class width.
+  zigzag, short-leg, needless-bend
+                     the route's shape (corner_angle.route_shape): a run that
+                     changes direction ZIGZAG_MIN_BENDS (4) times in a row,
+                     each bend under ZIGZAG_MAX_LEG_MM (1 mm) from the last; a
+                     leg between two bends under SHORT_LEG_WIDTHS track
+                     widths; a bend under 90 degrees that a straight line or
+                     one 45-degree elbow between its neighbours removes while
+                     clearing the copper around (the router smoother's own
+                     clearance gate, at the board's rules). Right-angle
+                     corners are allowed; only acute ones are a defect.
+  needless-via       two vias joined by one run on another layer, where that
+                     run (or an octilinear line between the vias) clears on
+                     the layer the route came from.
+  detour             a net whose joining copper (dangling copper pruned, each
+                     via's barrel added) is over DETOUR_RATIO times the
+                     free-path length of its pads' spanning tree, searched on
+                     a DETOUR_GRID_MM grid of the board's free space.
 
 This script NEVER modifies the board (read-only; nothing is written back).
 Net 0 (unconnected) copper is skipped -- "same-net" semantics do not apply.
@@ -132,7 +155,7 @@ Usage:
     python3 check_weird.py board.kicad_pcb [--nets PATTERN ...] [--thorough]
                                            [--max-print N]
 
-Exit code 0 when clean, 1 when any findings (advisory categories aside).
+Exit code 0 when clean, 1 when any findings.
 """
 
 #: #937 registry: which door(s) show this tool, and whether it changes
@@ -165,10 +188,24 @@ CATEGORIES = ['dangling-end', 'soft-joint', 'redundant-cycle',
               'removable-segment', 'stacked-copper', 'unsupported-via',
               'dangling-via', 'orphan-island', 'narrow-pad-joint',
               'kicad-dangling', 'off-centre-via-end', 'shallow-pad-entry',
-              'smd-entry', 'smd-to-corner', 'acute-corner']
+              'smd-entry', 'smd-to-corner', 'acute-corner',
+              'in-pad-off-axis', 'via-in-smd-pad', 'necked-track',
+              'zigzag', 'short-leg', 'needless-bend',
+              'needless-via', 'detour']
 # Reported, but not counted in the headline or the exit code (see the module
-# docstring): check_complete blocks DONE on that exit code.
-ADVISORY_CATEGORIES = frozenset({'off-centre-via-end', 'acute-corner'})
+# docstring): check_complete blocks DONE on that exit code. Empty: every
+# category is a defect a reviewer rejects the board for.
+ADVISORY_CATEGORIES = frozenset()
+# The categories that grade the route's QUALITY (its shape, its pad joints,
+# its widths) rather than its copper HYGIENE (dangles, joints, loops,
+# islands, floating vias). A test that guards a hygiene contract -- a pass
+# must leave no dangle, no removable copper -- reads hygiene_findings; the
+# full list is what a board ships against.
+REVIEW_CATEGORIES = frozenset({
+    'off-centre-via-end', 'smd-entry', 'smd-to-corner', 'acute-corner',
+    'in-pad-off-axis', 'via-in-smd-pad', 'necked-track', 'zigzag',
+    'short-leg', 'needless-bend', 'needless-via', 'detour'})
+HYGIENE_CATEGORIES = [c for c in CATEGORIES if c not in REVIEW_CATEGORIES]
 # Cost cap for the removable scan (skip unless --thorough): the removal pass's
 # own cap (#1063), so the checker never grades a net the pass may not clean.
 MAX_SEGS_PER_NET = STRICT_REMOVAL_MAX_SEGS
@@ -1202,17 +1239,575 @@ def _check_acute_corners(name, net_segs, net_vias, net_pads, min_angle,
             size=None))
 
 
+def _check_in_pad_off_axis(name, net_segs, net_pads, findings):
+    """Flag track centrelines that run inside a same-net pad off the pad's
+    axes (pad_entry.in_pad_off_axis). Read-only; size = the off-axis run."""
+    if not net_pads or not net_segs:
+        return
+    from pad_entry import in_pad_off_axis
+    for s in net_segs:
+        if getattr(s, 'graphic', False):
+            continue
+        for pad in net_pads:
+            reach = math.hypot(pad.size_x, pad.size_y) / 2.0 + s.width
+            if (max(s.start_x, s.end_x) < pad.global_x - reach
+                    or min(s.start_x, s.end_x) > pad.global_x + reach
+                    or max(s.start_y, s.end_y) < pad.global_y - reach
+                    or min(s.start_y, s.end_y) > pad.global_y + reach):
+                continue
+            run = in_pad_off_axis(pad, s.layer, s.start_x, s.start_y,
+                                  s.end_x, s.end_y)
+            if run is None:
+                continue
+            mx, my = (s.start_x + s.end_x) / 2.0, (s.start_y + s.end_y) / 2.0
+            findings.append(_finding(
+                'in-pad-off-axis', name, s.layer, mx, my,
+                f"{s.width:.3f}mm track runs {run:.3f}mm inside pad "
+                f"{pad.component_ref}.{pad.pad_number} off the pad's axes",
+                size=None))
+
+
+def _check_via_in_smd_pad(name, net_vias, net_pads, findings):
+    """Flag a via whose barrel overlaps a same-net SMD pad
+    (fab_notes.via_in_pad_sites, the router's own via-in-pad count)."""
+    if not net_vias or not net_pads:
+        return
+    from fab_notes import via_in_pad_sites
+    nid = net_vias[0].net_id
+    for via, pad in via_in_pad_sites(net_vias, {nid: net_pads}):
+        findings.append(_finding(
+            'via-in-smd-pad', name, 'via', via.x, via.y,
+            f"{getattr(via, 'size', 0):.3f}mm via overlaps SMD pad "
+            f"{pad.component_ref}.{pad.pad_number}", size=None))
+
+
+def _check_necked(name, net_segs, want_width, findings):
+    """Flag tracks narrower than the net's class track width."""
+    if not net_segs or not want_width:
+        return
+    for s in net_segs:
+        if getattr(s, 'graphic', False):
+            continue
+        if s.width < want_width - 1e-4:
+            mx, my = (s.start_x + s.end_x) / 2.0, (s.start_y + s.end_y) / 2.0
+            L = math.hypot(s.end_x - s.start_x, s.end_y - s.start_y)
+            findings.append(_finding(
+                'necked-track', name, s.layer, mx, my,
+                f"{s.width:.4f}mm track ({L:.3f}mm long) under the "
+                f"{want_width:.4f}mm the board allows", size=None))
+
+
+def _check_route_shape(net_id, name, net_segs, net_vias, net_pads, clears,
+                       findings):
+    """Flag zigzags, short legs and needless bends
+    (corner_angle.route_shape). Read-only; no size."""
+    if len(net_segs) < 2:
+        return
+    from corner_angle import route_shape
+    cl = None
+    if clears is not None:
+        def cl(x1, y1, x2, y2, layer, w):
+            return clears(x1, y1, x2, y2, layer, net_id, w)
+    for f in route_shape(net_segs, net_vias, net_pads, clears=cl):
+        # each category spelled out, so the CATEGORIES guard reads it
+        if f.kind == 'zigzag':
+            findings.append(_finding('zigzag', name, f.layer, f.x, f.y, f.detail))
+        elif f.kind == 'short-leg':
+            findings.append(_finding('short-leg', name, f.layer, f.x, f.y, f.detail))
+        else:
+            findings.append(_finding('needless-bend', name, f.layer, f.x, f.y,
+                                     f.detail))
+
+
+#: A pad-to-pad run of copper longer than this many times the shortest path
+#: the board leaves free between the two pads is a detour.
+DETOUR_RATIO = 1.5
+#: Grid (mm) the free path is searched on, and the margin (mm, and fraction of
+#: the pads' distance) the search window adds around the two pads. A window
+#: can only lengthen the free path, so a detour found inside one is real.
+DETOUR_GRID_MM = 0.05
+DETOUR_WINDOW_MM = 3.0
+DETOUR_WINDOW_FRAC = 0.5
+
+
+class _FreeSpace:
+    """Where a track of one net may run: per copper layer, the cells a
+    ``width`` centreline keeps its clearance from foreign copper (tracks,
+    vias, pads), drills, keep-outs and the board edge; and where a via of
+    that net fits on every layer. Rasterised per query window."""
+
+    def __init__(self, pcb_data, clr_of, edge_clr, hole_clr):
+        self.pcb = pcb_data
+        self.clr_of = clr_of
+        self.edge_clr = edge_clr
+        self.hole_clr = hole_clr
+        self.layers = list(getattr(pcb_data.board_info, 'copper_layers', None)
+                           or ['F.Cu', 'B.Cu'])
+        from check_pads import pad_outline_polygon
+        self.pads = []
+        for fp in pcb_data.footprints.values():
+            for pd in fp.pads:
+                try:
+                    poly = pad_outline_polygon(pd)
+                except Exception:                            # noqa: BLE001
+                    continue
+                self.pads.append((pd, poly))
+        from check_drc import board_edge_geometry
+        self.rings, self.outer, self.cutouts = board_edge_geometry(
+            pcb_data.board_info, rect_ring=True)
+
+    def masks(self, net_id, win, g, width, via_size):
+        """(blocked[layer] for a track, via_ok) over window ``win``."""
+        import numpy as np
+        from PIL import Image, ImageDraw
+        x0, y0, x1, y1 = win
+        nx, ny = int(math.ceil((x1 - x0) / g)) + 1, int(math.ceil((y1 - y0) / g)) + 1
+        P = lambda x, y: ((x - x0) / g, (y - y0) / g)
+        my_clr = self.clr_of(net_id)
+
+        def layer_mask(layer, half):
+            im = Image.new('1', (nx, ny), 0)
+            d = ImageDraw.Draw(im)
+            # outside the board, and the edge band
+            if self.outer:
+                inside = Image.new('1', (nx, ny), 0)
+                di = ImageDraw.Draw(inside)
+                for ring in self.outer:
+                    di.polygon([P(*q) for q in ring], fill=1)
+                for ring in self.cutouts:
+                    di.polygon([P(*q) for q in ring], fill=0)
+                im = Image.eval(inside, lambda v: 0 if v else 1).convert('1')
+                d = ImageDraw.Draw(im)
+                band = 2.0 * (self.edge_clr + half) / g
+                for ring in self.rings:
+                    pts = [P(*q) for q in ring] + [P(*ring[0])]
+                    d.line(pts, fill=1, width=max(1, int(round(band))))
+            m = 2.0 * g
+            for sg in self.pcb.segments:
+                if sg.net_id == net_id or sg.layer != layer:
+                    continue
+                if (max(sg.start_x, sg.end_x) < x0 - 2 or min(sg.start_x, sg.end_x) > x1 + 2
+                        or max(sg.start_y, sg.end_y) < y0 - 2 or min(sg.start_y, sg.end_y) > y1 + 2):
+                    continue
+                r = sg.width / 2.0 + max(my_clr, self.clr_of(sg.net_id)) + half
+                a, b = P(sg.start_x, sg.start_y), P(sg.end_x, sg.end_y)
+                d.line([a, b], fill=1, width=max(1, int(round(2 * r / g))))
+                for q in (a, b):
+                    d.ellipse([q[0] - r / g, q[1] - r / g, q[0] + r / g, q[1] + r / g], fill=1)
+            for v in self.pcb.vias:
+                if v.net_id == net_id:
+                    continue
+                if not (x0 - 2 <= v.x <= x1 + 2 and y0 - 2 <= v.y <= y1 + 2):
+                    continue
+                r = v.size / 2.0 + max(my_clr, self.clr_of(v.net_id)) + half
+                c = P(v.x, v.y)
+                d.ellipse([c[0] - r / g, c[1] - r / g, c[0] + r / g, c[1] + r / g], fill=1)
+            for pd, poly in self.pads:
+                if not (x0 - 5 <= pd.global_x <= x1 + 5 and y0 - 5 <= pd.global_y <= y1 + 5):
+                    continue
+                on = layer in pd.layers or any('*' in L and L.endswith('.Cu') for L in pd.layers)
+                drill = getattr(pd, 'drill', 0) or 0
+                if on and pd.net_id != net_id:
+                    rr = max(my_clr, self.clr_of(pd.net_id)) + half
+                    pts = [P(*q) for q in poly]
+                    d.polygon(pts, fill=1)
+                    w_px = max(1, int(round(2 * rr / g)))
+                    d.line(pts + [pts[0]], fill=1, width=w_px)
+                    for q in pts:
+                        d.ellipse([q[0] - rr / g, q[1] - rr / g, q[0] + rr / g, q[1] + rr / g], fill=1)
+                if drill and (not on or pd.net_id != net_id):
+                    rr = drill / 2.0 + self.hole_clr + half
+                    c = P(pd.global_x, pd.global_y)
+                    d.ellipse([c[0] - rr / g, c[1] - rr / g, c[0] + rr / g, c[1] + rr / g], fill=1)
+            for ko in (getattr(self.pcb.board_info, 'keepouts', None) or []):
+                if layer not in (ko.get('layers') or ()) or ko.get('tracks_allowed', True):
+                    continue
+                d.polygon([P(*q) for q in ko['polygon']], fill=1)
+            return np.array(im, dtype=bool)
+
+        blocked = [layer_mask(L, width / 2.0) for L in self.layers]
+        via_block = np.zeros_like(blocked[0])
+        for L in self.layers:
+            via_block |= layer_mask(L, via_size / 2.0)
+        return blocked, ~via_block
+
+
+def _free_path_length(space, net_id, pa, pb, width, via_size, barrel):
+    """Shortest length (mm) a ``width`` track of the net could join pad
+    ``pa`` to pad ``pb`` through the free space, vias costing ``barrel``;
+    None when no free path exists in the window."""
+    import numpy as np
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import dijkstra
+    g = DETOUR_GRID_MM
+    dist = math.hypot(pb.global_x - pa.global_x, pb.global_y - pa.global_y)
+    m = max(DETOUR_WINDOW_MM, DETOUR_WINDOW_FRAC * dist)
+    x0 = min(pa.global_x, pb.global_x) - m
+    y0 = min(pa.global_y, pb.global_y) - m
+    x1 = max(pa.global_x, pb.global_x) + m
+    y1 = max(pa.global_y, pb.global_y) + m
+    blocked, via_ok = space.masks(net_id, (x0, y0, x1, y1), g, width, via_size)
+    nl = len(blocked)
+    ny, nx = blocked[0].shape
+    free = ~np.stack(blocked)                         # (nl, ny, nx)
+    idx = np.arange(nl * ny * nx).reshape(nl, ny, nx)
+    rows, cols, wts = [], [], []
+    for dy, dx, w in ((0, 1, g), (1, 0, g), (1, 1, g * math.sqrt(2)), (1, -1, g * math.sqrt(2))):
+        ys = slice(0, ny - dy)
+        yd = slice(dy, ny)
+        xs = slice(max(0, -dx), nx - max(0, dx))
+        xd = slice(max(0, dx), nx - max(0, -dx))
+        ok = free[:, ys, xs] & free[:, yd, xd]
+        if dy and dx:          # a diagonal may not cut a blocked corner
+            ok &= free[:, ys, xd] & free[:, yd, xs]
+        a = idx[:, ys, xs][ok]
+        b = idx[:, yd, xd][ok]
+        rows += [a, b]; cols += [b, a]; wts += [np.full(a.size, w), np.full(a.size, w)]
+    vo = via_ok & free.all(axis=0)
+    for i in range(nl - 1):
+        for j in range(i + 1, nl):
+            a = idx[i][vo]
+            b = idx[j][vo]
+            c = barrel(space.layers[i], space.layers[j])
+            rows += [a, b]; cols += [b, a]; wts += [np.full(a.size, c), np.full(a.size, c)]
+    N = nl * ny * nx
+    G = coo_matrix((np.concatenate(wts), (np.concatenate(rows), np.concatenate(cols))),
+                   shape=(N, N)).tocsr()
+
+    def pad_nodes(pd):
+        out = []
+        cx, cy = (pd.global_x - x0) / g, (pd.global_y - y0) / g
+        ix, iy = int(round(cx)), int(round(cy))
+        for li, L in enumerate(space.layers):
+            if not (L in pd.layers or any('*' in q and q.endswith('.Cu') for q in pd.layers)):
+                continue
+            # the pad's own copper is free for its net: start from the nearest
+            # free cell within the pad
+            r = max(1, int(min(pd.size_x, pd.size_y) / 2.0 / g))
+            best = None
+            for yy in range(max(0, iy - r), min(ny, iy + r + 1)):
+                for xx in range(max(0, ix - r), min(nx, ix + r + 1)):
+                    if free[li, yy, xx]:
+                        dd = (yy - iy) ** 2 + (xx - ix) ** 2
+                        if best is None or dd < best[0]:
+                            best = (dd, idx[li, yy, xx], math.sqrt(dd) * g)
+            if best:
+                out.append((best[1], best[2]))
+        return out
+    sa, sb = pad_nodes(pa), pad_nodes(pb)
+    if not sa or not sb:
+        return None
+    D = dijkstra(G, directed=False, indices=[n for n, _ in sa], min_only=True)
+    best = min((D[n] + off for n, off in sb), default=float('inf'))
+    if not np.isfinite(best):
+        return None
+    return best + min(off for _, off in sa)
+
+
+def _joining_copper(net_segs, net_vias, net_pads):
+    """The net's tracks and vias that join its pads: every track or via that
+    ends nowhere -- not on a pad, a via or another track -- is pruned, again
+    and again, so a dangling tail or spur (its own finding) does not count as
+    route length."""
+    from connectivity import endpoint_reaches_pad
+    segs = [sg for sg in net_segs if not getattr(sg, 'graphic', False)]
+    vias = list(net_vias)
+    k = lambda x, y: (round(x, 4), round(y, 4))
+
+    def on_pad(sg, x, y):
+        for p in net_pads:
+            try:
+                if endpoint_reaches_pad(x, y, sg.width / 2.0, [sg.layer], p):
+                    return True
+            except Exception:                                # noqa: BLE001
+                continue
+        return False
+    pad_end = {}
+    while True:
+        cnt = defaultdict(int)
+        for sg in segs:
+            cnt[(sg.layer,) + k(sg.start_x, sg.start_y)] += 1
+            cnt[(sg.layer,) + k(sg.end_x, sg.end_y)] += 1
+
+        def held(sg, x, y):
+            if cnt[(sg.layer,) + k(x, y)] > 1:
+                return True
+            if any(math.hypot(x - v.x, y - v.y) <= v.size / 2.0 + 1e-3 for v in vias):
+                return True
+            key = (id(sg), k(x, y))
+            if key not in pad_end:
+                pad_end[key] = on_pad(sg, x, y)
+            if pad_end[key]:
+                return True
+            # an end on another track's body (a T)
+            for o in segs:
+                if o is sg or o.layer != sg.layer:
+                    continue
+                if _pt_seg_dist(x, y, o.start_x, o.start_y, o.end_x, o.end_y) \
+                        <= (o.width + sg.width) / 4.0:
+                    return True
+            return False
+        keep = [sg for sg in segs if held(sg, sg.start_x, sg.start_y)
+                and held(sg, sg.end_x, sg.end_y)]
+        vkeep = []
+        for v in vias:
+            n = sum(1 for sg in keep
+                    if min(math.hypot(sg.start_x - v.x, sg.start_y - v.y),
+                           math.hypot(sg.end_x - v.x, sg.end_y - v.y))
+                    <= v.size / 2.0 + 1e-3)
+            if n >= 2 or any(math.hypot(v.x - p.global_x, v.y - p.global_y)
+                             <= math.hypot(p.size_x, p.size_y) / 2.0 for p in net_pads):
+                vkeep.append(v)
+        if len(keep) == len(segs) and len(vkeep) == len(vias):
+            return segs, vias
+        segs, vias = keep, vkeep
+
+
+def _check_detours(pcb_data, net_id, name, net_segs, net_vias, net_pads,
+                   space, width_of, via_size, barrel, findings):
+    """Flag a net whose copper is more than DETOUR_RATIO times the length the
+    board leaves free to join its pads: the tracks plus each via's barrel,
+    against the free-path lengths of the pads' minimum spanning tree (edges
+    picked by straight distance, each measured by _free_path_length). On a
+    two-pad net that is the one free path between the pads."""
+    if space is None or not net_segs:
+        return
+    pads = []
+    for p in net_pads:
+        if not any(math.hypot(p.global_x - q.global_x, p.global_y - q.global_y) < 0.01
+                   for q in pads):
+            pads.append(p)
+    if len(pads) < 2:
+        return
+    width = width_of(net_id, net_segs)
+    segs, vias = _joining_copper(net_segs, net_vias, net_pads)
+    L = sum(math.hypot(sg.end_x - sg.start_x, sg.end_y - sg.start_y) for sg in segs)
+    for v in vias:
+        lays = sorted({sg.layer for sg in segs
+                       if min(math.hypot(sg.start_x - v.x, sg.start_y - v.y),
+                              math.hypot(sg.end_x - v.x, sg.end_y - v.y))
+                       <= v.size / 2.0 + 1e-3},
+                      key=lambda x: space.layers.index(x) if x in space.layers else 0)
+        if len(lays) >= 2:
+            L += barrel(lays[0], lays[-1])
+    # Euclidean minimum spanning tree over the pads (Prim)
+    n = len(pads)
+
+    def d2(i, j):
+        return math.hypot(pads[i].global_x - pads[j].global_x,
+                          pads[i].global_y - pads[j].global_y)
+    edges = []
+    best = {j: (d2(0, j), 0) for j in range(1, n)}
+    while best:
+        j = min(best, key=lambda q: best[q][0])
+        dj, i = best.pop(j)
+        edges.append((i, j, dj))
+        for q in best:
+            dq = d2(j, q)
+            if dq < best[q][0]:
+                best[q] = (dq, j)
+    straight = sum(e[2] for e in edges)
+    if L <= DETOUR_RATIO * straight + 1e-6:
+        return                            # cannot be a detour: free >= straight
+    ref = 0.0
+    for i, j, _d in edges:
+        try:
+            f = _free_path_length(space, net_id, pads[i], pads[j], width,
+                                  via_size, barrel)
+        except Exception as e:                               # noqa: BLE001
+            print(f"check_weird: detour {name}: {e}", file=sys.stderr)
+            return
+        if f is None:
+            return
+        ref += f
+    if ref > 1e-6 and L > DETOUR_RATIO * ref + 1e-6:
+        p0 = pads[0]
+        findings.append(_finding(
+            'detour', name, '-', p0.global_x, p0.global_y,
+            f"{L:.2f}mm of copper joins {n} pads where {ref:.2f}mm is free "
+            f"({L / ref:.2f}x, over {DETOUR_RATIO:g}x)", size=None))
+
+
+def _check_needless_vias(net_id, name, net_segs, net_vias, net_pads, clears,
+                         findings):
+    """Flag vias a route did not need: two vias joined by one run on another
+    layer (a jumper) where that run, or an octilinear line between the two
+    vias, clears on the layer the route came from."""
+    if clears is None or len(net_vias) < 2 or not net_segs:
+        return
+    from corner_angle import track_runs
+    from pcb_modification import _octolinear_bends
+    runs = track_runs(net_segs, net_vias, net_pads)
+
+    def via_at(pt):
+        for v in net_vias:
+            if math.hypot(pt[0] - v.x, pt[1] - v.y) <= v.size / 2.0 + 1e-3:
+                return v
+        return None
+
+    def layers_at(v):
+        return {r.layer for r in runs
+                if any(math.hypot(q[0] - v.x, q[1] - v.y) <= v.size / 2.0 + 1e-3
+                       for q in (r.pts[0], r.pts[-1]))}
+
+    on_pad = lambda v: any(math.hypot(v.x - p.global_x, v.y - p.global_y)
+                           <= math.hypot(p.size_x, p.size_y) / 2.0 for p in net_pads)
+    done = set()
+    for r in runs:
+        if r.ends != ('via', 'via'):
+            continue
+        va, vb = via_at(r.pts[0]), via_at(r.pts[-1])
+        if va is None or vb is None or va is vb or (id(va), id(vb)) in done:
+            continue
+        la, lb = layers_at(va) - {r.layer}, layers_at(vb) - {r.layer}
+        # the jumper is all that joins the vias on r.layer; elsewhere both
+        # reach the same single other layer
+        if len(la) != 1 or la != lb or on_pad(va) or on_pad(vb):
+            continue
+        other = next(iter(la))
+        if any(rr is not r and rr.layer == r.layer and any(
+                math.hypot(q[0] - v.x, q[1] - v.y) <= v.size / 2.0 + 1e-3
+                for v in (va, vb) for q in (rr.pts[0], rr.pts[-1])) for rr in runs):
+            continue
+        w = max(r.widths)
+        ok = all(clears(p[0], p[1], q[0], q[1], other, net_id, w)
+                 for p, q in zip(r.pts, r.pts[1:]))
+        if not ok:
+            for inter in _octolinear_bends((va.x, va.y), (vb.x, vb.y)):
+                poly = [(va.x, va.y)] + list(inter) + [(vb.x, vb.y)]
+                if all(clears(p[0], p[1], q[0], q[1], other, net_id, w)
+                       for p, q in zip(poly, poly[1:])):
+                    ok = True
+                    break
+        if ok:
+            done.add((id(va), id(vb)))
+            for v in (va, vb):
+                findings.append(_finding(
+                    'needless-via', name, 'via', v.x, v.y,
+                    f"via pair jumps to {r.layer} and back to {other}, where "
+                    f"the run clears on {other} itself", size=None))
+
+
+def _shape_gates(pcb_data):
+    """The clearance gate the router's own smoother places new copper by
+    (pcb_modification._copper_clearance_gates), at the board's rules: the
+    Default class clearance, each net's class clearance and the copper-to-
+    edge constraint from the sibling project. None when it cannot be built."""
+    try:
+        from pcb_modification import _copper_clearance_gates
+        from routing_config import GridRouteConfig
+        from list_nets import (board_default_netclass_clearance,
+                               net_clearance_map_by_id, board_constraint)
+        path = getattr(pcb_data, 'source_path', None)
+        clr = (board_default_netclass_clearance(path) if path else None) or 0.2
+        edge = (board_constraint(path, 'min_copper_edge_clearance')
+                if path else None) or 0.0
+        nets = {nid: n.name for nid, n in pcb_data.nets.items()}
+        net_clr = (net_clearance_map_by_id(path, nets) if path else None) or None
+        layers = list(getattr(pcb_data.board_info, 'copper_layers', None)
+                      or ['F.Cu', 'B.Cu'])
+        cfg = GridRouteConfig(layers=layers, clearance=clr,
+                              board_edge_clearance=edge)
+        gates = _copper_clearance_gates(pcb_data, clr, net_clr, edge, cfg)
+        return gates.clears
+    except Exception as e:                                   # noqa: BLE001
+        print(f"check_weird: no clearance gate ({e}); V corners and needless "
+              f"bends are not graded", file=sys.stderr)
+        return None
+
+
+def _class_track_widths(pcb_data):
+    """{net_id: the narrowest track the board allows the net} from the
+    sibling project: its declared minimum track width (KiCad's track_width
+    DRC rule) when it declares one, else the net's class width (the widest of
+    its classes, Default for a net in none); {} without a project.
+
+    The class width is the width new copper is DRAWN at, not a floor: a
+    designer necks down to the board minimum where a fine-pitch part needs
+    it (the published Watchy routes 67% of its track length at its 0.15 mm
+    minimum under a 0.25 mm class), and KiCad's DRC grades the minimum."""
+    path = getattr(pcb_data, 'source_path', None)
+    if not path:
+        return {}
+    try:
+        from list_nets import read_design_rules, net_class_memberships
+        dr = read_design_rules(path)
+        from list_nets import board_constraint
+        floor = board_constraint(path, 'min_track_width', design_rules=dr)
+        classes = dr.get('classes') or {}
+        dflt = (classes.get('Default') or {}).get('track_width')
+        nets = {nid: n.name for nid, n in pcb_data.nets.items()}
+        member = net_class_memberships(path, nets, design_rules=dr)
+        out = {}
+        for nid in nets:
+            ws = [(classes.get(c) or {}).get('track_width')
+                  for c in member.get(nid, ())]
+            ws = [float(w) for w in ws if w]
+            w = max(ws) if ws else (float(dflt) if dflt else None)
+            if floor and floor > 0:
+                w = min(w, floor) if w else floor
+            if w:
+                out[nid] = w
+        return out
+    except Exception:                                        # noqa: BLE001
+        return {}
+
+
+def _detour_setup(pcb_data, class_w):
+    """(free space, via size, barrel(l1, l2), width_of(net_id, segs)) for the
+    detour check, at the board's rules; space None when it cannot be built."""
+    path = getattr(pcb_data, 'source_path', None)
+    try:
+        from list_nets import (board_default_netclass_clearance,
+                               board_default_netclass_param,
+                               net_clearance_map_by_id, board_constraint)
+        clr = (board_default_netclass_clearance(path) if path else None) or 0.2
+        nets = {nid: n.name for nid, n in pcb_data.nets.items()}
+        net_clr = (net_clearance_map_by_id(path, nets) if path else None) or {}
+        edge = (board_constraint(path, 'min_copper_edge_clearance')
+                if path else None) or clr
+        hole = (board_constraint(path, 'min_hole_clearance')
+                if path else None) or clr
+        via_size = (board_default_netclass_param(path, 'via_diameter')
+                    if path else None) or 0.6
+        space = _FreeSpace(pcb_data, lambda nid: max(clr, net_clr.get(nid, clr)),
+                           edge, max(hole, clr))
+    except Exception as e:                                   # noqa: BLE001
+        print(f"check_weird: no free-space model ({e}); detours not graded",
+              file=sys.stderr)
+        return None, 0.6, None, None
+
+    def barrel(l1, l2):
+        try:
+            b = pcb_data.get_via_barrel_length(l1, l2)
+        except Exception:                                    # noqa: BLE001
+            b = 0.0
+        return b if b and b > 0 else 1.6
+
+    def width_of(net_id, segs):
+        w = class_w.get(net_id)
+        if w:
+            return w
+        ws = sorted(sg.width for sg in segs)
+        return ws[len(ws) // 2] if ws else 0.2
+    return space, via_size, barrel, width_of
+
+
 def check_weird(pcb_data: PCBData, net_patterns: Optional[List[str]] = None,
                 thorough: bool = False, quiet: bool = True,
                 tolerance: float = 0.1,
-                min_corner_angle: Optional[float] = None
+                min_corner_angle: Optional[float] = None,
+                detours: bool = True,
+                smd_to_corner: Optional[float] = None
                 ) -> Tuple[List[Dict], List[Tuple[str, int]]]:
     """Run every check. Returns (findings, skipped_nets) where each finding is
     {'category', 'net', 'layer', 'x', 'y', 'detail', 'size'} and skipped_nets
     lists (net_name, segment_count) nets the removable-segment scan skipped.
     Findings whose characteristic size (mm) is below `tolerance` are dropped
     (0 = report everything). ``min_corner_angle``: the acute-corner limit in
-    degrees (None = routing_defaults.MIN_CORNER_ANGLE, 0 = not graded). Read-only: pcb_data is not modified."""
+    degrees (None = routing_defaults.MIN_CORNER_ANGLE, 0 = not graded).
+    ``smd_to_corner``: the SMD To Corner distance in mm (None =
+    routing_defaults.SMD_TO_CORNER_MM). Read-only: pcb_data is not modified."""
     findings: List[Dict] = []
     skipped_nets: List[Tuple[str, int]] = []
     if min_corner_angle is None:
@@ -1264,6 +1859,9 @@ def check_weird(pcb_data: PCBData, net_patterns: Optional[List[str]] = None,
         smd_skip = pad_exit_skip_net_ids(pcb_data)
     except Exception:
         smd_skip = set()
+    clears = _shape_gates(pcb_data)
+    class_w = _class_track_widths(pcb_data)
+    space, via_size, barrel, width_of = _detour_setup(pcb_data, class_w)
     for net_id in check_ids:
         name = _net_name(pcb_data, net_id)
         net_segs = segs_by_net.get(net_id, [])
@@ -1300,11 +1898,27 @@ def check_weird(pcb_data: PCBData, net_patterns: Optional[List[str]] = None,
             _check_smd_exit(name, net_segs, net_vias, net_pads, findings)
             _check_acute_corners(name, net_segs, net_vias, net_pads,
                                  min_corner_angle, findings)
+            _check_in_pad_off_axis(name, net_segs, net_pads, findings)
+            _check_route_shape(net_id, name, net_segs, net_vias, net_pads,
+                               clears, findings)
+        _check_via_in_smd_pad(name, net_vias, net_pads, findings)
+        _check_necked(name, net_segs, class_w.get(net_id), findings)
+        _check_needless_vias(net_id, name, net_segs, net_vias, net_pads,
+                             clears, findings)
+        if detours and not net_zones:
+            _check_detours(pcb_data, net_id, name, net_segs, net_vias,
+                           net_pads, space, width_of, via_size, barrel,
+                           findings)
 
     if tolerance and tolerance > 0:
         findings = [f for f in findings
                     if f.get('size') is None or f['size'] + 1e-9 >= tolerance]
     return findings, skipped_nets
+
+
+def hygiene_findings(findings: List[Dict]) -> List[Dict]:
+    """The findings in HYGIENE_CATEGORIES (see REVIEW_CATEGORIES)."""
+    return [f for f in findings if f['category'] not in REVIEW_CATEGORIES]
 
 
 def blocking_findings(findings: List[Dict]) -> List[Dict]:
@@ -1377,13 +1991,10 @@ def main():
                         help='Minimum finding size in mm (dangle/tail length, '
                              'gap, duplicated-copper length, via diameter); '
                              'smaller findings are dropped. Default 0.1; use '
-                             '0 to report everything. soft-joint, '
-                             'narrow-pad-joint, shallow-pad-entry, smd-entry, '
-                             'smd-to-corner, acute-corner, '
-                             'kicad-dangling and '
-                             'off-centre-via-end carry no size and are ALWAYS '
-                             'reported -- smaller is worse, or KiCad treats '
-                             'any amount alike.')
+                             '0 to report everything. Only dangles, gaps, '
+                             'duplicated copper and islands carry a size; '
+                             'every other category is ALWAYS reported -- '
+                             'smaller is worse, or any amount is a defect.')
     parser.add_argument('--min-corner-angle', type=float, default=None,
                         help='Interior angle (degrees) under which two '
                              'same-net tracks meeting form an acute-corner '
@@ -1392,6 +2003,18 @@ def main():
                              'value route.py cleans to unless its '
                              '--min-corner-angle / --max-turn-angle said '
                              'otherwise.')
+    parser.add_argument('--smd-to-corner', type=float, default=None,
+                        help='Straight run (mm) a track must keep from an '
+                             'SMD pad outline before its first bend '
+                             "(Altium's SMD To Corner; never less than the "
+                             "track's half-width): shorter is an "
+                             'smd-to-corner finding. Default: '
+                             'routing_defaults.SMD_TO_CORNER_MM (0.25), the '
+                             'value route.py lays unless its --smd-to-corner '
+                             'said otherwise.')
+    parser.add_argument('--no-detours', action='store_true',
+                        help='Skip the detour check (a free-path search per '
+                             'net: the slowest category on a big board).')
     parser.add_argument('--max-print', type=int, default=20,
                         help='Max findings printed per category '
                              '(<=0 prints all; default 20)')
@@ -1402,7 +2025,9 @@ def main():
     findings, skipped_nets = check_weird(pcb_data, args.nets,
                                           tolerance=args.tolerance,
                                          thorough=args.thorough, quiet=False,
-                                         min_corner_angle=args.min_corner_angle)
+                                         min_corner_angle=args.min_corner_angle,
+                                         detours=not args.no_detours,
+                                         smd_to_corner=args.smd_to_corner)
     print_report(findings, skipped_nets, max_print=args.max_print)
     sys.exit(1 if blocking_findings(findings) else 0)
 

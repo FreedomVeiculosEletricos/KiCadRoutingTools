@@ -351,3 +351,72 @@ def grade_pad_exit(pad, pts, width, allow_side: bool = SMD_ENTRY_SIDE):
         run += math.hypot(sx - qx, sy - qy)
         j += 1
     return out
+
+
+#: A track's centreline inside a pad shorter than this (mm) is a touch, not a
+#: run through the pad's copper.
+IN_PAD_MIN_RUN_MM = 0.01
+#: A run through a round pad passes its centre within this (mm).
+IN_PAD_RADIAL_TOL_MM = 0.01
+
+
+def in_pad_off_axis(pad, layer: str, ax, ay, bx, by) -> Optional[float]:
+    """How much of the track centreline a->b runs inside ``pad`` OFF the
+    pad's axes (mm), or None when none does.
+
+    A designer joins a pad along its own axes: straight in from an edge, on
+    a line parallel to the pad's sides, to the centre or short of it. A
+    centreline that crosses the pad's copper at an angle -- a diagonal from
+    the centre out to a corner, a 45-degree stub joining an exit laid off the
+    pad's axis -- is copper the pad already holds drawn crooked inside it:
+    the solder sees a track edge running across the land, the mask opening
+    and the paste no longer match the copper, and the joint's current path
+    is the diagonal's, not the pad's. On a round pad any line through the
+    centre is an axis."""
+    if not gradable_pad(pad, layer):
+        return None
+    return _off_axis_run(pad, ax, ay, bx, by)
+
+
+def _off_axis_run(pad, ax, ay, bx, by) -> Optional[float]:
+    """in_pad_off_axis on a pad already known to carry the track's layer."""
+    if pad_depth(pad, ax, ay) <= 0 and pad_depth(pad, bx, by) <= 0 \
+            and segment_pad_depth(pad, ax, ay, bx, by) <= 0:
+        return None
+    # the interval of t inside the pad (pad_depth is concave along a line)
+    def f(t):
+        return pad_depth(pad, ax + (bx - ax) * t, ay + (by - ay) * t)
+    lo, hi = 0.0, 1.0
+    for _ in range(60):
+        m1, m2 = lo + (hi - lo) / 3.0, hi - (hi - lo) / 3.0
+        if f(m1) < f(m2):
+            lo = m1
+        else:
+            hi = m2
+    tm = (lo + hi) / 2.0
+    if f(tm) <= 0:
+        return None
+
+    def edge(t_in, t_out):
+        for _ in range(50):
+            mid = (t_in + t_out) / 2.0
+            if f(mid) > 0:
+                t_in = mid
+            else:
+                t_out = mid
+        return t_in
+    t0 = 0.0 if f(0.0) > 0 else edge(tm, 0.0)
+    t1 = 1.0 if f(1.0) > 0 else edge(tm, 1.0)
+    run = (t1 - t0) * math.hypot(bx - ax, by - ay)
+    if run < IN_PAD_MIN_RUN_MM:
+        return None
+    if _round_pad(pad):
+        dx, dy = bx - ax, by - ay
+        L = math.hypot(dx, dy)
+        off = abs((pad.global_x - ax) * dy - (pad.global_y - ay) * dx) / L
+        return None if off <= IN_PAD_RADIAL_TOL_MM else run
+    lx, ly = to_local_dir(pad, bx - ax, by - ay)
+    L = math.hypot(lx, ly)
+    if min(abs(lx), abs(ly)) <= ANGLE_TOL * L:
+        return None
+    return run

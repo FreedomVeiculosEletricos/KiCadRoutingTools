@@ -262,10 +262,98 @@ def test_fix_y_tee_and_fold():
     print("PASS fix: Y joint and T squared off along the trunk, fold removed")
 
 
+def _kinds(pcb, clears, net=1):
+    from corner_angle import route_shape
+    out = {}
+    for f in route_shape(_net(pcb, net), pcb.vias, pcb.pads_by_net[net], clears=clears):
+        out.setdefault(f.kind, []).append((round(f.x, 3), round(f.y, 3)))
+    return out
+
+
+ANY = (lambda *a: True)
+NONE = (lambda *a: False)
+
+
+def test_shape_zigzag_and_short_leg():
+    # pad 1 (10,10) down to pad 2 (10,16) with a jog 0.2 aside and back
+    jog = [(10.0, 10.0), (10.0, 12.0), (10.2, 12.2), (10.2, 12.5), (10.0, 12.7),
+           (10.0, 16.0)]
+    k = _kinds(_board([(jog, 0.3, 1)]), NONE)
+    assert len(k.get('zigzag', [])) == 1, k          # 4 bends, 0.28/0.30/0.28 apart
+    assert len(k.get('short-leg', [])) == 3, k       # 0.28, 0.30, 0.28 < 0.6
+    assert 'needless-bend' not in k, k               # copper blocks all
+    k = _kinds(_board([(jog, 0.3, 1)]), ANY)
+    assert len(k.get('needless-bend', [])) == 4, k   # a straight line clears
+    # a 1 mm jog: its bends are over 1 mm apart and its legs long -- no
+    # zigzag, no short leg; still needless where the straight line clears
+    jog2 = [(10.0, 10.0), (10.0, 12.0), (11.0, 13.0), (11.0, 14.0), (10.0, 15.0),
+            (10.0, 16.0)]
+    k = _kinds(_board([(jog2, 0.3, 1)]), NONE)
+    assert not k, k
+    k = _kinds(_board([(jog2, 0.3, 1)]), ANY)
+    assert len(k.get('needless-bend', [])) == 4, k
+    # three close bends are a jog, not a zigzag: four in a row are needed
+    three = [(10.0, 10.0), (10.0, 12.0), (10.3, 12.3), (10.3, 12.6), (11.3, 13.6)]
+    k = _kinds(_board([(three, 0.3, 1)]), NONE)
+    assert 'zigzag' not in k, k
+    # five close bends are one zigzag, not two
+    five = [(10.0, 10.0), (10.0, 12.0), (10.3, 12.3), (10.3, 12.6), (10.0, 12.9),
+            (10.0, 13.2), (10.3, 13.5), (10.3, 16.0)]
+    k = _kinds(_board([(five, 0.3, 1)]), NONE)
+    assert len(k.get('zigzag', [])) == 1, k
+    print("PASS shape: zigzag (4+ bends each under 1 mm apart) and short legs "
+          "graded; needless bends need clear copper")
+
+
+def test_shape_right_angle_allowed():
+    # out to (11,13) and back: the 90-degree turn is allowed (only acute
+    # corners are a defect); its two 45-degree bends are needless
+    v = [(10.0, 10.0), (10.0, 12.0), (11.0, 13.0), (10.0, 14.0), (10.0, 16.0)]
+    k = _kinds(_board([(v, 0.3, 1)]), ANY)
+    assert sorted(k.get('needless-bend', [])) == [(10.0, 12.0), (10.0, 14.0)], k
+    assert set(k) == {'needless-bend'}, k
+    k = _kinds(_board([(v, 0.3, 1)]), NONE)
+    assert not k, k
+    print("PASS shape: a right-angle corner is never reported")
+
+
+def test_shape_keeps_what_is_needed():
+    # straight, collinear legs merged: nothing
+    k = _kinds(_board([([(10.0, 10.0), (10.0, 13.0), (10.0, 16.0)], 0.3, 1)]), ANY)
+    assert not k, k
+    # one 45-degree elbow to a free end off the pad's axis: the shortest
+    # octolinear path already -- not needless
+    k = _kinds(_board([([(10.0, 10.0), (10.0, 12.0), (12.0, 14.0)], 0.3, 1)]), ANY)
+    assert not k, k
+    # a track ending on the jog (a T) pins it: removing the jog would strand it
+    jog = [(10.0, 10.0), (10.0, 12.0), (11.0, 13.0), (11.0, 14.0), (10.0, 15.0),
+           (10.0, 16.0)]
+    k = _kinds(_board([(jog, 0.3, 1), ([(11.0, 13.5), (13.0, 13.5)], 0.3, 1)]), ANY)
+    assert 'needless-bend' not in k, k
+    # a pad end keeps the line it leaves the pad on: no shortcut that turns
+    # the exit
+    k = _kinds(_board([([(10.0, 10.0), (10.0, 11.0), (11.0, 12.0)], 0.3, 1)]), ANY)
+    assert not k, k
+    print("PASS shape: straight runs, needed elbows, pinned legs and pad exits kept")
+
+
+def test_shape_in_check_weird():
+    jog = [(10.0, 10.0), (10.0, 12.0), (10.2, 12.2), (10.2, 12.5), (10.0, 12.7),
+           (10.0, 16.0)]
+    f, _ = check_weird(_board([(jog, 0.3, 1)]), tolerance=0)
+    cats = {x['category'] for x in f}
+    assert {'zigzag', 'short-leg', 'needless-bend'} <= cats, cats
+    from check_weird import blocking_findings
+    assert len(blocking_findings(f)) == len(f)       # none is advisory
+    print("PASS shape: check_weird counts zigzag, short-leg, needless-bend")
+
+
 TESTS = [test_max_turn_is_hard_over_the_window, test_acute_cost_avoids_the_hairpin,
          test_config_kwargs, test_detect, test_fix_cuts_octolinearly,
          test_fix_takes_the_whole_spike_and_leaves_a_joint,
-         test_fix_y_tee_and_fold]
+         test_fix_y_tee_and_fold, test_shape_zigzag_and_short_leg,
+         test_shape_right_angle_allowed, test_shape_keeps_what_is_needed,
+         test_shape_in_check_weird]
 
 if __name__ == "__main__":
     for t in TESTS:

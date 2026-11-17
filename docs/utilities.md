@@ -3170,9 +3170,9 @@ category each:
   through a side `SMD_ENTRY_SIDE` forbids (Altium's SMD Entry rule: straight
   out through an edge, with the track's copper inside that edge; a round pad
   radially);
-- `smd-to-corner` -- a track bending within `SMD_TO_CORNER_MM` (0.25 mm, and
-  never less than its half-width) of an SMD pad's outline (Altium's SMD To
-  Corner). route.py's cleanup rebuilds both from the pad centre, straight out
+- `smd-to-corner` -- a track bending within the SMD To Corner distance
+  (`--smd-to-corner`, default `SMD_TO_CORNER_MM` 0.25 mm, and never less than
+  its half-width) of an SMD pad's outline (Altium's SMD To Corner). route.py's cleanup rebuilds both from the pad centre, straight out
   through an allowed edge, then onto the route (`rebuild_pad_exits`); what
   remains is an exit no rebuild could clear;
 - `acute-corner` -- two same-net tracks meeting at an interior angle under
@@ -3181,8 +3181,7 @@ category each:
   point beside it is a sliver. Not graded inside the net's own pad or via
   copper. route.py's cleanup cuts the corner octolinearly, squares a branch
   off along its trunk, or removes a fold (`fix_acute_corners`); what remains
-  is a corner no change could clear. Advisory: reported, not counted in the
-  exit code;
+  is a corner no change could clear;
 - `kicad-dangling` -- a joint segment whose ends both lie on other same-net
   tracks, which KiCad's DRC reports as `track_dangling` (#1217);
 - `off-centre-via-end` -- a track end inside a same-net via's copper, on a
@@ -3191,12 +3190,48 @@ category each:
   differently from the routed copper, which is how a matched pair shipped
   skewed (#1583). An end a segment carries on to the via's centre (the
   route cleanup's via-centre bridge) is not reported. An end that is also a
-  pad's terminal names the pad. **Advisory**: printed
-  after the report, never counted in the headline or the exit code, since a
-  via-in-pad is drawn this way and a human-routed board carries many.
+  pad's terminal names the pad;
+- `in-pad-off-axis` -- a track centreline running inside a same-net pad's
+  copper off the pad's axes: the 45-degree stub that joins an exit laid off
+  the pad's axis to its centre, a cut across a corner. A designer joins a pad
+  along its axes (on a round pad, through its centre) (`pad_entry.py`);
+- `via-in-smd-pad` -- a via whose barrel overlaps a same-net SMD pad
+  (`fab_notes.via_in_pad_sites`, the router's own via-in-pad count): solder
+  wicks down the barrel unless the fab fills and caps it;
+- `necked-track` -- a track narrower than the board allows its net: the
+  sibling project's declared minimum track width (KiCad's `track_width`
+  rule), else the net's class width (the widest of its classes). The class
+  width is what new copper is drawn at, not a floor: designers neck down to
+  the board minimum at fine-pitch parts;
+- `zigzag` -- a run that changes direction `ZIGZAG_MIN_BENDS` (4) times in
+  a row, each bend less than `ZIGZAG_MAX_LEG_MM` (1 mm) from the one before;
+  one finding per chain;
+- `short-leg` -- a leg between two bends shorter than `SHORT_LEG_WIDTHS` (2)
+  track widths;
+- `needless-bend` -- a bend under 90 degrees that a straight line or one
+  45-degree elbow between its neighbouring vertices removes while clearing
+  the copper around (up to
+  `NEEDLESS_MAX_WINDOW` consecutive bends at once). The shortcut must clear
+  under the clearance gate the router's own smoother places copper by
+  (`_copper_clearance_gates`, at the board's class rules and edge
+  constraint), keep the line a pad end leaves on, make no corner under 90
+  degrees where it meets the run, and replace no leg that same-net copper
+  touches (`corner_angle.route_shape`);
+- `needless-via` -- two vias joined by one run on another layer where that
+  run, or an octilinear line between the vias, clears on the layer the route
+  came from;
+- `detour` -- a net whose joining copper (dangling copper pruned, each via's
+  barrel counted) is over `DETOUR_RATIO` (1.5) times the free-path length of
+  its pads' spanning tree. The free path is searched on a 0.05 mm grid over
+  every copper layer, foreign copper, drills, keep-outs and the board edge at
+  their clearances, vias where one fits on every layer at its barrel length,
+  inside a window around the two pads (a window only lengthens the free path,
+  so a detour it finds is real). Nets with a zone are not graded.
+
+Every category is counted: the headline and the exit code include all of them.
 
 It never modifies the board — use it as a triage pass before or after the
-other checkers. Exit 1 when anything but an advisory category is found, else 0.
+other checkers. Exit 1 when anything is found, else 0.
 
 **Removable** is graded by the same predicate route.py's post-route cleanup
 removes by (`pcb_modification.StrictRemovalModel`, #1063): a segment, or an
@@ -3222,13 +3257,17 @@ Options:
   --tolerance FLOAT     Minimum finding size in mm (dangle/tail length, gap,
                         duplicated-copper length, via diameter); smaller findings are
                         dropped. Default: 0.1; use 0 to report everything.
-                        soft-joint, narrow-pad-joint, shallow-pad-entry,
-                        smd-entry, smd-to-corner, acute-corner, kicad-dangling
-                        and off-centre-via-end carry no size and are always
+                        Only dangles, gaps, duplicated copper and islands
+                        carry a size; every other category is always
                         reported
   --min-corner-angle DEG
                         Interior angle under which same-net tracks meeting are an
                         acute-corner finding; 0 = not graded (default 90)
+  --smd-to-corner MM    Straight run a track keeps from an SMD pad outline before
+                        its first bend; shorter is an smd-to-corner finding
+                        (default 0.25, never less than the track's half-width)
+  --no-detours          Skip the detour check (a free-path search per net, the
+                        slowest category on a big board)
   --max-print INT       Max findings printed per category (<=0 prints all; default 20)
 ```
 

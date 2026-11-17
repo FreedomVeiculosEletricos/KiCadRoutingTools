@@ -199,7 +199,37 @@ def test_end_on_another_track_is_not_a_pad_entry():
     print("PASS end on another track -> not a pad entry")
 
 
-TESTS = [test_depth_geometry, test_end_on_another_track_is_not_a_pad_entry, test_edge_end_gets_centre_connector,
+def test_in_pad_off_axis():
+    """in_pad_off_axis: a centreline inside the pad's copper on one of its
+    axes (straight in from an edge, to the centre or short of it, or parallel
+    to a side) is the pad's own; one crossing it at an angle -- the diagonal
+    from an off-axis exit to the centre -- is reported, and check_weird
+    names it in-pad-off-axis."""
+    pcb = _board([])
+    A = _pad(pcb, 'R', '1')                       # 1.0 x 1.0 at (10, 10)
+    f = pad_entry.in_pad_off_axis
+    assert f(A, 'F.Cu', 10.0, 12.0, 10.0, 10.0) is None          # straight to centre
+    assert f(A, 'F.Cu', 10.3, 12.0, 10.3, 10.2) is None          # parallel, off-centre
+    assert f(A, 'F.Cu', 12.0, 10.0, 10.0, 10.0) is None          # from the side
+    assert f(A, 'F.Cu', 10.0, 12.0, 10.0, 10.6) is None          # stops outside
+    d = f(A, 'F.Cu', 10.4, 10.4, 10.0, 10.0)                     # corner to centre
+    assert d is not None and abs(d - 0.4 * 2 ** 0.5) < 1e-3, d
+    assert f(A, 'F.Cu', 11.0, 11.0, 10.5, 10.5) is None          # ends on the corner: a touch
+    assert f(A, 'F.Cu', 11.0, 11.0, 10.4, 10.4) is not None      # enters through the corner
+    assert f(A, 'B.Cu', 10.4, 10.4, 10.0, 10.0) is None          # pad not on that layer
+    # check_weird: an exit laid 0.3 off the pad's axis, closed to the centre
+    # by a 45-degree stub inside the pad
+    pcb = _board([((10.3, 12.0), (10.3, 10.3), W, 1), ((10.3, 10.3), (10.0, 10.0), W, 1)])
+    f2, _ = check_weird(pcb, tolerance=0)
+    hits = [x for x in f2 if x['category'] == 'in-pad-off-axis']
+    assert len(hits) == 1 and abs(hits[0]['x'] - 10.15) < 1e-6, hits
+    pcb = _board([((10.0, 12.0), (10.0, 10.0), W, 1)])
+    f2, _ = check_weird(pcb, tolerance=0)
+    assert not [x for x in f2 if x['category'] == 'in-pad-off-axis']
+    print("PASS in-pad off-axis: diagonal inside the pad reported, axis runs not")
+
+
+TESTS = [test_depth_geometry, test_in_pad_off_axis, test_end_on_another_track_is_not_a_pad_entry, test_edge_end_gets_centre_connector,
          test_corner_graze_gets_centre_connector, test_deep_landing_untouched,
          test_narrow_pad_needs_the_medial_axis,
          test_blocked_centre_falls_back_to_shortest_connector,

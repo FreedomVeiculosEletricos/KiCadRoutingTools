@@ -922,6 +922,46 @@ def main():
                             pads=[_pad(-2, 0, num='1'), _pad(2, 0, num='2', ref='U2'),
                                   _pad(0.03, 0.02, size=0.2, num='3', ref='U3')])))
 
+    # 24. The reviewer's defects (in-pad-off-axis and the route shape have
+    #     their own tests): a via in an SMD pad, a track under its class
+    #     width, a via pair that jumps to another layer and back where the
+    #     run clears on its own layer, and a detour.
+    def _cw(segs, vias=(), pads=(), more=()):
+        pcb = _pcb(list(segs) + [m for m in more if isinstance(m, Segment)],
+                   vias=vias, pads=pads)
+        if more:
+            pcb.nets[2] = Net(net_id=2, name='/OTHER', pads=[])
+            pcb.pads_by_net[2] = []
+        return _cats(check_weird(pcb, tolerance=0)[0])
+    _sp = [_rect_pad(0, 0, 1.0, 1.0, num='1'), _rect_pad(6, 0, 1.0, 1.0, num='2', ref='U2')]
+    c = _cw([_seg(0, 0, 6, 0)], vias=[_via(0, 0, size=0.4, drill=0.2)], pads=_sp)
+    results.append(("a via in an SMD pad is via-in-smd-pad", c['via-in-smd-pad'] == 1))
+    _tp = [_pad(0, 0, size=1.6, layers=('F.Cu', 'B.Cu'), drill=0.8, num='1'),
+           _pad(6, 0, num='2', ref='U2')]
+    c = _cw([_seg(0, 0, 6, 0)], vias=[_via(0, 0, size=0.4, drill=0.2)], pads=_tp)
+    results.append(("a via in a plated through-hole pad is not", c['via-in-smd-pad'] == 0))
+    _nk = []
+    check_weird_mod._check_necked(NAME, [_seg(0, 0, 3, 0, width=0.1),
+                                         _seg(3, 0, 6, 0, width=0.2)], 0.2, _nk)
+    results.append(("a track under the class width is necked-track (only that one)",
+                    len(_nk) == 1 and _nk[0]['category'] == 'necked-track'
+                    and abs(_nk[0]['x'] - 1.5) < 1e-9))
+    _pp = [_pad(0, 0, num='1'), _pad(10, 0, num='2', ref='U2')]
+    _jump = [_seg(0, 0, 3, 0), _seg(3, 0, 7, 0, layer='B.Cu'), _seg(7, 0, 10, 0)]
+    _jv = [_via(3, 0), _via(7, 0)]
+    c = _cw(_jump, vias=_jv, pads=_pp)
+    results.append(("a jumper to B.Cu and back over clear F.Cu: two needless vias",
+                    c['needless-via'] == 2))
+    _wall = Segment(start_x=5, start_y=-3, end_x=5, end_y=3, width=0.3,
+                    layer='F.Cu', net_id=2)
+    c = _cw(_jump, vias=_jv, pads=_pp, more=[_wall])
+    results.append(("the same jumper over a foreign track is needed", c['needless-via'] == 0))
+    _q = [_pad(0, 0, num='1'), _pad(4, 0, num='2', ref='U2')]
+    c = _cw([_seg(0, 0, 0, 5), _seg(0, 5, 4, 5), _seg(4, 5, 4, 0)], pads=_q)
+    results.append(("14 mm of copper where 4 mm is free is a detour", c['detour'] == 1))
+    c = _cw([_seg(0, 0, 4, 0)], pads=_q)
+    results.append(("the straight run is not", c['detour'] == 0))
+
     # 11. The reporter, which is what #696 actually broke: a finding whose
     #     category is missing from CATEGORIES counted toward the headline and
     #     the exit code but printed nothing, so the board was blocked by a

@@ -13,8 +13,9 @@ Rows, on synthetic boards:
      via's copper and off its centre is found with its offset; an end on the
      centre, an end past the via's radius, a foreign-net end and an end on a
      layer the via does not carry are not;
-  2. check_weird reports it as advisory: not in the headline or the exit
-     code (blocking_findings), named with its offset in the report;
+  2. check_weird counts it: in the headline and the exit code
+     (blocking_findings), named with its offset in the report -- a reviewer
+     rejects the end (it was advisory until every category became a defect);
   3. an end that is also a same-net pad's terminal names the pad.
 
     python3 tests/test_1235_off_centre_via_end_report.py
@@ -111,17 +112,17 @@ blind = via(5, 0, layers=('In1.Cu', 'B.Cu'))     # row 1's via spans F.Cu
 check("an end on a layer the via does not carry is not",
       not ends(board([seg(0, 0, 5.1, 0.1), B_CU], [blind], [A, B])))
 
-print("2. check_weird reports it as advisory")
+print("2. check_weird counts it")
 found = advisory(board([seg(0, -0.25, 5.0, -0.25), B_CU], [via(5, 0)], [A, B]))
 check("check_weird reports the end", len(found) == 1, found)
-check("the category is advisory", 'off-centre-via-end' in ADVISORY_CATEGORIES
-      and not blocking_findings(found))
+check("the category is counted", 'off-centre-via-end' not in ADVISORY_CATEGORIES
+      and blocking_findings(found) == found)
 buf = io.StringIO()
 with redirect_stdout(buf):
     print_report(found, [])
 out = buf.getvalue()
-check("the report says nothing counted, and names the end",
-      'NO WEIRD THINGS FOUND' in out and 'advisory, not counted: off-centre-via-end x1' in out
+check("the report counts it and names the end",
+      'FOUND 1 WEIRD THINGS' in out and 'off-centre-via-end: 1' in out
       and '0.2500mm off the centre' in out, out)
 
 print("3. an end on a pad names the pad")
