@@ -239,6 +239,77 @@ def corner_cut_candidates(V, A, C, min_angle: float, step: float,
     return out
 
 
+def corner_cut_chains(V, A, C, min_angle: float, step: float,
+                      width: float = 0.0, max_points: int = 24):
+    """Two-cut recorners of the corner A-V-C for a corner one cut cannot
+    fix: A-P-R-Q-C, P on VA, Q on VC, the cuts P-R and R-Q octolinear, all
+    three new corners at ``min_angle`` or wider. One cut turns a corner by
+    at most twice the turn ``min_angle`` allows (2 x 45 = 90 degrees under a
+    135-degree limit), so an acute corner -- a 135-degree turn -- needs two.
+    Yields [P, R, Q], the shortest resulting path first. The cuts keep the
+    notch reach corner_cut_candidates keeps from V."""
+    vx, vy = V
+    ax, ay = A[0] - vx, A[1] - vy
+    cx, cy = C[0] - vx, C[1] - vy
+    la, lc = math.hypot(ax, ay), math.hypot(cx, cy)
+    if la < 1e-9 or lc < 1e-9:
+        return []
+    au = (ax / la, ay / la)
+    cu = (cx / lc, cy / lc)
+    limit = float(min_angle) - ANGLE_TOL_DEG
+    half = math.radians(interior_angle(au[0], au[1], cu[0], cu[1])) / 2.0
+    reach = (width / 2.0) * (1.0 / max(math.sin(half), 1e-6) - 1.0) if width > 0 else 0.0
+    dirs = [(math.cos(k * math.pi / 4), math.sin(k * math.pi / 4)) for k in range(8)]
+    # directions whose turns from the incoming leg (-au) and onto the
+    # outgoing one (cu) each keep the limit
+    pairs = []
+    for d1 in dirs:
+        if interior_angle(au[0], au[1], d1[0], d1[1]) < limit:
+            continue
+        for d2 in dirs:
+            if (interior_angle(-d1[0], -d1[1], d2[0], d2[1]) < limit
+                    or interior_angle(-d2[0], -d2[1], cu[0], cu[1]) < limit):
+                continue
+            pairs.append((d1, d2))
+    if not pairs:
+        return []
+    na = max(1, min(max_points, int(la / max(step, 1e-3))))
+    nc = max(1, min(max_points, int(lc / max(step, 1e-3))))
+    cands = []
+    for i in range(na, 0, -1):
+        d1a = la * i / na
+        P = (vx + au[0] * d1a, vy + au[1] * d1a)
+        for j in range(nc, 0, -1):
+            d2c = lc * j / nc
+            Q = (vx + cu[0] * d2c, vy + cu[1] * d2c)
+            for d1, d2 in pairs:
+                # P + t*d1 + r*d2 = Q
+                det = d1[0] * d2[1] - d1[1] * d2[0]
+                if abs(det) < 1e-12:
+                    continue
+                rx, ry = Q[0] - P[0], Q[1] - P[1]
+                t = (rx * d2[1] - ry * d2[0]) / det
+                r = (d1[0] * ry - d1[1] * rx) / det
+                if t <= 1e-6 or r <= 1e-6:
+                    continue
+                R = (P[0] + d1[0] * t, P[1] + d1[1] * t)
+                if (_pt_seg(vx, vy, P[0], P[1], R[0], R[1])[0] < reach - 1e-6
+                        or _pt_seg(vx, vy, R[0], R[1], Q[0], Q[1])[0] < reach - 1e-6):
+                    continue
+                length = (la - d1a) + t + r + (lc - d2c)
+                cands.append((length, (round(P[0], 4), round(P[1], 4)),
+                              (round(R[0], 4), round(R[1], 4)),
+                              (round(Q[0], 4), round(Q[1], 4))))
+    cands.sort(key=lambda c: c[0])
+    seen, out = set(), []
+    for _l, P, R, Q in cands:
+        if (P, R, Q) in seen:
+            continue
+        seen.add((P, R, Q))
+        out.append([P, R, Q])
+    return out
+
+
 def tee_cut_candidates(V, A, C, min_angle: float, step: float, width: float = 0.0):
     """A branch V-C leaving a trunk V-A at an angle under ``min_angle``
     (a Y split, or a T whose end V lies on the trunk's body): the branch is

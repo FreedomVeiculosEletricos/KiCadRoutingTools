@@ -2395,6 +2395,118 @@ def _late_move_exit_vias(pcb_data, output_file, return_results, results_data,
         return 0
 
 
+def _late_final_corners(pcb_data, output_file, return_results, results_data,
+                        write_model, input_signature, scope_names,
+                        keep_input_copper, config=None):
+    """Cut, once more, every corner sharper than config.min_interior_angle()
+    (fix_acute_corners) on the board this run SHIPS, after the last end-of-run
+    pass that lays copper (_late_move_exit_vias). Runs only when the limit is
+    wider than a right angle -- --max-turn-angle under 90, or
+    --min-corner-angle over 90 -- where a pass that re-lays a track to the
+    right-angle rule it always kept could leave a bend the run was asked not
+    to ship. Same plumbing as _late_move_exit_vias. Returns the corners cut."""
+    import copy as _copy
+    from collections import Counter
+    from improvement_gate import copper_item_key
+    from pcb_modification import fix_acute_corners, _min_corner
+    from cleanup_pipeline import pad_exit_skip_net_ids
+    if _min_corner(config) <= 90.0:
+        return 0
+    try:
+        rd = None
+        if return_results:
+            rd = results_data if results_data is not None else {}
+            board = _copy.copy(pcb_data)
+            if write_model is not None:
+                segs_by_net, vias_by_net = write_model(rd)
+                board.segments = [x for _l in segs_by_net.values() for x in _l]
+                board.vias = [x for _l in vias_by_net.values() for x in _l]
+            else:
+                board.segments = list(pcb_data.segments)
+                board.vias = list(pcb_data.vias)
+        elif output_file and os.path.isfile(output_file):
+            from kicad_parser import parse_kicad_pcb as _pkfc
+            board = _pkfc(output_file)
+            if getattr(pcb_data, '_net_keepouts', None):
+                board._net_keepouts = list(pcb_data._net_keepouts)
+        else:
+            return 0
+        name_of = {nid: n.name for nid, n in board.nets.items()}
+        scope = {nid for nid, nm in name_of.items() if nm in set(scope_names or ())}
+        if not scope:
+            return 0
+        left = {n: Counter(c) for n, c in (input_signature or {}).items()}
+        owned, protected = set(), set()
+        for item in list(board.segments) + list(board.vias):
+            c = left.get(name_of.get(item.net_id))
+            k = copper_item_key(item)
+            if c and c[k] > 0:
+                c[k] -= 1                   # input copper
+                if keep_input_copper:
+                    protected.add(id(item))
+            else:
+                owned.add(id(item))
+        cfg = _declared_floor_config(config, pcb_data)
+        skip = pad_exit_skip_net_ids(board, config)
+        before = {id(x): x for x in board.segments}
+        stats = {}
+        n_fixed, _strip, _added = fix_acute_corners(
+            [], board, scope, cfg, editable=lambda x: id(x) not in protected,
+            skip_net_ids=skip, stats=stats)
+        after = {id(x): x for x in board.segments}
+        rem_s = [x for i, x in before.items() if i not in after]
+        add_s = [x for i, x in after.items() if i not in before]
+        left_n = sum(stats.values())
+        if not (rem_s or add_s):
+            if left_n:
+                print(f"  Corners (end of run, last pass): {left_n} corner(s) "
+                      f"under {_min_corner(config):g} degrees left as routed "
+                      f"-- no clear fix")
+            return 0
+        gone = {id(x) for x in rem_s}
+        if return_results:
+            for r in rd.get('results') or []:
+                if r.get('new_segments'):
+                    r['new_segments'] = [x for x in r['new_segments']
+                                         if id(x) not in gone]
+            if rd.get('all_swap_segments'):
+                rd['all_swap_segments'] = [x for x in rd['all_swap_segments']
+                                           if id(x) not in gone]
+            rd.setdefault('segments_to_remove', []).extend(
+                x for x in rem_s if id(x) not in owned)
+            rd.setdefault('results', []).append({
+                'new_segments': list(add_s), 'new_vias': [],
+                'cleanup': 'final_corners'})
+            pcb_data.segments = [x for x in pcb_data.segments
+                                 if id(x) not in gone] + list(add_s)
+            bump_copper_epoch(pcb_data)
+        else:
+            n_s, _n_v = _strip_written_copper(output_file, rem_s, [], name_of)
+            if n_s != len(rem_s):
+                print(f"  WARNING: final corners: chose {len(rem_s)} segment(s) "
+                      f"to replace, found {n_s} in the written file")
+            from kicad_parser import board_uses_name_nets
+            from kicad_writer import generate_segment_sexpr
+            with open(output_file, 'r', encoding='utf-8') as _f:
+                _content = _f.read()
+            _v10 = board_uses_name_nets(_content)
+            _sx = [generate_segment_sexpr(
+                (w.start_x, w.start_y), (w.end_x, w.end_y), w.width, w.layer,
+                w.net_id, name_of.get(w.net_id) if _v10 else None)
+                for w in add_s]
+            _lp = _content.rfind(')')
+            _content = _content[:_lp] + '\n'.join(_sx) + '\n' + _content[_lp:]
+            with open(output_file, 'w', encoding='utf-8') as _f:
+                _f.write(_content)
+        print(f"  Corners (end of run, last pass): cut {n_fixed} corner(s) to "
+              f"{_min_corner(config):g} degrees or wider"
+              + (f"; {left_n} left as routed -- no clear fix" if left_n else ""))
+        return n_fixed
+    except Exception as _e:                                     # noqa: BLE001
+        print(f"  (end-of-run final corner pass skipped: {type(_e).__name__}: {_e})")
+        return 0
+
+
 def _late_dangling_via_sweep1166(pcb_data, output_file, return_results,
                                  results_data, write_model, input_signature,
                                  scope_names, keep_input_copper):
@@ -4685,6 +4797,9 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                 _late_move_exit_vias(pcb_data, output_file, as_gui, rd, None,
                                      _input_sig1069, _scope1166,
                                      keep_input_copper, config)
+                _late_final_corners(pcb_data, output_file, as_gui, rd, None,
+                                    _input_sig1069, _scope1166,
+                                    keep_input_copper, config)
             _moved = []
             if _sk:
                 from check_drc import skew_moved_out_of_range as _smo1798
@@ -10350,6 +10465,11 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
             {pcb_data.nets[_n].name for _n in sweep_scope_ids
              if _n in pcb_data.nets}, keep_input_copper, config)
         _late_move_exit_vias(
+            pcb_data, output_file, return_results,
+            locals().get('results_data'), _gui_write_model, _input_sig1069,
+            {pcb_data.nets[_n].name for _n in sweep_scope_ids
+             if _n in pcb_data.nets}, keep_input_copper, config)
+        _late_final_corners(
             pcb_data, output_file, return_results,
             locals().get('results_data'), _gui_write_model, _input_sig1069,
             {pcb_data.nets[_n].name for _n in sweep_scope_ids

@@ -5793,6 +5793,31 @@ def pad_field_is_corridor(footprint, track_width: float, clearance: float,
     return (pitch - pad) < channels * chan
 
 
+def _min_corner(config) -> float:
+    """The interior angle a pass that lays new copper keeps at every bend it
+    lays and every joint it makes: config.min_interior_angle() (raised to
+    135 by --max-turn-angle 45), never under 90 -- the right angle these
+    passes always kept."""
+    f = getattr(config, 'min_interior_angle', None)
+    try:
+        v = float(f()) if callable(f) else 0.0
+    except Exception:                                          # noqa: BLE001
+        v = 0.0
+    return max(90.0, v)
+
+
+def _bend_too_sharp(ux, uy, vx, vy, min_corner: float = 90.0) -> bool:
+    """Is the bend from travel direction (ux, uy) onto (vx, vy) sharper than
+    ``min_corner`` degrees interior? At 90 this is the plain "turns back"
+    test (negative dot product) the passes used before."""
+    if min_corner <= 90.0:
+        return ux * vx + uy * vy < -1e-9
+    from corner_angle import interior_angle, ANGLE_TOL_DEG
+    if math.hypot(ux, uy) < 1e-12 or math.hypot(vx, vy) < 1e-12:
+        return False
+    return interior_angle(-ux, -uy, vx, vy) < min_corner - ANGLE_TOL_DEG
+
+
 def _creates_acute(pts, layer, same_net_segs, skip_ids=(), min_angle: float = 90.0) -> bool:
     """Would the new run ``pts`` meet a same-net track on ``layer`` at either
     of its ends at an interior angle under ``min_angle`` -- the copper the
@@ -6759,11 +6784,12 @@ def rebuild_pad_exits(results, pcb_data: PCBData, scope_net_ids, config,
                           'copper_layers', None) or ['F.Cu', 'B.Cu'])
 
     _join_ctx = {}
+    _mc = _min_corner(config)
 
     def join(net_id, pad, pts, w, layer, next_dir_of, head, X, ux, uy):
         """The run ``head`` + [X], joined octolinearly to the first vertex
-        of ``pts`` past the pad that keeps both bends at 90 degrees
-        or wider and grades clean: (path, j) or None."""
+        of ``pts`` past the pad that keeps both bends at _min_corner(config)
+        degrees or wider and grades clean: (path, j) or None."""
         # The vertex a join can reach with the fewest new bends wins: the
         # farthest one first, so a join absorbs the jogs of the run it
         # replaces instead of adding its own elbow in front of them. A
@@ -6786,12 +6812,12 @@ def rebuild_pad_exits(results, pcb_data: PCBData, scope_net_ids, config,
                 ix = len(head)
                 if len(path) > ix + 1:
                     ax, ay = path[ix + 1][0] - X[0], path[ix + 1][1] - X[1]
-                    if ax * ux + ay * uy < -1e-9:
-                        continue          # bend at X sharper than 90
+                    if _bend_too_sharp(ux, uy, ax, ay, _mc):
+                        continue          # bend at X sharper than the limit
                 lx_, ly_ = path[-1][0] - path[-2][0], path[-1][1] - path[-2][1]
                 nd = next_dir_of(j)
-                if nd is not None and lx_ * nd[0] + ly_ * nd[1] < -1e-9:
-                    continue              # bend at Q sharper than 90
+                if nd is not None and _bend_too_sharp(lx_, ly_, nd[0], nd[1], _mc):
+                    continue              # bend at Q sharper than the limit
                 if any(segment_pad_depth(pad, *path[k], *path[k + 1])
                        > -(w / 2.0) + 1e-3 for k in range(ix, len(path) - 1)):
                     continue              # back over the pad past X
@@ -6804,7 +6830,8 @@ def rebuild_pad_exits(results, pcb_data: PCBData, scope_net_ids, config,
                 # leg it keeps is graded above)
                 if final and len(path) - ix >= 2 and _creates_acute(path[ix:], layer,
                                             _join_ctx.get('segs', ()),
-                                            skip_ids=_join_ctx.get('skip', ())):
+                                            skip_ids=_join_ctx.get('skip', ()),
+                                            min_angle=_mc):
                     continue
                 if not all(gates.clears(*path[k], *path[k + 1], layer, net_id, w)
                            for k in range(ix - 1, len(path) - 1)):
@@ -7155,6 +7182,7 @@ def move_vias_blocking_pad_exits(pcb_data: PCBData, scope_net_ids, config,
     from pad_entry import (pad_depth, smd_gradable, exit_distance, is_smd)
     skip = set(skip_net_ids or ())
     to_corner = getattr(config, 'smd_to_corner', None)
+    _mc = _min_corner(config)
     h2h = getattr(config, 'hole_to_hole_clearance', 0.0) or 0.0
     grid = getattr(config, 'grid_step', 0.05) or 0.05
     copper = list(getattr(getattr(pcb_data, 'board_info', None),
@@ -7284,16 +7312,18 @@ def move_vias_blocking_pad_exits(pcb_data: PCBData, scope_net_ids, config,
             for cand in options:
                 cand = [p for k, p in enumerate(cand) if k == 0 or math.hypot(
                     p[0] - cand[k - 1][0], p[1] - cand[k - 1][1]) > 1e-6]
-                # no bend sharper than 90 degrees along the new run
-                if any((cand[k][0] - cand[k - 1][0]) * (cand[k + 1][0] - cand[k][0])
-                       + (cand[k][1] - cand[k - 1][1]) * (cand[k + 1][1] - cand[k][1])
-                       < -1e-9
+                # no bend sharper than _min_corner(config) along the new run
+                if any(_bend_too_sharp(cand[k][0] - cand[k - 1][0],
+                                       cand[k][1] - cand[k - 1][1],
+                                       cand[k + 1][0] - cand[k][0],
+                                       cand[k + 1][1] - cand[k][1], _mc)
                        for k in range(1, len(cand) - 1)):
                     continue
                 if not all(gate(*cand[k], *cand[k + 1], s.layer, v.net_id, s.width)
                            for k in range(len(cand) - 1)):
                     continue
-                if _creates_acute(cand, s.layer, net_segs, skip_ids=skip_ids):
+                if _creates_acute(cand, s.layer, net_segs, skip_ids=skip_ids,
+                                  min_angle=_mc):
                     continue
                 path = cand
                 break
@@ -7447,7 +7477,7 @@ def fix_acute_corners(results, pcb_data: PCBData, scope_net_ids, config,
     import math
     from collections import defaultdict
     from check_connected import check_net_connectivity
-    from corner_angle import (acute_corners, corner_cut_candidates,
+    from corner_angle import (acute_corners, corner_cut_candidates, corner_cut_chains,
                               tee_cut_candidates, interior_angle, _key)
     if min_angle is None:
         min_angle = (config.min_interior_angle()
@@ -7549,6 +7579,18 @@ def fix_acute_corners(results, pcb_data: PCBData, scope_net_ids, config,
                                    seg(Q, C, s2.width, layer, net_id))
                        if math.hypot(n.end_x - n.start_x, n.end_y - n.start_y) > 1e-6]
                 yield [s1, s2], new, [(V, P, s1.width), (V, Q, s2.width)], [(P, Q, w)]
+            if c.angle < 2.0 * min_angle - 180.0 - 0.5:
+                # a corner one cut inside its legs cannot fix (an acute
+                # corner under a 135-degree limit), when no single cut with a
+                # bend at A or C took: two octolinear cuts
+                for P, R, Q in corner_cut_chains(V, A, C, min_angle, step, width=w):
+                    new = [n for n in (seg(A, P, s1.width, layer, net_id),
+                                       seg(P, R, w, layer, net_id),
+                                       seg(R, Q, w, layer, net_id),
+                                       seg(Q, C, s2.width, layer, net_id))
+                           if math.hypot(n.end_x - n.start_x, n.end_y - n.start_y) > 1e-6]
+                    yield ([s1, s2], new, [(V, P, s1.width), (V, Q, s2.width)],
+                           [(P, R, w), (R, Q, w)])
             return
         # a Y joint: one of the pair is the trunk, the other the branch
         for trunk, branch in ((s1, s2), (s2, s1)):
@@ -8239,12 +8281,12 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
                             return False
 
                         def _bend_acute(pts, i, j, poly):
-                            """A corner under 90 degrees
+                            """A corner under _min_corner(config) degrees
                             where the connector meets the chain legs it
                             keeps."""
                             from corner_angle import interior_angle, ANGLE_TOL_DEG
                             m = len(poly) - 1
-                            lim = 90.0 - ANGLE_TOL_DEG
+                            lim = _min_corner(config) - ANGLE_TOL_DEG
                             if i > 0:
                                 a, b, c = poly[i - 1], pts[0], pts[1]
                                 if interior_angle(a[0] - b[0], a[1] - b[1],
@@ -8392,7 +8434,8 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
                                                 _new_contact(pts, i, j, poly)
                                                 or _pad_leg_bent(pts, i, j, poly)
                                                 or _creates_acute(pts, layer, net_segs,
-                                                                  chain_ids)
+                                                                  chain_ids,
+                                                                  _min_corner(config))
                                                 or _bend_acute(pts, i, j, poly)
                                                 or _exit_worse(pts, i, j, poly)):
                                             continue

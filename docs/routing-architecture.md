@@ -664,6 +664,18 @@ can land on its own tie or tap, a segment lying wholly on a longer same-net
 track of the same layer, no wider, that nothing meets off the track's ends.
 
 ### Corner limit after the router
+
+`--max-turn-angle` holds the A* to its turn; `config.min_interior_angle()`
+(180 minus that, or `--min-corner-angle` if larger) is the corner every later
+pass keeps. `pcb_modification._min_corner` gives it, never under 90, to the
+passes that lay new bends: `rebuild_pad_exits` (the join's bends at X and Q
+and its far joint), `move_vias_blocking_pad_exits` (the re-laid via tracks)
+and `smooth_octolinear_chains` (the connector's joints). At the default limit
+they keep the right angle they always kept. When the limit is wider than 90,
+`route._late_final_corners` runs `fix_acute_corners` once more after
+`_late_move_exit_vias`, the last pass that lays copper; an acute corner one
+octolinear cut cannot fix gets two (`corner_angle.corner_cut_chains`).
+
 ### Exposed pads and open pads
 
 Before any net is routed, `exposed_pad_ties.tie_pins_to_exposed_pads` joins
