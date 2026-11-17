@@ -4935,6 +4935,22 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
             boundary_debug_labels.extend(stub_labels)
 
     results = []
+    # A package's same-net pins tied straight to its exposed pad before any
+    # net is routed (exposed_pad_ties.py): otherwise a signal routed under
+    # the part takes the strip between the pin row and the exposed pad, or
+    # the multipoint pass joins two pins round the outside of the row and
+    # boxes in the pin between them. On pcb_data before the base obstacle
+    # map, so every net routes around them and the sync keeps them as input
+    # copper; written through the results just before the write (the ones a
+    # rip-up of the net did not take off the board).
+    _ep_ties = []
+    if final_reconcile and not skip_routing and single_ended_nets:
+        from exposed_pad_ties import tie_pins_to_exposed_pads
+        _ep_ties = tie_pins_to_exposed_pads(
+            pcb_data, [nid for _nm, nid in single_ended_nets], config)
+        if _ep_ties:
+            print(f"Exposed pads: tied {len(_ep_ties)} pin(s) straight to "
+                  f"their package's exposed pad")
     pad_swaps = []  # List of (pad1, pad2) tuples for nets that need swapping
     successful = 0
     failed = 0
@@ -8202,6 +8218,13 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     print(f"JSON_SUMMARY: {json.dumps(summary)}")
     from route_summary import sink_summary
     sink_summary(summary)          # the sink and its printed-floor record
+
+    if _ep_ties:
+        _live_ep = {id(x) for x in pcb_data.segments}
+        _kept_ep = [x for x in _ep_ties if id(x) in _live_ep]
+        if _kept_ep:
+            results.append({'new_segments': _kept_ep, 'new_vias': [],
+                             'cleanup': 'exposed_pad_tie'})
 
     # Write output file or return results for direct application
     if return_results:

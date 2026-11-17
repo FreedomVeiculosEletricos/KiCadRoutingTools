@@ -664,6 +664,18 @@ can land on its own tie or tap, a segment lying wholly on a longer same-net
 track of the same layer, no wider, that nothing meets off the track's ends.
 
 ### Corner limit after the router
+### Exposed pads and open pads
+
+Before any net is routed, `exposed_pad_ties.tie_pins_to_exposed_pads` joins
+each pin of an exposed pad's net to the exposed pad with a straight stub under
+the package, along the pin's long axis, where the stub clears every other net
+at the run's clearance. The ties go on the board before the base obstacle map,
+so every net routes round them and the sync keeps them; they are written
+through the results. Without them a signal routed under the part took the
+strip between the pin row and the exposed pad, or the multipoint pass joined
+two pins round the outside of the row and boxed in the pin between them.
+
+After the CLI run writes its board, `open_pad_unbox.unbox_open_pads` takes the
 ## Visualizing the Search
 
 The interactive PyGame visualizer was removed in #569: the debugging workflow it predated (grade with `check_drc`/`check_connected`, replay a recorded chain from its `redo_commands.sh` manifest, read the per-net JSON summary and blocker report, or step a board in the GUI plugin) covers the same questions without a second rendering path to keep in sync with the engine.
