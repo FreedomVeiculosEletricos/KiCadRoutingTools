@@ -101,6 +101,8 @@ check("an end inside the via, off its centre, is found",
       and abs(rows[0][3] - 0.1414) < 1e-3, rows)
 check("an end on the centre is not",
       not ends(board([seg(0, 0, 5, 0), B_CU], [via(5, 0)], [A, B])))
+check("an end whose track runs on through the centre is not",
+      not ends(board([seg(0, 0, 5.15, 0), B_CU], [via(5, 0)], [A, B])))
 check("an end past the via's radius is not",
       not ends(board([seg(0, 0, 4.6, 0), B_CU], [via(5, 0)], [A, B])))
 check("a foreign net's end is not",
@@ -123,8 +125,10 @@ check("the report says nothing counted, and names the end",
       and '0.2500mm off the centre' in out, out)
 
 print("3. an end on a pad names the pad")
-C = pad(5.15, 0, 'C1', size=0.4)          # a same-net pad the end lands on
-found = advisory(board([seg(0, 0, 5.15, 0), B_CU], [via(5, 0)], [A, B, C]))
+C = pad(5.15, 0.1, 'C1', size=0.4)        # a same-net pad the end lands on
+# (the run stays 0.1 mm off the via's centre: one through the centre already
+# reaches it and is not off-centre)
+found = advisory(board([seg(0, 0.1, 5.15, 0.1), B_CU], [via(5, 0)], [A, B, C]))
 check("the finding names the pad", len(found) == 1 and 'also on pad C1.1' in found[0]['detail'],
       found)
 

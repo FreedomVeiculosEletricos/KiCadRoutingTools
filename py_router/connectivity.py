@@ -433,7 +433,20 @@ def endpoint_reaches_via(x, y, radius, via, layers, copper_layers=None) -> bool:
 VIA_CENTRE_TOL = 1e-6
 
 
-def off_centre_via_ends(segments, vias, copper_layers=None):
+def _on_centre_track(o, v, x, y, tol: float = 1e-3) -> bool:
+    """Does (x, y) lie on the centreline of track ``o`` (which ends at via
+    ``v``'s centre), short of that centre?"""
+    ax, ay, bx, by = o.start_x, o.start_y, o.end_x, o.end_y
+    dx, dy = bx - ax, by - ay
+    L2 = dx * dx + dy * dy
+    if L2 < 1e-18:
+        return False
+    t = max(0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / L2))
+    return math.hypot(x - (ax + t * dx), y - (ay + t * dy)) <= tol
+
+
+def off_centre_via_ends(segments, vias, copper_layers=None,
+                        carried_through: bool = True):
     """Track ends that lie inside a same-net via's copper but not on its
     centre (#1235): ``[(segment, end, via, offset_mm)]``, ``end`` 0 for the
     segment's start and 1 for its end, one row per (end, via) pair.
@@ -448,7 +461,14 @@ def off_centre_via_ends(segments, vias, copper_layers=None):
 
     An end that a segment on its layer carries on to the via's centre (a
     via-centre bridge, `close_soft_joints`) is not off-centre: the copper
-    reaches the centre, which is where KiCad measures it to.
+    reaches the centre, which is where KiCad measures it to. Nor is an end
+    lying on the centreline of a same-net track on its layer that ends at the
+    via's centre: the end is a T into that track, which carries it there. Nor
+    an end whose own track runs on through the centre (its centreline passes
+    within VIA_CENTRE_TOL of it): that copper crosses the centre already.
+    (``carried_through=False`` drops those two exemptions: the in-run
+    via-centre bridge of the length-graded nets keeps the copper it has
+    always laid, so what is routed after it does not move.)
 
     Graphic (footprint / board art) copper and net 0 are skipped."""
     from collections import defaultdict
@@ -464,6 +484,18 @@ def off_centre_via_ends(segments, vias, copper_layers=None):
     grid = defaultdict(list)          # (net, cx, cy) -> vias
     for v in vias:
         grid[(v.net_id, math.floor(v.x / cell), math.floor(v.y / cell))].append(v)
+    # the tracks that end at each via's centre, by (net, layer, via)
+    to_centre = defaultdict(list)
+    for s in segments:
+        if not s.net_id or getattr(s, 'graphic', False):
+            continue
+        for (x, y) in ((s.start_x, s.start_y), (s.end_x, s.end_y)):
+            for i in (-1, 0, 1):
+                for j in (-1, 0, 1):
+                    for v in grid.get((s.net_id, math.floor(x / cell) + i,
+                                       math.floor(y / cell) + j), ()):
+                        if math.hypot(x - v.x, y - v.y) <= VIA_CENTRE_TOL:
+                            to_centre[(s.net_id, s.layer, id(v))].append(s)
     spans = {}
     out = []
     for s in segments:
@@ -481,6 +513,11 @@ def off_centre_via_ends(segments, vias, copper_layers=None):
                     continue
                 if any(math.hypot(fx - v.x, fy - v.y) <= VIA_CENTRE_TOL for fx, fy in
                        at_vertex[(s.net_id, s.layer, round(x, 4), round(y, 4))]):
+                    continue
+                if carried_through and any(_on_centre_track(o, v, x, y) for o in
+                                           to_centre.get((s.net_id, s.layer, id(v)), ())):
+                    continue
+                if carried_through and _on_centre_track(s, v, v.x, v.y, VIA_CENTRE_TOL):
                     continue
                 span = spans.get(id(v))
                 if span is None:
