@@ -297,7 +297,7 @@ def _dump_engine_config(engine, cfg):
 _FINALIZE_ROUTE_KNOBS = (
     'via_cost', 'ordering_strategy', 'direction_order', 'max_iterations',
     'max_probe_iterations', 'heuristic_weight', 'turn_cost',
-    'max_turn_angle', 'acute_turn_cost', 'min_corner_angle',
+    'max_turn_angle', 'acute_turn_cost', 'min_corner_angle', 'smd_to_corner',
     'direction_preference_cost', 'proximity_heuristic_factor',
     'stub_proximity_radius', 'stub_proximity_cost', 'via_proximity_cost',
     'bga_proximity_radius', 'bga_proximity_cost', 'bga_exclusion_zones',
@@ -3055,6 +3055,7 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                 max_turn_angle: float = defaults.MAX_TURN_ANGLE,
                 acute_turn_cost: int = defaults.ACUTE_TURN_COST,
                 min_corner_angle: float = defaults.MIN_CORNER_ANGLE,
+                smd_to_corner: float = defaults.SMD_TO_CORNER_MM,
                 direction_preference_cost: int = defaults.DIRECTION_PREFERENCE_COST,
                 bus_enabled: bool = False,
                 bus_detection_radius: float = 5.0,
@@ -4059,6 +4060,7 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     config_kwargs['max_turn_angle'] = max_turn_angle
     config_kwargs['acute_turn_cost'] = acute_turn_cost
     config_kwargs['min_corner_angle'] = min_corner_angle
+    config_kwargs['smd_to_corner'] = smd_to_corner
     # #1253: the rules the board's design brief declares join the caller's,
     # read here in the engine so the CLI and the GUI both get them with no
     # flag. Only the OUTERMOST call reads the brief: the nested sub-runs (the
@@ -11534,6 +11536,11 @@ For differential pair routing, use route_diff.py:
                              "Acute Angle rule). The end-of-run cleanup cuts sharper corners "
                              "where the cut clears, and check_weird reports what is left as "
                              f"acute-corner; 0 = off (default: {defaults.MIN_CORNER_ANGLE:g})")
+    parser.add_argument("--smd-to-corner", type=float, default=defaults.SMD_TO_CORNER_MM,
+                        help="Straight run (mm) a track keeps from an SMD pad's outline before "
+                             "its first bend (Altium's SMD To Corner rule; never less than the "
+                             "track's half-width). The pad-exit passes lay it and check_weird "
+                             f"reports a shorter one as smd-to-corner (default: {defaults.SMD_TO_CORNER_MM:g})")
     parser.add_argument("--direction-preference-cost", type=int, default=defaults.DIRECTION_PREFERENCE_COST,
                         help=f"Penalty for non-preferred layer direction, 0=disabled (default: {defaults.DIRECTION_PREFERENCE_COST})")
     parser.add_argument("--bus", action="store_true",
@@ -12328,6 +12335,7 @@ For differential pair routing, use route_diff.py:
                 max_turn_angle=args.max_turn_angle,
                 acute_turn_cost=args.acute_turn_cost,
                 min_corner_angle=args.min_corner_angle,
+                smd_to_corner=args.smd_to_corner,
                 direction_preference_cost=args.direction_preference_cost,
                 bus_enabled=args.bus,
                 bus_detection_radius=args.bus_detection_radius,

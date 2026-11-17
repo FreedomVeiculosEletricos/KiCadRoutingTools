@@ -1201,6 +1201,11 @@ class RoutingDialog(wx.Dialog):
 
         # Float parameters
         float_params = [
+            ('smd_to_corner', 'SMD To Corner (mm):', defaults.SMD_TO_CORNER_MM,
+             "Straight run a track keeps from an SMD pad's outline before its "
+             "first bend (Altium's SMD To Corner rule; never less than the "
+             "track's half-width). The pad-exit passes lay it and check_weird "
+             "reports a shorter one as smd-to-corner. (CLI: --smd-to-corner)"),
             ('bga_proximity_radius', 'BGA Proximity (mm):', defaults.BGA_PROXIMITY_RADIUS, "Radius around BGA pads to apply extra cost"),
             ('bga_proximity_cost', 'BGA Prox. Cost:', defaults.BGA_PROXIMITY_COST, "Cost multiplier for routing near BGA pads"),
             ('stub_proximity_radius', 'Stub Proximity (mm):', defaults.STUB_PROXIMITY_RADIUS, "Radius around stubs to apply extra cost"),
@@ -3096,6 +3101,7 @@ class RoutingDialog(wx.Dialog):
         self.max_turn_angle.SetValue(int(defaults.MAX_TURN_ANGLE))
         self.acute_turn_cost.SetValue(defaults.ACUTE_TURN_COST)
         self.min_corner_angle.SetValue(int(defaults.MIN_CORNER_ANGLE))
+        self.smd_to_corner.SetValue(defaults.SMD_TO_CORNER_MM)
         self.direction_preference_cost.SetValue(defaults.DIRECTION_PREFERENCE_COST)
         self.ordering_strategy.SetSelection(0)
         self.fab_tier.SetStringSelection(defaults.FAB_TIER)
@@ -3485,6 +3491,7 @@ class RoutingDialog(wx.Dialog):
             'max_turn_angle': 45.0 * max(1, min(4, round(self.max_turn_angle.GetValue() / 45.0))),
             'acute_turn_cost': self.acute_turn_cost.GetValue(),
             'min_corner_angle': float(self.min_corner_angle.GetValue()),
+            'smd_to_corner': float(self.smd_to_corner.GetValue()),
             'direction_preference_cost': self.direction_preference_cost.GetValue(),
             'max_ripup': self.max_ripup.GetValue(),
             'ripup_abandon_metric': self.ripup_abandon_metric.GetString(
@@ -4077,6 +4084,7 @@ class RoutingDialog(wx.Dialog):
                     max_turn_angle=config.get('max_turn_angle', defaults.MAX_TURN_ANGLE),
                     acute_turn_cost=config.get('acute_turn_cost', defaults.ACUTE_TURN_COST),
                     min_corner_angle=config.get('min_corner_angle', defaults.MIN_CORNER_ANGLE),
+                    smd_to_corner=config.get('smd_to_corner', defaults.SMD_TO_CORNER_MM),
                     direction_preference_cost=config.get('direction_preference_cost', defaults.DIRECTION_PREFERENCE_COST),
                     max_rip_up_count=config['max_ripup'],
                     ripup_abandon_metric=config.get('ripup_abandon_metric', defaults.RIPUP_ABANDON_METRIC),

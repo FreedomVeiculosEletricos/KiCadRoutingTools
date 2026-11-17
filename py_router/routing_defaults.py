@@ -89,7 +89,9 @@ PAD_ENTRY_NECK_MM = 2.0
 PAD_ENTRY_MARGIN_MM = 0.05
 # Pad exit on SMD pads (pad_entry.py), Altium's SMT rules:
 #  * SMD To Corner -- a track leaves the pad straight for at least
-#    max(SMD_TO_CORNER_MM, its half-width) before its first bend;
+#    max(SMD_TO_CORNER_MM, its half-width) before its first bend (the
+#    default of route.py --smd-to-corner / the GUI's SMD To Corner and of
+#    check_weird --smd-to-corner);
 #  * SMD Entry -- it crosses the pad outline perpendicular to an edge, inside
 #    that edge's straight span (never through a corner, never at an angle).
 #    Ends (the short edges) are always allowed; SMD_ENTRY_SIDE allows the long
@@ -412,6 +414,7 @@ PARAM_RANGES = {
     'max_turn_angle': {'min': 45, 'max': 180},
     'acute_turn_cost': {'min': 0, 'max': 100000},
     'min_corner_angle': {'min': 0, 'max': 180},
+    'smd_to_corner': {'min': 0.0, 'max': 5.0, 'inc': 0.05, 'digits': 3},
     'direction_preference_cost': {'min': 0, 'max': 10000},
     'max_ripup': {'min': 0, 'max': 50},
     'stub_proximity_radius': {'min': 0.0, 'max': 10.0, 'inc': 0.5, 'digits': 1},

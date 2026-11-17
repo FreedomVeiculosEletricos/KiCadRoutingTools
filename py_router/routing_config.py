@@ -202,6 +202,11 @@ class GridRouteConfig:
     max_turn_angle: float = 180.0
     acute_turn_cost: int = 4000
     min_corner_angle: float = 90.0
+    # SMD To Corner (Altium's rule, routing_defaults.SMD_TO_CORNER_MM): the
+    # straight run (mm) a track keeps from an SMD pad's outline before its
+    # first bend (never less than its half-width); the pad-exit passes lay
+    # it and check_weird grades it.
+    smd_to_corner: float = 0.25
     # BGA exclusion zones (auto-detected from PCB) - vias blocked inside these areas
     bga_exclusion_zones: List[Tuple[float, float, float, float]] = field(default_factory=list)
     stub_proximity_radius: float = 2.0  # mm - radius around stubs to penalize

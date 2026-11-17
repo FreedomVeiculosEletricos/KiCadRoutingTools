@@ -96,6 +96,7 @@ def get_dialog_settings(dialog):
         'max_turn_angle': dialog.max_turn_angle.GetValue(),
         'acute_turn_cost': dialog.acute_turn_cost.GetValue(),
         'min_corner_angle': dialog.min_corner_angle.GetValue(),
+        'smd_to_corner': dialog.smd_to_corner.GetValue(),
         'direction_preference_cost': dialog.direction_preference_cost.GetValue(),
         'ordering_strategy': dialog.ordering_strategy.GetSelection(),
         'fab_tier': dialog.fab_tier.GetSelection(),
@@ -457,6 +458,8 @@ def restore_dialog_settings(dialog, settings):
     for key in ('max_turn_angle', 'acute_turn_cost', 'min_corner_angle'):
         if key in settings:
             getattr(dialog, key).SetValue(int(settings[key]))
+    if 'smd_to_corner' in settings:
+        dialog.smd_to_corner.SetValue(float(settings['smd_to_corner']))
     if 'direction_preference_cost' in settings:
         dialog.direction_preference_cost.SetValue(settings['direction_preference_cost'])
     if 'ordering_strategy' in settings:

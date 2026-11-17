@@ -271,6 +271,33 @@ def test_clean_exit_relaid_when_an_end_is_straighter():
     print("PASS clean exit re-laid at the end of the run when a side is straighter")
 
 
+def test_smd_to_corner_is_configurable():
+    """The SMD To Corner distance comes from the run (RoutingConfig
+    smd_to_corner, route.py --smd-to-corner, check_weird --smd-to-corner):
+    a bend 0.4 mm past the outline passes at the 0.25 mm default, fails at
+    0.5 mm, and the rebuild then lays the exit out to 0.5 mm."""
+    pts = [(10.0, 10.0), (10.9, 10.0), (11.9, 11.0), (17.5, 11.0), (18.5, 10.0),
+           (20.0, 10.0)]
+    assert pad_entry.exit_distance(W) == 0.25
+    assert pad_entry.exit_distance(W, 0.5) == 0.5
+    assert pad_entry.exit_distance(1.2, 0.1) == 0.6, "never under half-width"
+    pcb = _board([(pts, W, 1)])
+    assert _rules(pcb) == [], _rules(pcb)
+    f, _ = check_weird(pcb, tolerance=0, smd_to_corner=0.5)
+    assert 'smd-to-corner' in {x['category'] for x in f}
+    cfg = _cfg()
+    cfg.smd_to_corner = 0.5
+    n, _s, added = rebuild_pad_exits([], pcb, {1}, cfg)
+    assert n == 1 and _connected(pcb), n
+    f, _ = check_weird(pcb, tolerance=0, smd_to_corner=0.5)
+    assert not {x['category'] for x in f} & {'smd-to-corner', 'smd-entry'}
+    a = added[0]
+    assert (a.start_x, a.start_y) == (10.0, 10.0)
+    assert abs(a.end_x - 11.0) < 1e-6 and abs(a.end_y - 10.0) < 1e-6, \
+        (a.end_x, a.end_y)
+    print("PASS SMD To Corner distance is configurable (0.25 default, 0.5 set)")
+
+
 def test_junction_inside_the_pad_is_graded_and_rebuilt():
     """Three tracks meet at A's centre (a stub, a run straight down and a
     run that leaves through A's top-right corner): the last is an exit too,
@@ -364,6 +391,7 @@ TESTS = [test_straight_exit_is_clean, test_off_axis_inside_the_pad_is_rebuilt,
          test_round_pad_radial_and_tht_ignored,
          test_exit_with_fewest_bends_wins,
          test_clean_exit_relaid_when_an_end_is_straighter,
+         test_smd_to_corner_is_configurable,
          test_junction_inside_the_pad_is_graded_and_rebuilt,
          test_track_through_the_pad_is_split_and_rebuilt,
          test_track_grazing_the_side_is_flagged,

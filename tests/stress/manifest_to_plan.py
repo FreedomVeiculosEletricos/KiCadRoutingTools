@@ -314,6 +314,8 @@ FLAG_PARAMS = {
     # #581: same-net pad via clearance -- valid on planes, route, route_diff,
     # bga/qfn fanout and repair steps; the GUI control lives on the Basic tab.
     '--same-net-pad-clearance': 'same_net_pad_clearance',
+    # SMD To Corner distance (route.py; the Advanced tab's SMD To Corner)
+    '--smd-to-corner': 'smd_to_corner',
     '--max-track-width': 'max_track_width',
     '--min-track-width': 'min_track_width',
     '--analysis-grid-step': 'analysis_grid_step',
