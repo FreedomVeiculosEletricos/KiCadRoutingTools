@@ -577,6 +577,54 @@ def length_graded_net_ids(pcb_data: PCBData, config) -> set:
     return ids
 
 
+def _via_pad_served(segs, layer, vx, vy, vr, pad, pad_dist):
+    """True when same-net track copper on ``layer`` already runs from the via
+    barrel at (vx, vy) into ``pad``: a chain of segments joined end to end,
+    leaving the barrel and ending inside the pad copper, no longer than a
+    local dogbone (1.5x the via-pad centre distance + 0.5 mm).
+
+    A tap or rescue dogbone is an A* path, emitted as a staircase of grid
+    segments rather than one straight stub. Checking for a single segment
+    missed it, and close_soft_joints laid a straight via->pad stub ON TOP of
+    the path: rescue escapes and plane taps shipped duplicate copper,
+    double-counted in the narrowed-width ledger.
+    """
+    def rk(x, y):
+        return (round(x, 3), round(y, 3))
+
+    limit = 1.5 * math.hypot(pad.global_x - vx, pad.global_y - vy) + 0.5
+    adj = {}
+    for s in segs:
+        if s.layer != layer:
+            continue
+        a, b = rk(s.start_x, s.start_y), rk(s.end_x, s.end_y)
+        ln = math.hypot(s.end_x - s.start_x, s.end_y - s.start_y)
+        adj.setdefault(a, []).append((b, (s.end_x, s.end_y), ln))
+        adj.setdefault(b, []).append((a, (s.start_x, s.start_y), ln))
+    best = {}
+    stack = []
+    for s in segs:
+        if s.layer != layer:
+            continue
+        for (ax, ay, bx, by) in ((s.start_x, s.start_y, s.end_x, s.end_y),
+                                 (s.end_x, s.end_y, s.start_x, s.start_y)):
+            if math.hypot(ax - vx, ay - vy) <= vr + 1e-6:
+                ln = math.hypot(bx - ax, by - ay)
+                if ln <= limit:
+                    stack.append((rk(bx, by), (bx, by), ln))
+    while stack:
+        key, (x, y), d = stack.pop()
+        if pad_dist(x, y, pad) <= 1e-3:
+            return True
+        if best.get(key, float('inf')) <= d:
+            continue
+        best[key] = d
+        for (nk, pt, ln) in adj.get(key, ()):
+            if d + ln <= limit and best.get(nk, float('inf')) > d + ln:
+                stack.append((nk, pt, d + ln))
+    return False
+
+
 def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
                       clearance: float = None,
                       pad_entries_only: bool = False,
@@ -791,9 +839,9 @@ def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
     # free end), so the cap-overlap pass above never sees this joint class.
     # Firm it the soft-joint way: a short stub from via center to pad center
     # (both ends deep inside own copper), same clears() gate, never moving
-    # the via. Joints already served by a DIRECT stub (an existing segment
-    # with one endpoint on the barrel and the other inside the pad -- every
-    # healthy dogbone) are skipped.
+    # the via. Joints already served by track copper from the barrel into the
+    # pad -- a direct stub or a staircase dogbone path (_via_pad_served) --
+    # are skipped.
     via_pad_conns = []
     # Some plane-flow callers pass a minimal namespace config with no
     # track_width (only clearance); fall back to the stock default.
@@ -828,20 +876,8 @@ def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
                 if not vp_layers:
                     continue
                 vp_layer = vp_layers[0]
-                served = False
-                for s2 in vp_segs:
-                    if s2.layer != vp_layer:
-                        continue
-                    for (ax, ay, bx2, by2) in (
-                            (s2.start_x, s2.start_y, s2.end_x, s2.end_y),
-                            (s2.end_x, s2.end_y, s2.start_x, s2.start_y)):
-                        if (math.hypot(ax - vx, ay - vy) <= vr + 1e-6 and
-                                point_to_pad_distance(bx2, by2, p) <= 1e-3):
-                            served = True
-                            break
-                    if served:
-                        break
-                if served:
+                if _via_pad_served(vp_segs, vp_layer, vx, vy, vr, p,
+                                   point_to_pad_distance):
                     continue
                 w2 = min(_vp_tw, p.size_x, p.size_y, 2 * vr)
                 if not clears(vp_net, vx, vy, p.global_x, p.global_y,
@@ -1406,6 +1442,16 @@ def snap_stub_gaps(results, pcb_data: PCBData, scope_net_ids, config,
                     continue  # #1279: sense member copper is never extended
                 for (px, py) in ((s.start_x, s.start_y), (s.end_x, s.end_y)):
                     if deg[(px, py)] != 1:
+                        continue
+                    # An end inside a same-net via barrel is joined to the
+                    # via, not loose. It used to read as degree 1 whenever the
+                    # via carried a single track on this layer -- a dogbone
+                    # once close_soft_joints stopped stacking a via->pad stub
+                    # on it -- and was then "snapped" to the nearest pad edge,
+                    # next to a protected sense branch on test_1279's board.
+                    if any(math.hypot(px - v.x, py - v.y)
+                           <= getattr(v, 'size', 0.0) / 2 + 1e-6
+                           for v in net_vias):
                         continue
                     w = s.width
                     limit = max_gap_factor * w
