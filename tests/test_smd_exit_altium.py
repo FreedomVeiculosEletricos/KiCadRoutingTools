@@ -78,9 +78,14 @@ _SEG = """	(segment (start {x1} {y1}) (end {x2} {y2}) (width {w}) (layer "F.Cu")
 """
 
 
-def _board(polylines):
-    """polylines: [(points, width, net)]"""
+def _board(polylines, vias=()):
+    """polylines: [(points, width, net)]; vias: [(x, y, net)] (0.5/0.25,
+    F.Cu-B.Cu)"""
     body, i = "", 0
+    for k, (x, y, n) in enumerate(vias):
+        body += (f'\t(via (at {x} {y}) (size 0.5) (drill 0.25) '
+                 f'(layers "F.Cu" "B.Cu") (net {n}) '
+                 f'(uuid "cccccccc-0000-0000-0000-0000000{k:05d}"))\n')
     for pts, w, n in polylines:
         for a, b in zip(pts, pts[1:]):
             body += _SEG.format(x1=a[0], y1=a[1], x2=b[0], y2=b[1], w=w, net=n, i=i)
@@ -196,11 +201,173 @@ def test_round_pad_radial_and_tht_ignored():
     print("PASS round SMD pad radial, THT pad not graded")
 
 
-TESTS = [test_straight_exit_is_clean, test_corner_exit_is_flagged_and_rebuilt,
+def test_off_axis_inside_the_pad_is_rebuilt():
+    """The exit leaves A's right side straight, but 0.3 mm off the pad's
+    axis, and reaches the centre by a 45-degree stub across the land: the
+    end-of-run exit grade fails it (in-pad-off-axis) and the end-of-run
+    rebuild lays it from the centre on the axis."""
+    pts = [(10.0, 10.0), (10.3, 10.3), (11.5, 10.3), (12.5, 11.3), (17.0, 11.3),
+           (18.5, 10.0), (20.0, 10.0)]
+    pcb = _board([(pts, W, 1)])
+    segs = [s for s in pcb.segments if s.net_id == 1]
+    assert not smd_exit_violations(segs, [], pcb.pads_by_net[1]), \
+        "in-run, the exit grade is SMD Entry / To Corner only"
+    found = smd_exit_violations(segs, [], pcb.pads_by_net[1], in_pad=True)
+    assert any('in-pad-off-axis' in it[6] for it in found), [it[6] for it in found]
+    f, _ = check_weird(pcb, tolerance=0)
+    assert 'in-pad-off-axis' in {x['category'] for x in f}
+    assert rebuild_pad_exits([], pcb, {1}, _cfg())[0] == 0, "in-run: left as is"
+    n, _s, _a = rebuild_pad_exits([], pcb, {1}, _cfg(), final=True)
+    assert n >= 1 and _connected(pcb), n
+    f, _ = check_weird(pcb, tolerance=0)
+    cats = {x['category'] for x in f}
+    assert not cats & {'in-pad-off-axis', 'smd-entry', 'smd-to-corner'}, cats
+    print("PASS off-axis copper inside the pad -> in-pad-off-axis, rebuilt on the axis")
+
+
+def test_exit_with_fewest_bends_wins():
+    """The run leaves A through its bottom-right corner into a channel just
+    right of A (x = 10.75) that runs down to the far end: the bottom edge
+    faces the far end, but the right edge reaches the channel with one bend
+    and less copper. Every allowed edge is tried; the fewest bends win."""
+    pcb = _board([([(10.3, 10.6), (10.75, 11.05), (10.75, 20.0), (20.0, 20.0),
+                    (20.0, 10.0)], W, 1)])
+    assert 'smd-entry' in _rules(pcb), _rules(pcb)
+    # in-run: the first clear edge in facing order (the bottom), unchanged
+    n, _s, added = rebuild_pad_exits([], pcb, {1}, _cfg())
+    assert n >= 1 and _rules(pcb) == [] and _connected(pcb), (n, _rules(pcb))
+    a = added[0]
+    assert (a.end_x, a.end_y) == (10.0, 11.05), (a.end_x, a.end_y)
+    # end of run: every edge tried, the right end (fewest bends) wins
+    pcb = _board([([(10.3, 10.6), (10.75, 11.05), (10.75, 20.0), (20.0, 20.0),
+                    (20.0, 10.0)], W, 1)])
+    n, _s, added = rebuild_pad_exits([], pcb, {1}, _cfg(), final=True)
+    assert n >= 1 and _rules(pcb) == [] and _connected(pcb), (n, _rules(pcb))
+    a = added[0]
+    assert (a.start_x, a.start_y) == (10.0, 10.0), (a.start_x, a.start_y)
+    assert abs(a.end_y - 10.0) < 1e-6 and a.end_x > 10.5, \
+        f"exit through the right end, got ({a.end_x}, {a.end_y})"
+    print("PASS end of run: the exit with the fewest bends wins over the facing edge")
+
+
+def test_clean_exit_relaid_when_an_end_is_straighter():
+    """A clean exit (out of A's bottom end, 0.25 mm straight) that then turns
+    right and runs down a channel beside A: its side reaches the channel
+    with one bend instead of two. In-run it stays; the end-of-run pass
+    re-lays it out of the side, square with the channel (no slanted leg)."""
+    pts = [(10.0, 10.0), (10.0, 11.05), (10.75, 11.05), (10.75, 20.0),
+           (20.0, 20.0), (20.0, 10.0)]
+    pcb = _board([(pts, W, 1)])
+    assert _rules(pcb) == [], _rules(pcb)
+    assert rebuild_pad_exits([], pcb, {1}, _cfg())[0] == 0, "in-run: left as is"
+    n, _s, added = rebuild_pad_exits([], pcb, {1}, _cfg(), final=True)
+    assert n == 1 and _rules(pcb) == [] and _connected(pcb), (n, _rules(pcb))
+    got = sorted((round(a.start_x, 4), round(a.start_y, 4), round(a.end_x, 4),
+                  round(a.end_y, 4)) for a in added)
+    assert got == [(10.0, 10.0, 10.75, 10.0), (10.75, 10.0, 10.75, 20.0)], got
+    # a clean exit with nothing better is left alone
+    pcb = _board([([(10.0, 10.0), (10.0, 12.0), (20.0, 12.0), (20.0, 10.0)], W, 1)])
+    assert rebuild_pad_exits([], pcb, {1}, _cfg(), final=True)[0] == 0
+    print("PASS clean exit re-laid at the end of the run when a side is straighter")
+
+
+def test_junction_inside_the_pad_is_graded_and_rebuilt():
+    """Three tracks meet at A's centre (a stub, a run straight down and a
+    run that leaves through A's top-right corner): the last is an exit too,
+    though its end inside the pad is no free end -- graded only with
+    ``through``, rebuilt at the end of the run."""
+    pcb = _board([([(10.2, 10.0), (10.0, 10.0)], W, 1),
+                  ([(10.0, 10.0), (10.0, 7.0)], W, 1),
+                  ([(10.0, 10.0), (11.5, 11.5), (17.0, 11.5), (18.5, 10.0),
+                    (20.0, 10.0)], W, 1)])
+    segs = pcb.segments
+    assert not smd_exit_violations(segs, [], pcb.pads_by_net[1])
+    found = smd_exit_violations(segs, [], pcb.pads_by_net[1], through=True)
+    assert [(e, r) for _s, e, _p, _pt, _c, _r, r in found] == \
+        [((10.0, 10.0), {'smd-entry'})], found
+    assert 'smd-entry' in _rules(pcb), _rules(pcb)
+    n, _s, _a = rebuild_pad_exits([], pcb, {1}, _cfg())
+    assert n == 0, "in-run: a junction is left as routed"
+    n, _s, added = rebuild_pad_exits([], pcb, {1}, _cfg(), final=True)
+    assert n == 1 and _rules(pcb) == [] and _connected(pcb), (n, _rules(pcb))
+    assert (added[0].start_x, added[0].start_y) == (10.0, 10.0)
+    print("PASS junction inside the pad -> graded, rebuilt at the end")
+
+
+def test_track_through_the_pad_is_split_and_rebuilt():
+    """A run enters A slanted through its top edge, turns inside it and
+    leaves straight down through its bottom edge, with no end in the pad:
+    split at the point nearest the centre, the slanted half fails and is
+    rebuilt from the centre; the straight half keeps its copper."""
+    pcb = _board([(list(reversed(B_EXIT)) + [(18.5, 10.0), (17.0, 12.0),
+                                             (12.0, 12.0), (10.0, 10.5),
+                                             (10.0, 7.0)], W, 1)])
+    segs = pcb.segments
+    assert not smd_exit_violations(segs, [], pcb.pads_by_net[1])
+    found = smd_exit_violations(segs, [], pcb.pads_by_net[1], through=True)
+    got = sorted((e, sorted(r)) for _s, e, _p, _pt, _c, _r, r in found)
+    assert got == [((10.0, 10.0), ['smd-entry'])], got
+    n, _s, added = rebuild_pad_exits([], pcb, {1}, _cfg(), final=True)
+    assert n >= 1 and _rules(pcb) == [] and _connected(pcb), (n, _rules(pcb))
+    keep = [a for a in added if (a.end_x, a.end_y) == (10.0, 7.0)]
+    assert keep and (keep[0].start_x, keep[0].start_y) == (10.0, 10.0), \
+        [(a.start_x, a.start_y, a.end_x, a.end_y) for a in added]
+    print("PASS track through the pad -> split, slanted half rebuilt")
+
+
+def test_track_grazing_the_side_is_flagged():
+    """A run whose copper only touches A's top edge, its centreline
+    outside the pad: an smd-entry, left as routed (no end to lay from)."""
+    pcb = _board([(list(reversed(B_EXIT)) + [(17.5, 10.9), (9.0, 10.9)], W, 1)])
+    found = smd_exit_violations(pcb.segments, [], pcb.pads_by_net[1],
+                                through=True)
+    assert [(r, rules) for _s, _e, p, _pt, _c, r, rules in found
+            if p.pad_number == '1'] == [('graze', {'smd-entry'})], found
+    assert 'smd-entry' in _rules(pcb), _rules(pcb)
+    before = len(pcb.segments)
+    stats = {}
+    rebuild_pad_exits([], pcb, {1}, _cfg(), final=True, stats=stats)
+    assert stats.get('grazes_pad') == 1, stats
+    print("PASS track grazing the pad's side -> smd-entry, reported")
+
+
+def test_parallel_runs_to_one_via_leave_one_exit():
+    """A routed dogbone and a straight via->pad stub laid beside it both run
+    from A's centre to one via (a loop): each blocks the other's rebuild
+    with an acute corner at the via. The end-of-run pass rebuilds one and
+    removes the other."""
+    via = (11.0, 11.3)
+    pcb = _board([([(10.0, 10.0), (10.2, 10.0), (10.2, 10.5), (11.0, 11.3)], W, 1),
+                  ([(10.0, 10.0), (11.0, 11.3)], W, 1),
+                  ([(11.0, 11.3), (11.0, 12.5), (18.5, 12.5), (20.0, 11.0),
+                    (20.0, 10.0)], W, 1)],
+                 vias=[(via[0], via[1], 1)])
+    found = smd_exit_violations(pcb.segments, pcb.vias, pcb.pads_by_net[1],
+                                through=True)
+    assert len([f for f in found if f[2].pad_number == '1']) == 2, found
+    n, _s, added = rebuild_pad_exits([], pcb, {1}, _cfg(), final=True)
+    assert n >= 1 and _connected(pcb), n
+    at_a = [s for s in pcb.segments
+            if (s.start_x, s.start_y) == (10.0, 10.0)
+            or (s.end_x, s.end_y) == (10.0, 10.0)]
+    assert len(at_a) == 1, [(s.start_x, s.start_y, s.end_x, s.end_y) for s in at_a]
+    assert not smd_exit_violations(pcb.segments, pcb.vias, pcb.pads_by_net[1],
+                                   through=True)
+    print("PASS parallel runs to one via -> one exit left")
+
+
+TESTS = [test_straight_exit_is_clean, test_off_axis_inside_the_pad_is_rebuilt,
+         test_corner_exit_is_flagged_and_rebuilt,
          test_bend_on_the_edge_is_flagged_and_rebuilt,
          test_shallow_end_is_rebuilt_not_left_diagonal,
          test_blocked_exit_is_left_and_reported, test_side_rule,
-         test_round_pad_radial_and_tht_ignored]
+         test_round_pad_radial_and_tht_ignored,
+         test_exit_with_fewest_bends_wins,
+         test_clean_exit_relaid_when_an_end_is_straighter,
+         test_junction_inside_the_pad_is_graded_and_rebuilt,
+         test_track_through_the_pad_is_split_and_rebuilt,
+         test_track_grazing_the_side_is_flagged,
+         test_parallel_runs_to_one_via_leave_one_exit]
 
 if __name__ == "__main__":
     for t in TESTS:

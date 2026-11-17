@@ -609,6 +609,48 @@ ships, after the plane finalize and the reconciliation have laid their copper
 (#1063). `KICAD_BOARD_LEDGER=1` checks, per net, that the copper in memory and
 the copper the writer produces are identical.
 
+After the last pass that removes copper, `route.py`'s end-of-run pass
+(`_late_pad_exits`) works on the board it ships. Nothing is routed after it,
+so it may do what the in-run passes must not (their copper steers what is
+routed next). It builds two candidates from the same copper:
+
+* **A** -- the pass as the in-run cleanup does it: `rebuild_pad_exits` and
+  `fix_acute_corners` in rounds, the strict collapse of what they leave
+  redundant, then the pad-entry connectors (`close_soft_joints`).
+* **B** -- first a final gloss (`smooth_octolinear_chains` with
+  `micro_any_angle`: a jog whose vertices lie within one track width of a
+  straight line takes that line at any angle, since a 45-degree jog cannot
+  offset a run by less than its width without a zigzag; no fine-pitch field
+  guard; no connector that touches other same-net copper, bends a pad's exit
+  leg, makes a pad exit grade worse or makes a corner under 90 degrees); then
+  the exits rebuilt with `final=True` (copper crossing its pad off the pad's
+  axes is rebuilt too, and the join takes the farthest vertex it reaches with
+  the fewest bends) and the corners cut, at the clearances the run's INPUT
+  declares plus the plated drills' hole clearance (`_declared_floor_config`:
+  the run may have relaxed and written back lower floors), then again at the
+  run's floors for what that could not rebuild; then the pad entries, and
+  every net's track ends inside a via taken to its centre
+  (`close_soft_joints(via_centres_all_nets=True)`).
+
+Per net, B ships only where `check_weird` grades it no worse than A in every
+category (`_late_choose_no_worse`; a track below the board's minimum width by
+its length); A ships everywhere else. The in-run copper is the same with or
+without this pass, so every difference it makes is its own.
+
+With `final=True`, every connection to an SMD pad is an exit
+(`smd_exit_violations(through=True)`, also what `check_weird` grades): a track
+ending in the pad, each track leaving a junction inside it, and both halves of
+a track passing through it (split at its point nearest the centre). Runs from
+one pad to one via or junction are parallel copper: the one rebuilt first
+replaces the others. A track whose copper only touches the pad's side is
+reported, not rebuilt.
+
+own copper only. `_late_merge_clears` checks the merge: a new segment that
+cleared in its own candidate but not against the merged board sends the B net
+it meets back to A, until the merge clears (all-A is the plain pass). Without
+it a net's B exit could run into a neighbour's A track -- a short.
+
+`_late_stacked_dedup162` removes exact same-net copies and, since a reroute
 ## Visualizing the Search
 
 The interactive PyGame visualizer was removed in #569: the debugging workflow it predated (grade with `check_drc`/`check_connected`, replay a recorded chain from its `redo_commands.sh` manifest, read the per-net JSON summary and blocker report, or step a board in the GUI plugin) covers the same questions without a second rendering path to keep in sync with the engine.

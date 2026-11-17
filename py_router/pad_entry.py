@@ -194,11 +194,15 @@ def smd_gradable(pad, layer: str) -> bool:
     return is_smd(pad) and gradable_pad(pad, layer)
 
 
-def exit_distance(width: float) -> float:
+def exit_distance(width: float, to_corner: Optional[float] = None) -> float:
     """SMD To Corner: the straight run a ``width`` track keeps from the pad
-    outline to its first bend -- SMD_TO_CORNER_MM, and never less than its
-    half-width (a bend closer than that puts its copper on the pad edge)."""
-    return max(SMD_TO_CORNER_MM, width / 2.0)
+    outline to its first bend -- ``to_corner`` (None = SMD_TO_CORNER_MM; the
+    run's RoutingConfig.smd_to_corner, route.py --smd-to-corner), and never
+    less than its half-width (a bend closer than that puts its copper on the
+    pad edge)."""
+    if to_corner is None:
+        to_corner = SMD_TO_CORNER_MM
+    return max(float(to_corner), width / 2.0)
 
 
 def _round_pad(pad) -> bool:
@@ -301,17 +305,26 @@ def exit_crossing(pad, pts):
     return None
 
 
-def grade_pad_exit(pad, pts, width, allow_side: bool = SMD_ENTRY_SIDE):
+def grade_pad_exit(pad, pts, width, allow_side: bool = SMD_ENTRY_SIDE,
+                   in_pad: bool = False, to_corner: Optional[float] = None):
     """Altium's SMD Entry and SMD To Corner on a track run entering an SMD
     ``pad``: ``pts`` from the end inside the pad outward (terminal_chain).
-    Returns the set of rules it fails, of {'smd-entry', 'smd-to-corner'}; empty
-    when the end is not inside the pad (a shallow entry, graded apart) or the
-    run never leaves it."""
+    Returns the set of rules it fails, of {'smd-entry', 'smd-to-corner'},
+    and with ``in_pad`` also 'in-pad-off-axis' (a leg of the run inside the
+    pad's copper off the pad's axes, _off_axis_run: the exit leaves straight,
+    but the copper joining it to its end crosses the land crooked); empty when
+    the end is not inside the pad (a shallow entry, graded apart) or the run
+    never leaves it. ``to_corner``: the SMD To Corner distance
+    (exit_distance; None = SMD_TO_CORNER_MM)."""
     out = set()
     cross = exit_crossing(pad, pts)
     if cross is None:
         return out
     k, (kx, ky) = cross
+    for q in range(k + 1 if in_pad else 0):
+        if _off_axis_run(pad, pts[q][0], pts[q][1], pts[q + 1][0], pts[q + 1][1]):
+            out.add('in-pad-off-axis')
+            break
     (ax, ay), (bx, by) = pts[k], pts[k + 1]
     vx, vy = bx - ax, by - ay
     lvx, lvy = to_local_dir(pad, vx, vy)
@@ -345,7 +358,7 @@ def grade_pad_exit(pad, pts, width, allow_side: bool = SMD_ENTRY_SIDE):
     while j < len(pts) - 1:
         (px, py), (qx, qy), (sx, sy) = pts[j - 1], pts[j], pts[j + 1]
         if not _collinear(qx - px, qy - py, sx - qx, sy - qy):
-            if run < exit_distance(width) - 1e-3:
+            if run < exit_distance(width, to_corner) - 1e-3:
                 out.add('smd-to-corner')
             break
         run += math.hypot(sx - qx, sy - qy)

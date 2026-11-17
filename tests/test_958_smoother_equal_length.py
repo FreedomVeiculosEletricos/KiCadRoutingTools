@@ -318,8 +318,40 @@ def test_writelist_custody():
           and len(res['new_segments']) == 2)
 
 
+def test_micro_jog_takes_the_straight_line():
+    """An offset smaller than the track's width cannot be carried by a
+    45-degree jog without two bends closer than a millimetre: the span whose
+    vertices lie within MICRO_ANY_ANGLE_WIDTHS widths of the straight line
+    between its ends takes that line, at any angle, and a pad leg it tilts by
+    under SMD Entry's 1 degree stays a pad leg. A jog wider than the track
+    stays octolinear. Off by default: route.py's end-of-run pass asks."""
+    from pcb_modification import MICRO_ANY_ANGLE_WIDTHS
+    pts = [(10.0, 10.0), (15.0, 10.0), (15.05, 10.05), (20.0, 10.05)]
+    pcb = _board(end_pads(pts), polyline(pts))
+    _n, nets, strip, added, st = smooth_octolinear_chains(
+        [], pcb, clearance=CLR, micro_any_angle=MICRO_ANY_ANGLE_WIDTHS)
+    v = vertices(pcb.segments)
+    check("a 0.05 mm jog (under one width) becomes one straight leg",
+          len(pcb.segments) == 1 and pts[0] in v and pts[-1] in v, v)
+    check("...that leaves both pads within 1 degree of their legs",
+          all(abs(math.degrees(math.atan2(s.end_y - s.start_y, s.end_x - s.start_x))) < 1.0
+              for s in pcb.segments))
+    pts = [(10.0, 10.0), (15.0, 10.0), (15.3, 10.3), (20.0, 10.3)]
+    pcb = _board(end_pads(pts), polyline(pts))
+    smooth_octolinear_chains([], pcb, clearance=CLR, micro_any_angle=MICRO_ANY_ANGLE_WIDTHS)
+    check("a 0.3 mm jog (over one width) stays octolinear",
+          all(octolinear(s) for s in pcb.segments) and len(pcb.segments) >= 2,
+          vertices(pcb.segments))
+    pcb = _board(end_pads([(10.0, 10.0), (20.0, 10.05)]),
+                 polyline([(10.0, 10.0), (15.0, 10.0), (15.05, 10.05), (20.0, 10.05)]))
+    smooth_octolinear_chains([], pcb, clearance=CLR)
+    check("off by default (in-run): the output stays octolinear",
+          all(octolinear(s) for s in pcb.segments))
+    check("route.py's end-of-run pass uses one track width", MICRO_ANY_ANGLE_WIDTHS == 1.0)
+
+
 if __name__ == '__main__':
-    for fn in (test_equal_length_jogs, test_elbow_stable_and_idempotent,
+    for fn in (test_micro_jog_takes_the_straight_line, test_equal_length_jogs, test_elbow_stable_and_idempotent,
                test_refuses_measurable_growth, test_blocked_alternatives,
                test_via_mid_span_pins, test_pad_mid_span_pins,
                test_round_pad_detour_all_poses, test_skip_net_ids_absolute,

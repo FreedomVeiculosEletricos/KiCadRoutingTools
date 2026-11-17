@@ -579,7 +579,8 @@ def length_graded_net_ids(pcb_data: PCBData, config) -> set:
 
 def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
                       clearance: float = None,
-                      pad_entries_only: bool = False) -> int:
+                      pad_entries_only: bool = False,
+                      via_centres_all_nets: bool = False) -> int:
     """Bridge same-net SOFT JOINTS with a TINY coincident segment (#soft-joint).
 
     A soft joint is a dangling free end (a segment terminus that is not a shared
@@ -597,6 +598,13 @@ def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
 
     ``pad_entries_only`` runs only the shallow pad-entry connector (route.py's
     late pass over copper laid after the cleanup).
+
+    ``via_centres_all_nets`` runs the off-centre via-end bridge (#1235) on
+    every net in scope, not only the length-graded ones, and alongside
+    ``pad_entries_only``: route.py's end-of-run pass, after which nothing is
+    routed, so the bridge can no longer change what a later step routes
+    around. A track that ends inside its via off the centre is a reviewer's
+    finding on any net (check_weird's off-centre-via-end).
     """
     import math
     from collections import defaultdict
@@ -988,6 +996,8 @@ def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
     routed_ids = {id(x) for r in results if not r.get('cleanup')
                   for x in (r.get('new_segments') or ())}
     graded = length_graded_net_ids(pcb_data, config)
+    if via_centres_all_nets:
+        graded = {s.net_id for s in pcb_data.segments if s.net_id}
     oc_segs = [s for s in pcb_data.segments
                if s.net_id in graded
                and (scope_net_ids is None or s.net_id in scope_net_ids)
@@ -997,8 +1007,9 @@ def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
                and (scope_net_ids is None or v.net_id in scope_net_ids)
                and not _sense_copper(v)]
     done_ends = set()
-    for s, end, v, d in ([] if pad_entries_only else
-                         off_centre_via_ends(oc_segs, oc_vias, _copper or None)):
+    for s, end, v, d in ([] if (pad_entries_only and not via_centres_all_nets) else
+                         off_centre_via_ends(oc_segs, oc_vias, _copper or None,
+                                             carried_through=via_centres_all_nets)):
         ex, ey = (s.start_x, s.start_y) if end == 0 else (s.end_x, s.end_y)
         ox, oy = (s.end_x, s.end_y) if end == 0 else (s.start_x, s.start_y)
         key = (s.net_id, s.layer, rk(ex, ey))
@@ -1020,6 +1031,26 @@ def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
                 bx, by = ox + ux * te, oy + uy * te
         if (math.hypot(bx - v.x, by - v.y) + w / 2.0 > r + 1e-6
                 and not clears(s.net_id, bx, by, v.x, v.y, s.layer, w)):
+            continue
+        # The end already lies on a same-net track that runs on to the
+        # centre: that track is its bridge, and a second one would only
+        # stack copper over it (a redundant loop the collapse cannot take).
+        # A bridge that would cross a same-net pad's copper off the pad's
+        # axes (a via beside the pad, the track ending in the pad) trades the
+        # off-centre end for an in-pad diagonal: leave it.
+        if via_centres_all_nets:
+            from pad_entry import in_pad_off_axis as _ipoa
+            if any(_ipoa(p, s.layer, bx, by, v.x, v.y) is not None
+                   for p in pcb_data.pads_by_net.get(s.net_id, ())):
+                done_ends.add(key)
+                continue
+        if via_centres_all_nets and any(o is not s and o.net_id == s.net_id and o.layer == s.layer
+               and (math.hypot(o.start_x - v.x, o.start_y - v.y) < 1e-4
+                    or math.hypot(o.end_x - v.x, o.end_y - v.y) < 1e-4)
+               and _pt_seg_dist(ex, ey, o.start_x, o.start_y, o.end_x, o.end_y)
+               <= o.width / 2.0
+               for o in oc_segs):
+            done_ends.add(key)
             continue
         done_ends.add(key)
         if (bx, by) != (ex, ey):
@@ -3382,6 +3413,7 @@ def collapse_strict_redundant(results, pcb_data: PCBData, scope_net_ids=None,
                               keep_input_copper: bool = False,
                               protect_segment_ids=None,
                               stats: Optional[dict] = None,
+                              centre_stubs_all_nets: bool = False,
                               ) -> Tuple[int, List[Segment]]:
     """Remove copper that is redundant under the STRICT removability model
     (StrictRemovalModel; #217 classes 1-2, #1063): superseded parallel chains
@@ -3438,7 +3470,9 @@ def collapse_strict_redundant(results, pcb_data: PCBData, scope_net_ids=None,
     # lowered as the writeback will lower it (connection_width_floor, #1187).
     from fix_kicad_drc_settings import connection_width_floor
     web_floor = connection_width_floor(pcb_data, shipped=True)
-    # #1798: the nets whose via-centre stubs a length grade reads.
+    # #1798: the nets whose via-centre stubs a length grade reads. (route.py's
+    # end-of-run pass bridges the other nets' via ends to the centre after
+    # the last collapse; this in-run pass keeps the routing it steers as is.)
     from cleanup_pipeline import _centre_stub_net_ids
     stub_ids = _centre_stub_net_ids(pcb_data)
 
@@ -3467,7 +3501,8 @@ def collapse_strict_redundant(results, pcb_data: PCBData, scope_net_ids=None,
                                    copper_layers, readonly_ids=readonly,
                                    droppable_via_ids=droppable,
                                    web_floor=web_floor,
-                                   keep_centre_stubs=net_id in stub_ids)
+                                   keep_centre_stubs=(centre_stubs_all_nets
+                                                      or net_id in stub_ids))
         if not model.valid:
             continue
         _dbg = None
@@ -5712,6 +5747,65 @@ def pad_field_is_corridor(footprint, track_width: float, clearance: float,
     return (pitch - pad) < channels * chan
 
 
+def _creates_acute(pts, layer, same_net_segs, skip_ids=(), min_angle: float = 90.0) -> bool:
+    """Would the new run ``pts`` meet a same-net track on ``layer`` at either
+    of its ends at an interior angle under ``min_angle`` -- the copper the
+    run replaces (``skip_ids``) aside? A track ending at the point or running
+    through it (a T) both count."""
+    from corner_angle import interior_angle, ANGLE_TOL_DEG
+    limit = min_angle - ANGLE_TOL_DEG
+    for (ex, ey), (nx, ny) in ((pts[0], pts[1]), (pts[-1], pts[-2])):
+        ux, uy = nx - ex, ny - ey
+        if math.hypot(ux, uy) < 1e-9:
+            continue
+        for o in same_net_segs:
+            if id(o) in skip_ids or o.layer != layer:
+                continue
+            dirs = []
+            if math.hypot(o.start_x - ex, o.start_y - ey) < 1e-3:
+                dirs.append((o.end_x - ex, o.end_y - ey))
+            elif math.hypot(o.end_x - ex, o.end_y - ey) < 1e-3:
+                dirs.append((o.start_x - ex, o.start_y - ey))
+            elif _pt_seg_dist(ex, ey, o.start_x, o.start_y, o.end_x, o.end_y) < 1e-3:
+                dirs += [(o.end_x - ex, o.end_y - ey), (o.start_x - ex, o.start_y - ey)]
+            for dx, dy in dirs:
+                if math.hypot(dx, dy) < 1e-9:
+                    continue
+                if interior_angle(ux, uy, dx, dy) < limit:
+                    return True
+    return False
+
+
+def _max_offset_from_line(A, B, pts) -> float:
+    """Largest distance (mm) of ``pts`` from the straight line A-B (their
+    perpendicular distance, or the distance to the nearer end past it)."""
+    ax, ay = A
+    bx, by = B
+    dx, dy = bx - ax, by - ay
+    L2 = dx * dx + dy * dy
+    worst = 0.0
+    for px, py in pts:
+        if L2 < 1e-18:
+            d = math.hypot(px - ax, py - ay)
+        else:
+            t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / L2))
+            d = math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+        worst = max(worst, d)
+    return worst
+
+
+#: A staircase or jog whose vertices all lie within this many track widths of
+#: the straight line between its two ends is replaced by that line, at any
+#: angle (smooth_octolinear_chains ``micro_any_angle``, rebuild_pad_exits'
+#: join). A grid search can only offset a run sideways by 45-degree jogs, so
+#: an offset smaller than its own width -- a pad a fraction of a grid step off
+#: the grid, a fine-grid rescue route -- comes out as two bends closer than a
+#: millimetre (a zigzag) or a staircase of legs shorter than the track is
+#: wide. The straight line moves the copper by at most one width and leaves
+#: one leg; a 45-degree style cannot express the offset without the jog.
+MICRO_ANY_ANGLE_WIDTHS = 1.0
+
+
 def _octolinear_bends(A, B):
     """Candidate octolinear (45-degree) polylines from A to B: the direct segment
     (when A->B is already octolinear) and the two single-bend L-elbows (diagonal-
@@ -6198,6 +6292,35 @@ def _copper_clearance_gates(pcb_data, clearance, net_clearances,
     import os as _665os
     _665trace = bool(_665os.environ.get('KICAD_665_TRACE'))
 
+    # The plated drills of OTHER nets -- via barrels and through-hole pads --
+    # at the board's copper-to-hole rule (KiCad's hole_clearance): only when
+    # the caller asks (``config.drill_hole_clearance``, route.py's end-of-run
+    # pass at the declared rules); the in-run passes keep the gate they had.
+    _drill_clr = float(getattr(config, 'drill_hole_clearance', 0.0) or 0.0) \
+        if config is not None else 0.0
+    _drills = []
+    if _drill_clr:
+        for _v in pcb_data.vias:
+            if getattr(_v, 'drill', 0):
+                _drills.append((_v.x, _v.y, _v.drill / 2.0, _v.net_id))
+        for _fp in (getattr(pcb_data, 'footprints', None) or {}).values():
+            for _p in _fp.pads:
+                if getattr(_p, 'drill', 0) and getattr(_p, 'pad_type', '') != 'np_thru_hole':
+                    _drills.append((_p.global_x, _p.global_y, _p.drill / 2.0,
+                                    _p.net_id if _p.net_id else -1))
+
+    def _drills_clear(x1, y1, x2, y2, net_id, w):
+        need = _drill_clr + w / 2.0 - 1e-4
+        for hx, hy, hr, hn in _drills:
+            if hn == net_id:
+                continue
+            if (max(x1, x2) < hx - hr - need - 0.1 or min(x1, x2) > hx + hr + need + 0.1
+                    or max(y1, y2) < hy - hr - need - 0.1 or min(y1, y2) > hy + hr + need + 0.1):
+                continue
+            if _pt_seg_dist(hx, hy, x1, y1, x2, y2) - hr < need:
+                return False
+        return True
+
     def clears(x1, y1, x2, y2, layer, net_id, w):
         eff = pair_base(net_id, layer)
         # `config`: the class/type-scoped .kicad_dru rules (#1491, #1561, #1630) the router held
@@ -6220,6 +6343,8 @@ def _copper_clearance_gates(pcb_data, clearance, net_clearances,
                                               track_clearances=_trk_clr, config=config, need=need) < need:  # dru track rules
             return False
         ok = edge_clears(x1, y1, x2, y2, w) and keepout_clears(x1, y1, x2, y2, layer, w, net_id)
+        if ok and _drill_clr:
+            ok = _drills_clear(x1, y1, x2, y2, net_id, w)
         if _665trace and ok:
             # #665 forensics: re-check the pad distance with a FRESH pad
             # array (cache detached); a disagreement = a stale/poisoned
@@ -6241,16 +6366,34 @@ def _copper_clearance_gates(pcb_data, clearance, net_clearances,
     return SimpleNamespace(npth_clr=npth_clr, eff_clr=eff_clr, pair_base=pair_base, _trk_clr=_trk_clr, edge_rings=edge_rings, edge_outer=edge_outer, edge_cutouts=edge_cutouts, board_bounds=board_bounds, _edge_clr=_edge_clr, _slot_caps=_slot_caps, edge_clears=edge_clears, _keepout_areas=_keepout_areas, _ko_on_layer=_ko_on_layer, keepout_clears=keepout_clears, _665trace=_665trace, clears=clears)
 
 
-def smd_exit_violations(segs, vias, pads, net_id=None):
+def smd_exit_violations(segs, vias, pads, net_id=None, in_pad: bool = False,
+                        clean: bool = False, to_corner=None,
+                        through: bool = False):
     """Every free track end entering an SMD pad whose exit fails Altium's SMD
     Entry / SMD To Corner (pad_entry.grade_pad_exit), as ``[(seg, (ex, ey),
     pad, chain_pts, chain_segs, reason, rules)]``. ``segs`` / ``vias`` /
     ``pads`` are one net's. The detector check_weird reports by and
-    rebuild_pad_exits repairs by."""
+    rebuild_pad_exits repairs by. ``clean`` also lists the exits that pass
+    (``rules`` empty), for the end-of-run pass that re-lays a clean exit
+    when another edge reaches the route with fewer bends. ``to_corner``:
+    the SMD To Corner distance (None = routing_defaults.SMD_TO_CORNER_MM).
+
+    ``through`` grades the pad's other connections as exits too, each run
+    from the point inside the pad outward:
+
+    - a junction inside the pad (two or more tracks meeting there, or a
+      track ending on another's body): every track leaving it;
+    - a track passing through the pad (no end inside it): split at its
+      deepest point in the pad -- a vertex of the run, or a point inside a
+      segment (then ``chain_pts[0]`` is not an end of ``seg``) -- both
+      halves;
+    - a track whose copper only touches the pad's side, its centreline
+      outside the outline: ``reason`` 'graze', rule 'smd-entry'."""
     from collections import defaultdict
     from pad_entry import (smd_gradable, pad_depth, terminal_chain,
                            grade_pad_exit, on_via, on_other_track,
-                           shallow_pad_entry)
+                           shallow_pad_entry, exit_crossing,
+                           segment_pad_depth)
 
     def key(x, y):
         return (round(x, 4), round(y, 4))
@@ -6268,26 +6411,153 @@ def smd_exit_violations(segs, vias, pads, net_id=None):
         for s in lsegs:
             adj[key(s.start_x, s.start_y)].append(s)
             adj[key(s.end_x, s.end_y)].append(s)
+        # per pad: the segments of the runs graded from an end in it (a
+        # pass-through is what is left)
+        graded = defaultdict(set)
+
+        def grade(s, ex, ey, pad, pts, csegs, reason):
+            rules = set(grade_pad_exit(pad, pts, s.width, in_pad=in_pad,
+                                       to_corner=to_corner))
+            nx, ny = pts[1]
+            if shallow_pad_entry(lpads, layer, ex, ey, nx, ny, s.width):
+                rules.add('shallow')
+            cross = exit_crossing(pad, pts)
+            # the run up to its exit, and on while its copper still touches
+            # the pad (the leg leaving it): this end's own exit
+            n = len(csegs) if cross is None else cross[0] + 1
+            while n < len(csegs) and segment_pad_depth(
+                    pad, csegs[n].start_x, csegs[n].start_y, csegs[n].end_x,
+                    csegs[n].end_y) > -csegs[n].width / 2.0 + 1e-6:
+                n += 1
+            graded[id(pad)].update(id(c) for c in csegs[:n])
+            if rules or (clean and pad_depth(pad, ex, ey) > 0
+                         and cross is not None):
+                out.append((s, (ex, ey), pad, pts, csegs, reason, rules))
+
         for s in lsegs:
             if _sense_copper(s):
                 continue
             for ex, ey in ((s.start_x, s.start_y), (s.end_x, s.end_y)):
-                if len(adj[key(ex, ey)]) != 1 or on_via(vias, ex, ey):
+                if on_via(vias, ex, ey):
                     continue
-                if on_other_track(lsegs, s, ex, ey):
-                    continue
-                touch = [p for p in lpads
-                         if pad_depth(p, ex, ey) > -s.width / 2.0 + 1e-6]
+                deg = len(adj[key(ex, ey)])
+                if deg == 2:
+                    continue          # a vertex of a run: pass-through below
+                if deg > 1 or on_other_track(lsegs, s, ex, ey):
+                    # a junction: graded only inside the pad
+                    if not through:
+                        continue
+                    touch = [p for p in lpads if pad_depth(p, ex, ey) > 0]
+                else:
+                    touch = [p for p in lpads
+                             if pad_depth(p, ex, ey) > -s.width / 2.0 + 1e-6]
                 if not touch:
                     continue
                 pad = max(touch, key=lambda p: pad_depth(p, ex, ey))
                 pts, csegs, reason = terminal_chain(s, ex, ey, adj, key, vias)
-                rules = set(grade_pad_exit(pad, pts, s.width))
-                nx, ny = pts[1]
-                if shallow_pad_entry(lpads, layer, ex, ey, nx, ny, s.width):
-                    rules.add('shallow')
-                if rules:
-                    out.append((s, (ex, ey), pad, pts, csegs, reason, rules))
+                grade(s, ex, ey, pad, pts, csegs, reason)
+        if not through:
+            continue
+        for pad in lpads:
+            reach = math.hypot(pad.size_x, pad.size_y) / 2.0
+            px, py = pad.global_x, pad.global_y
+            cand = [s for s in lsegs if id(s) not in graded[id(pad)]
+                    and max(s.start_x, s.end_x) >= px - reach - s.width
+                    and min(s.start_x, s.end_x) <= px + reach + s.width
+                    and max(s.start_y, s.end_y) >= py - reach - s.width
+                    and min(s.start_y, s.end_y) <= py + reach + s.width
+                    and not _sense_copper(s)
+                    and segment_pad_depth(pad, s.start_x, s.start_y,
+                                          s.end_x, s.end_y)
+                    > -s.width / 2.0 + 1e-6]
+            seen = set()
+            for s0 in cand:
+                if id(s0) in seen:
+                    continue
+                # the run of candidates joined at plain vertices
+                run, stack = [], [s0]
+                seen.add(id(s0))
+                while stack:
+                    s = stack.pop()
+                    run.append(s)
+                    for vx, vy in ((s.start_x, s.start_y), (s.end_x, s.end_y)):
+                        nb = adj[key(vx, vy)]
+                        if len(nb) != 2 or on_via(vias, vx, vy):
+                            continue
+                        for o in nb:
+                            if (o is not s and id(o) not in seen
+                                    and any(o is c for c in cand)):
+                                seen.add(id(o))
+                                stack.append(o)
+                # its deepest point in the pad
+                best = None
+                for s in run:
+                    for vx, vy in ((s.start_x, s.start_y), (s.end_x, s.end_y)):
+                        if len(adj[key(vx, vy)]) == 2 and not on_via(vias, vx, vy):
+                            d = pad_depth(pad, vx, vy)
+                            if best is None or d > best[0] + 1e-9:
+                                best = (d, (vx, vy), None)
+                    lo, hi = 0.0, 1.0
+                    ax, ay, bx, by = s.start_x, s.start_y, s.end_x, s.end_y
+                    for _ in range(60):
+                        m1, m2 = lo + (hi - lo) / 3.0, hi - (hi - lo) / 3.0
+                        if (pad_depth(pad, ax + (bx - ax) * m1, ay + (by - ay) * m1)
+                                < pad_depth(pad, ax + (bx - ax) * m2,
+                                            ay + (by - ay) * m2)):
+                            lo = m1
+                        else:
+                            hi = m2
+                    t = (lo + hi) / 2.0
+                    # where the depth is flat (the land's middle), the point
+                    # nearest the pad centre
+                    L2 = (bx - ax) ** 2 + (by - ay) ** 2
+                    if L2 > 1e-12:
+                        tc = min(1.0, max(0.0, ((pad.global_x - ax) * (bx - ax)
+                                                + (pad.global_y - ay) * (by - ay)) / L2))
+                        if pad_depth(pad, ax + (bx - ax) * tc, ay + (by - ay) * tc) \
+                                >= pad_depth(pad, ax + (bx - ax) * t,
+                                             ay + (by - ay) * t) - 1e-6:
+                            t = tc
+                    P = (round(ax + (bx - ax) * t, 4), round(ay + (by - ay) * t, 4))
+                    d = pad_depth(pad, *P)
+                    if (best is None or d > best[0] + 1e-6) and \
+                            key(*P) not in (key(ax, ay), key(bx, by)):
+                        best = (d, P, s)
+                if best is None:
+                    continue
+                d, P, s_in = best
+                if s_in is None:
+                    # a vertex of the run: both tracks leaving it
+                    for s in adj[key(*P)]:
+                        pts, csegs, reason = terminal_chain(s, P[0], P[1],
+                                                            adj, key, vias)
+                        if d > 0:
+                            grade(s, P[0], P[1], pad, pts, csegs, reason)
+                        else:
+                            out.append((s, P, pad, pts, csegs, 'graze',
+                                        {'smd-entry'}))
+                            break
+                    continue
+                for E in ((s_in.start_x, s_in.start_y), (s_in.end_x, s_in.end_y)):
+                    pts, csegs, reason = [P, E], [s_in], 'end'
+                    nb = [o for o in adj[key(*E)] if o is not s_in]
+                    if on_via(vias, *E):
+                        reason = 'via'
+                    elif len(nb) > 1:
+                        reason = 'junction'
+                    elif nb:
+                        if abs(nb[0].width - s_in.width) > 1e-6:
+                            reason = 'width'
+                        else:
+                            p2, c2, reason = terminal_chain(nb[0], E[0], E[1],
+                                                            adj, key, vias)
+                            pts, csegs = pts + p2[1:], csegs + c2
+                    if d > 0:
+                        grade(s_in, P[0], P[1], pad, pts, csegs, reason)
+                    else:
+                        out.append((s_in, P, pad, pts, csegs, 'graze',
+                                    {'smd-entry'}))
+                        break
     return out
 
 
@@ -6326,8 +6596,50 @@ def _kicad_dangling_count(segs, vias, pads, copper_layers):
                is not None)
 
 
+#: End-of-run pad exits (rebuild_pad_exits, final): the straight exit may
+#: run up to this far (mm) past exit_distance to meet a vertex's line square.
+EXIT_ALIGN_REACH_MM = 1.0
+#: A clean exit is replaced by another of as many bends and off-axis legs
+#: only when that one leaves this much (mm) less copper outside the pad.
+EXIT_REPLACE_MIN_GAIN_MM = 0.1
+
+
+def _exit_run_key(run, in_pad):
+    """(bends, legs off the octolinear axes, copper outside the pad in mm)
+    of a pad exit ``run`` (points from inside the pad outward) whose first
+    ``in_pad`` mm lie inside the pad."""
+    from pad_entry import _collinear
+    bends = sum(1 for k in range(1, len(run) - 1)
+                if not _collinear(run[k][0] - run[k - 1][0],
+                                  run[k][1] - run[k - 1][1],
+                                  run[k + 1][0] - run[k][0],
+                                  run[k + 1][1] - run[k][1]))
+    off = 0
+    length = 0.0
+    for k in range(len(run) - 1):
+        dx, dy = run[k + 1][0] - run[k][0], run[k + 1][1] - run[k][1]
+        L = math.hypot(dx, dy)
+        length += L
+        if L > 1e-6 and min(abs(dx), abs(dy), abs(abs(dx) - abs(dy))) > 1e-3:
+            off += 1
+    return (bends, off, round(length - in_pad, 3))
+
+
+def _in_pad_run(pad, pts):
+    """How far (mm) the run ``pts`` (from its end inside ``pad`` outward)
+    travels before it leaves the pad."""
+    from pad_entry import exit_crossing
+    cross = exit_crossing(pad, pts)
+    if cross is None:
+        return 0.0
+    k, (kx, ky) = cross
+    return sum(math.hypot(pts[q + 1][0] - pts[q][0], pts[q + 1][1] - pts[q][1])
+               for q in range(k)) + math.hypot(kx - pts[k][0], ky - pts[k][1])
+
+
 def rebuild_pad_exits(results, pcb_data: PCBData, scope_net_ids, config,
-                      editable=None, skip_net_ids=None, stats=None):
+                      editable=None, skip_net_ids=None, stats=None,
+                      final: bool = False):
     """Rebuild every SMD pad exit that fails Altium's SMD Entry / SMD To Corner
     (smd_exit_violations) the way Altium's router lays one: from the pad
     centre straight out through an allowed edge (pad_entry.allowed_exits) to
@@ -6344,7 +6656,16 @@ def rebuild_pad_exits(results, pcb_data: PCBData, scope_net_ids, config,
     ``editable(seg)`` copper is replaced (default: all); locked, graphic and
     sense copper never is. Write-list / strip contract as the other rewriting
     passes. Returns (rebuilt, input_segments_to_strip, added_segments);
-    ``stats``, if given, counts the exits left as they are, by reason."""
+    ``stats``, if given, counts the exits left as they are, by reason.
+
+    ``final`` (route.py's end-of-run pass, after which nothing is routed):
+    an exit whose copper crosses its pad off the pad's axes is rebuilt too
+    (grade_pad_exit's in_pad), and the join onto the route takes the
+    farthest vertex it reaches with the fewest new bends, at any angle when
+    the run it replaces lies within MICRO_ANY_ANGLE_WIDTHS of the line --
+    so the join absorbs the jogs ahead of it instead of adding an elbow in
+    front of them. In-run the join keeps its first-vertex octolinear rule:
+    copper laid there steers what is routed after it."""
     import math
     from collections import defaultdict
     from check_connected import check_net_connectivity
@@ -6352,6 +6673,9 @@ def rebuild_pad_exits(results, pcb_data: PCBData, scope_net_ids, config,
                            pad_depth, segment_pad_depth, grade_pad_exit,
                            shallow_pad_entry, exit_crossing)
     skip = set(skip_net_ids or ())
+    # SMD To Corner distance of this run (route.py --smd-to-corner, the
+    # GUI's SMD To Corner); None = routing_defaults.SMD_TO_CORNER_MM
+    to_corner = getattr(config, 'smd_to_corner', None)
     # A caller may hand a shallow copy of a board (route.py's late pass):
     # never trust foreign-copper arrays cached against another copper list.
     for _attr in ('_foreign_seg_arr_cache', '_foreign_via_arr_cache',
@@ -6388,16 +6712,27 @@ def rebuild_pad_exits(results, pcb_data: PCBData, scope_net_ids, config,
     copper = list(getattr(getattr(pcb_data, 'board_info', None),
                           'copper_layers', None) or ['F.Cu', 'B.Cu'])
 
+    _join_ctx = {}
+
     def join(net_id, pad, pts, w, layer, next_dir_of, head, X, ux, uy):
         """The run ``head`` + [X], joined octolinearly to the first vertex
-        of ``pts`` past the pad that keeps both bends at 90 degrees or wider
-        and grades clean: (path, j) or None."""
-        for j in range(1, len(pts)):
+        of ``pts`` past the pad that keeps both bends at 90 degrees
+        or wider and grades clean: (path, j) or None."""
+        # The vertex a join can reach with the fewest new bends wins: the
+        # farthest one first, so a join absorbs the jogs of the run it
+        # replaces instead of adding its own elbow in front of them. A
+        # direct leg is taken at any angle when the run it replaces lies
+        # within MICRO_ANY_ANGLE_WIDTHS of it (an offset a 45-degree jog
+        # cannot carry without a zigzag), else only when octolinear.
+        for j in (range(len(pts) - 1, 0, -1) if final else range(1, len(pts))):
             Q = pts[j]
             if pad_depth(pad, *Q) > -(w / 2.0 + 1e-3):
                 continue
-            # the join stays octolinear (the direct leg only when it is)
-            for mids in _octolinear_bends(X, Q):
+            _cands = _octolinear_bends(X, Q)
+            if final and [] not in _cands and _max_offset_from_line(
+                    X, Q, pts[1:j]) <= MICRO_ANY_ANGLE_WIDTHS * w + 1e-9:
+                _cands = [[]] + _cands
+            for mids in _cands:
                 path = list(head) + [X] + list(mids) + [Q]
                 path = [p for k, p in enumerate(path)
                         if k == 0 or math.hypot(p[0] - path[k - 1][0],
@@ -6414,7 +6749,16 @@ def rebuild_pad_exits(results, pcb_data: PCBData, scope_net_ids, config,
                 if any(segment_pad_depth(pad, *path[k], *path[k + 1])
                        > -(w / 2.0) + 1e-3 for k in range(ix, len(path) - 1)):
                     continue              # back over the pad past X
-                if grade_pad_exit(pad, path + list(pts[j + 1:]), w):
+                if grade_pad_exit(pad, path + list(pts[j + 1:]), w, in_pad=final,
+                                  to_corner=to_corner):
+                    continue
+                # the join's far end lands on copper the run keeps: no
+                # corner under 90 degrees there with another branch of the
+                # net (the terminal run's own legs aside: the bend onto the
+                # leg it keeps is graded above)
+                if final and len(path) - ix >= 2 and _creates_acute(path[ix:], layer,
+                                            _join_ctx.get('segs', ()),
+                                            skip_ids=_join_ctx.get('skip', ())):
                     continue
                 if not all(gates.clears(*path[k], *path[k + 1], layer, net_id, w)
                            for k in range(ix - 1, len(path) - 1)):
@@ -6424,7 +6768,7 @@ def rebuild_pad_exits(results, pcb_data: PCBData, scope_net_ids, config,
 
     def plan(net_id, pad, pts, w, layer, next_dir_of, rules):
         cx, cy = pad.global_x, pad.global_y
-        d = exit_distance(w)
+        d = exit_distance(w, to_corner)
         far = pts[-1]
         tx, ty = far[0] - cx, far[1] - cy
         exits = []
@@ -6433,14 +6777,56 @@ def rebuild_pad_exits(results, pcb_data: PCBData, scope_net_ids, config,
             h = abs(lx) * pad.size_x / 2.0 + abs(ly) * pad.size_y / 2.0
             exits.append((-(ux * tx + uy * ty), ux, uy, h))
         exits.sort()
-        for _, ux, uy, h in exits:
-            X = (round(cx + ux * (h + d), 4), round(cy + uy * (h + d), 4))
-            if not gates.clears(cx, cy, X[0], X[1], layer, net_id, w):
+        # ``final``: every allowed edge is tried and the exit whose run has
+        # the fewest bends wins, then the fewest legs off the octolinear
+        # axes, then the least copper outside the pad (_exit_run_key): an
+        # edge facing the run's far end is not the shortest way when the run
+        # turns (a pad's end beside a channel beats its side facing a via
+        # further down the channel). The facing order above only breaks
+        # ties. The straight exit may also run on past exit_distance to a
+        # vertex's line, so the join leaves it square instead of slanted.
+        # In-run the first clear edge in facing order is kept, so the copper
+        # later nets route around is unchanged.
+        best = None
+        for rank, (_, ux, uy, h) in enumerate(exits):
+            X0 = (round(cx + ux * (h + d), 4), round(cy + uy * (h + d), 4))
+            if not gates.clears(cx, cy, X0[0], X0[1], layer, net_id, w):
                 continue
-            got = join(net_id, pad, pts, w, layer, next_dir_of, [(cx, cy)],
-                       X, ux, uy)
-            if got:
-                return got
+            Xs = [X0]
+            if final:
+                for Q in pts[1:]:
+                    # the point of the exit ray square with Q
+                    t = (Q[0] - cx) * ux + (Q[1] - cy) * uy
+                    if h + d + 1e-3 < t <= h + d + EXIT_ALIGN_REACH_MM:
+                        Xa = (round(cx + ux * t, 4), round(cy + uy * t, 4))
+                        if Xa not in Xs:
+                            Xs.append(Xa)
+            for X in Xs:
+                if X is not X0 and not gates.clears(cx, cy, X[0], X[1],
+                                                    layer, net_id, w):
+                    continue
+                got = join(net_id, pad, pts, w, layer, next_dir_of, [(cx, cy)],
+                           X, ux, uy)
+                if not got:
+                    continue
+                if not final:
+                    return got
+                run = list(got[0]) + list(pts[got[1] + 1:])
+                key = _exit_run_key(run, h) + (rank,)
+                if best is None or key < best[0]:
+                    best = (key, got)
+        if best is not None:
+            if not rules:
+                # a clean exit: replaced only by a strictly better one
+                cur = _exit_run_key(pts, _in_pad_run(pad, pts))
+                k = best[0]
+                if not (k[:2] < cur[:2]
+                        or (k[:2] == cur[:2]
+                            and k[2] < cur[2] - EXIT_REPLACE_MIN_GAIN_MM)):
+                    return None
+            return best[1]
+        if not rules:
+            return None
         # SMD To Corner alone: the run already leaves straight through an
         # edge (a fine pin's exit the grid set off its axis, clear of the
         # neighbours a centred one would graze). Keep its own exit line and
@@ -6456,19 +6842,44 @@ def rebuild_pad_exits(results, pcb_data: PCBData, scope_net_ids, config,
                         list(pts[:k + 1]), X, ux, uy)
         return None
 
-    for net_id in nets:
+    # A net is graded again once when an exit split a track passing through
+    # its pad: the half left behind now ends inside the pad.
+    queue, requeued = list(nets), set()
+    while queue:
+        net_id = queue.pop(0)
         segs = [s for s in pcb_data.segments if s.net_id == net_id]
         vias = vias_by_net.get(net_id, [])
         pads = pcb_data.pads_by_net.get(net_id, [])
-        found = smd_exit_violations(segs, vias, pads, net_id)
+        # final: junctions inside a pad and tracks passing through one are
+        # exits too (smd_exit_violations' through)
+        found = smd_exit_violations(segs, vias, pads, net_id, in_pad=final,
+                                    clean=final, to_corner=to_corner,
+                                    through=final)
+        consumed = set()
+        # final: runs from one pad to one terminal (a via, a junction) are
+        # parallel copper -- a loop (a via->pad stub laid beside the routed
+        # dogbone). The run rebuilt first replaces the others: they are
+        # skipped by its corner check and removed with its copper.
+        _rk4 = (lambda x, y: (round(x, 4), round(y, 4)))
+        same_end = defaultdict(list)
+        if final:
+            for it in found:
+                if it[5] in ('via', 'junction'):
+                    same_end[(id(it[2]), _rk4(*it[3][-1]))].append(it)
         for item in found:
             s, (ex, ey), pad, pts, csegs, reason, rules = item
-            if any(id(c) in removed_ids for c in csegs):
+            if any(id(c) in removed_ids or id(c) in consumed for c in csegs):
+                continue
+            if reason == 'graze':
+                # copper on the pad's side only: no end in the pad to lay an
+                # exit from
+                if stats is not None:
+                    stats['grazes_pad'] = stats.get('grazes_pad', 0) + 1
                 continue
             if any(getattr(c, 'graphic', False) or is_immutable_copper(c)
                    or _sense_copper(c) or (editable and not editable(c))
                    for c in csegs):
-                if stats is not None:
+                if stats is not None and rules:
                     stats['read_only'] = stats.get('read_only', 0) + 1
                 continue
             w, layer = s.width, s.layer
@@ -6477,19 +6888,45 @@ def rebuild_pad_exits(results, pcb_data: PCBData, scope_net_ids, config,
                 if j + 1 < len(pts):
                     return (pts[j + 1][0] - pts[j][0], pts[j + 1][1] - pts[j][1])
                 return None
+            own = {id(c) for c in csegs}
+            sibs = [c for it in same_end.get((id(pad), _rk4(*pts[-1])), ())
+                    if it is not item for c in it[4]
+                    if id(c) not in own]
+            if any(id(c) in removed_ids or id(c) in consumed
+                   or getattr(c, 'graphic', False) or is_immutable_copper(c)
+                   or _sense_copper(c) or (editable and not editable(c))
+                   for c in sibs):
+                sibs = []
+            sib_ids = {id(c) for c in sibs}
+            _join_ctx['segs'] = segs
+            _join_ctx['skip'] = own | sib_ids
             got = plan(net_id, pad, pts, w, layer, next_dir_of, rules)
             if got is None:
+                if not rules:
+                    continue          # a clean exit with nothing better
                 if stats is not None:
                     stats['no_clear_exit'] = stats.get('no_clear_exit', 0) + 1
                 continue
             path, j = got
-            gone = csegs[:j]
+            gone = csegs[:j] + sibs
             gone_ids = {id(c) for c in gone}
+            # the parallel runs' far end: still reached by this run's copper
+            term = pts[-1] if sibs else None
             # nothing else may hang on the copper being replaced
             new = [Segment(start_x=path[k][0], start_y=path[k][1],
                            end_x=path[k + 1][0], end_y=path[k + 1][1],
                            width=w, layer=layer, net_id=net_id)
                    for k in range(len(path) - 1)]
+            # a track passing through the pad, split inside it: the other
+            # half keeps its copper from the split point on
+            P0, rk = pts[0], (lambda x, y: (round(x, 4), round(y, 4)))
+            split = rk(*P0) not in (rk(s.start_x, s.start_y), rk(s.end_x, s.end_y))
+            if split:
+                far = ((s.end_x, s.end_y) if rk(s.start_x, s.start_y) == rk(*pts[1])
+                       else (s.start_x, s.start_y))
+                new.append(Segment(start_x=P0[0], start_y=P0[1],
+                                   end_x=far[0], end_y=far[1],
+                                   width=w, layer=layer, net_id=net_id))
 
             def covered(x, y, r):
                 """(x, y)'s copper (radius r) still meets the new exit."""
@@ -6509,6 +6946,8 @@ def rebuild_pad_exits(results, pcb_data: PCBData, scope_net_ids, config,
                         continue
                     if pad_depth(pad, x, y) > 0:
                         continue
+                    if term is not None and math.hypot(x - term[0], y - term[1]) <= 1e-3:
+                        continue
                     # a true T on the replaced copper stays a true T on the
                     # new exit (overlap alone is a KiCad-dangling joint); an
                     # end that only overlapped it may overlap the new one
@@ -6521,6 +6960,8 @@ def rebuild_pad_exits(results, pcb_data: PCBData, scope_net_ids, config,
                     touched = True
             for v in vias:
                 vr = (getattr(v, 'size', 0) or 0) / 2.0
+                if term is not None and math.hypot(v.x - term[0], v.y - term[1]) <= vr + 0.01:
+                    continue
                 if any(_pt_seg_dist(v.x, v.y, c.start_x, c.start_y, c.end_x, c.end_y)
                        <= c.width / 2.0 + vr for c in gone) and not covered(v.x, v.y, vr):
                     touched = True
@@ -6577,7 +7018,11 @@ def rebuild_pad_exits(results, pcb_data: PCBData, scope_net_ids, config,
             pcb_data.segments = [x for x in pcb_data.segments
                                  if id(x) not in gone_ids] + new
             segs = trial
+            consumed |= gone_ids
             rebuilt += 1
+            if split and net_id not in requeued:
+                requeued.add(net_id)
+                queue.append(net_id)
             if hasattr(pcb_data, '_foreign_seg_arr_cache'):
                 pcb_data._foreign_seg_arr_cache = None
     if removed_ids:
@@ -6888,7 +7333,10 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
                              dry_run: bool = False,
                              min_gain: float = 0.01,
                              max_net_segs: int = 400,
-                             max_chain_segs: int = 100):
+                             max_chain_segs: int = 100,
+                             micro_any_angle: float = 0.0,
+                             protect_dense_fields: bool = True,
+                             no_new_contacts: bool = False):
     """Collapse grid-A* staircase micro-jogs into octolinear shortcuts (#536).
 
     Walks each net's simple track chains (split at junctions, same-net vias,
@@ -6918,6 +7366,20 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
         measures the shipped board (#2006). The router bent the staircase
         away from the other side's copper; a shortcut through the band
         would hand that space back.
+
+    One exception to the octolinear output (``micro_any_angle``, in track
+    widths, 0 = off; route.py's end-of-run pass passes
+    MICRO_ANY_ANGLE_WIDTHS): a span whose vertices all lie within that many
+    widths of the straight line between its ends takes that line at any
+    angle -- the offset is too small for a 45-degree jog to carry without a
+    zigzag. A span that starts or ends on a pad turns the leg leaving it by
+    no more than SMD Entry's angle tolerance. ``protect_dense_fields=False``
+    lifts the fine-pitch field rule below: it guards escape corridors for
+    pads routed LATER, and the end-of-run pass has none.
+    ``no_new_contacts`` (the end-of-run pass) refuses a connector whose
+    copper would touch same-net copper the span does not end on -- a track,
+    a via or a pad of the net elsewhere -- so straightening never closes a
+    loop or lands on a pad it did not reach before.
 
     Per net, the result is committed only if check_net_connectivity does not
     grade it worse than the original. The guard runs WITHOUT pour credit:
@@ -6968,6 +7430,18 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
     keepout_clears = _gates.keepout_clears
     _665trace = _gates._665trace
     clears = _gates.clears
+    if no_new_contacts:
+        # the end-of-run pass also keeps clear of FILLED footprint copper of
+        # another net or none (an antenna, an SOT tab: #1181), as the exit
+        # rebuild does -- the segment gates measure it by its outline only
+        from check_drc import filled_graphic_shapes
+        _fills = filled_graphic_shapes(pcb_data)
+        _gate_clears = clears
+
+        def clears(x1, y1, x2, y2, layer, net_id, w):
+            return (_gate_clears(x1, y1, x2, y2, layer, net_id, w)
+                    and _filled_graphics_clear(_fills, x1, y1, x2, y2, layer,
+                                               net_id, w, clearance))
     # FINE-PITCH PAD FIELDS, from the board's OWN helpers -- `detect_bga_pitch`
     # and `get_footprint_bounds`, the two `auto_detect_bga_exclusion_zones` is
     # itself built from. A dense field's inter-pad space is escape corridor: the
@@ -6991,7 +7465,7 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
     _dense_boxes = []
     try:
         from kicad_parser import detect_bga_pitch, get_footprint_bounds
-        for _fp in pcb_data.footprints.values():
+        for _fp in (pcb_data.footprints.values() if protect_dense_fields else ()):
             if not pad_field_is_corridor(
                     _fp, getattr(config, 'track_width', None) or 0.15,
                     clearance):
@@ -7318,6 +7792,138 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
                                                        poly[p + 1][0], poly[p + 1][1])
                                                 for p in range(i, j)) + 1e-9
 
+                        def _new_contact(pts, i, j, poly):
+                            """Does the connector ``pts`` (replacing poly[i..j])
+                            touch same-net copper other than this chain's, away
+                            from its two ends?"""
+                            ends = (pts[0], pts[-1])
+                            r = w / 2.0
+                            for q in range(len(pts) - 1):
+                                (ax, ay), (bx, by) = pts[q], pts[q + 1]
+                                for o in net_segs:
+                                    if id(o) in chain_ids or o.layer != layer:
+                                        continue
+                                    if (max(o.start_x, o.end_x) < min(ax, bx) - 1.0
+                                            or min(o.start_x, o.end_x) > max(ax, bx) + 1.0
+                                            or max(o.start_y, o.end_y) < min(ay, by) - 1.0
+                                            or min(o.start_y, o.end_y) > max(ay, by) + 1.0):
+                                        continue
+                                    d, p1, _p2 = segment_to_segment_closest_points(
+                                        Segment(start_x=ax, start_y=ay, end_x=bx, end_y=by,
+                                                width=w, layer=layer, net_id=net_id), o)
+                                    if d < r + o.width / 2.0 + COINCIDENCE_TOL and all(
+                                            math.hypot(p1[0] - e[0], p1[1] - e[1])
+                                            > r + o.width / 2.0 for e in ends):
+                                        return True
+                                for v in net_vias:
+                                    vr = (getattr(v, 'size', 0.0) or 0.0) / 2.0
+                                    if _pt_seg_dist(v.x, v.y, ax, ay, bx, by) < r + vr and all(
+                                            math.hypot(v.x - e[0], v.y - e[1]) > vr + r
+                                            for e in ends):
+                                        return True
+                                for pad in net_pads:
+                                    if not pad_on_layer(pad, layer):
+                                        continue
+                                    if _pt_seg_dist(pad.global_x, pad.global_y, ax, ay, bx, by) \
+                                            > pad_reach(pad) + r:
+                                        continue
+                                    near_end = any(point_to_pad_distance(e[0], e[1], pad)
+                                                   <= r + COINCIDENCE_TOL for e in ends)
+                                    if near_end:
+                                        continue
+                                    for t in (0.0, 0.25, 0.5, 0.75, 1.0):
+                                        if point_to_pad_distance(ax + (bx - ax) * t,
+                                                                 ay + (by - ay) * t, pad) <= r:
+                                            return True
+                            return False
+
+                        def _exit_worse(pts, i, j, poly):
+                            """Does the connector make the exit of a pad the
+                            chain ends on fail a rule (SMD Entry, SMD To
+                            Corner, in-pad off-axis) the chain's own exit did
+                            not?"""
+                            from pad_entry import grade_pad_exit, smd_gradable
+                            m = len(poly) - 1
+                            for at_end, end_pt, new_run, old_run in (
+                                    (i == 0, poly[0], list(pts) + list(poly[j + 1:]), list(poly)),
+                                    (j == m, poly[m], list(reversed(pts)) + list(reversed(poly[:i])),
+                                     list(reversed(poly)))):
+                                if not at_end:
+                                    continue
+                                for pad in net_pads:
+                                    if not smd_gradable(pad, layer):
+                                        continue
+                                    if point_to_pad_distance(end_pt[0], end_pt[1], pad) \
+                                            > w / 2.0 + COINCIDENCE_TOL:
+                                        continue
+                                    _tc = getattr(config, 'smd_to_corner', None)
+                                    new_r = grade_pad_exit(pad, new_run, w, in_pad=True,
+                                                           to_corner=_tc)
+                                    old_r = grade_pad_exit(pad, old_run, w, in_pad=True,
+                                                           to_corner=_tc)
+                                    if new_r - old_r:
+                                        return True
+                            return False
+
+                        def _bend_acute(pts, i, j, poly):
+                            """A corner under 90 degrees
+                            where the connector meets the chain legs it
+                            keeps."""
+                            from corner_angle import interior_angle, ANGLE_TOL_DEG
+                            m = len(poly) - 1
+                            lim = 90.0 - ANGLE_TOL_DEG
+                            if i > 0:
+                                a, b, c = poly[i - 1], pts[0], pts[1]
+                                if interior_angle(a[0] - b[0], a[1] - b[1],
+                                                  c[0] - b[0], c[1] - b[1]) < lim:
+                                    return True
+                            if j < m:
+                                a, b, c = poly[j + 1], pts[-1], pts[-2]
+                                if interior_angle(a[0] - b[0], a[1] - b[1],
+                                                  c[0] - b[0], c[1] - b[1]) < lim:
+                                    return True
+                            return False
+
+                        def _pad_leg_bent(pts, i, j, poly):
+                            """Does connector ``pts`` (replacing poly[i..j])
+                            leave a pad the chain ends on along a different
+                            line than the chain's own leg did?"""
+                            from pad_entry import ANGLE_TOL as _AT
+                            m = len(poly) - 1
+                            for at_end, old_a, old_b, new_a, new_b in (
+                                    (i == 0, poly[0], poly[1], pts[0], pts[1]),
+                                    (j == m, poly[m], poly[m - 1], pts[-1], pts[-2])):
+                                if not at_end or not pad_anchored(*old_a):
+                                    continue
+                                ox, oy = old_b[0] - old_a[0], old_b[1] - old_a[1]
+                                nx, ny = new_b[0] - new_a[0], new_b[1] - new_a[1]
+                                lo, ln = math.hypot(ox, oy), math.hypot(nx, ny)
+                                if lo < 1e-9 or ln < 1e-9:
+                                    return True
+                                if (abs(ox * ny - oy * nx) > _AT * lo * ln
+                                        or ox * nx + oy * ny <= 0):
+                                    return True
+                            return False
+
+                        def _pad_leg_turns(i, j, poly):
+                            """Would the line poly[i] -> poly[j] turn a leg
+                            that leaves a pad (the chain's first or last) by
+                            more than SMD Entry's angle tolerance
+                            (pad_entry.ANGLE_TOL, 1 degree)?"""
+                            from pad_entry import ANGLE_TOL as _AT
+                            for end, k0, k1 in ((0, 0, 1), (len(poly) - 1, len(poly) - 1, len(poly) - 2)):
+                                if (i == end or j == end) and pad_anchored(*poly[end]):
+                                    ox, oy = poly[k1][0] - poly[k0][0], poly[k1][1] - poly[k0][1]
+                                    other = poly[j] if end == i else poly[i]
+                                    nx, ny = other[0] - poly[end][0], other[1] - poly[end][1]
+                                    lo, ln = math.hypot(ox, oy), math.hypot(nx, ny)
+                                    if lo < 1e-9 or ln < 1e-9:
+                                        return True
+                                    if (abs(ox * ny - oy * nx) > _AT * lo * ln
+                                            or ox * nx + oy * ny <= 0):
+                                        return True
+                            return False
+
                         def collapse(poly, leg_pos, allow_tie):
                             """One greedy pass over polyline poly -> {i: (j, pts)}."""
                             m = len(poly) - 1
@@ -7358,7 +7964,14 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
                                     if not span_free(i, j):
                                         continue
                                     A, B = poly[i], poly[j]
-                                    for inter in _octolinear_bends(A, B):
+                                    _cands = _octolinear_bends(A, B)
+                                    if (micro_any_angle > 0 and [] not in _cands
+                                            and _max_offset_from_line(
+                                                A, B, poly[i + 1:j])
+                                            <= micro_any_angle * w + 1e-9
+                                            and not _pad_leg_turns(i, j, poly)):
+                                        _cands = [[]] + _cands
+                                    for inter in _cands:
                                         pts = [A] + inter + [B]
                                         lengths = [math.hypot(b[0] - a[0], b[1] - a[1])
                                                    for a, b in zip(pts, pts[1:])]
@@ -7401,6 +8014,14 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
                                                 _in_dense_field(pts[q][0], pts[q][1],
                                                                 pts[q + 1][0], pts[q + 1][1])
                                                 for q in range(len(pts) - 1)):
+                                            continue
+                                        if no_new_contacts and (
+                                                _new_contact(pts, i, j, poly)
+                                                or _pad_leg_bent(pts, i, j, poly)
+                                                or _creates_acute(pts, layer, net_segs,
+                                                                  chain_ids)
+                                                or _bend_acute(pts, i, j, poly)
+                                                or _exit_worse(pts, i, j, poly)):
                                             continue
                                         if all(clears_m(pts[q][0], pts[q][1],
                                                         pts[q + 1][0], pts[q + 1][1])

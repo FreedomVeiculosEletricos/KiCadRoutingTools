@@ -1865,6 +1865,163 @@ def _late_soft_joint_bridge984(pcb_data, output_file, return_results,
         return 0
 
 
+def _declared_floor_config(config, pcb_data):
+    """``config`` with its clearances raised to the ones the run's INPUT
+    project declares (the Default class and each net's classes). The run may
+    have relaxed them (escalation) and written the relaxed floors back; copper
+    the end-of-run pass MOVES must not come out closer than the board asked
+    for, or it trades one defect for a DRC one. Returns ``config`` itself when
+    nothing is declared."""
+    import copy as _copy
+    path = getattr(pcb_data, 'source_path', None)
+    if config is None or not path or not os.path.isfile(path):
+        return config
+    try:
+        from list_nets import board_default_netclass_clearance, net_clearance_map_by_id
+        clr = board_default_netclass_clearance(path)
+        nets = {nid: n.name for nid, n in pcb_data.nets.items()}
+        by_net = net_clearance_map_by_id(path, nets) or {}
+    except Exception:                                           # noqa: BLE001
+        return config
+    if not clr and not by_net:
+        return config
+    cfg = _copy.copy(config)
+    try:
+        from list_nets import board_constraint
+        hole = board_constraint(path, 'min_hole_clearance')
+    except Exception:                                           # noqa: BLE001
+        hole = None
+    # KiCad grades copper against another net's plated drill at the larger
+    # of the copper clearance and the hole clearance rule
+    cfg.drill_hole_clearance = max(hole or 0.0, 0.0)
+    base = max(getattr(config, 'clearance', 0.0) or 0.0, clr or 0.0)
+    cfg.clearance = base
+    have = dict(getattr(config, 'net_clearances', None) or {})
+    for nid, c in by_net.items():
+        have[nid] = max(have.get(nid, 0.0), c)
+    cfg.net_clearances = have or None
+    return cfg
+
+
+def _late_choose_no_worse(board, segs_a, segs_b, scope, rules_path=None,
+                          smd_to_corner=None):
+    """The nets (of ``scope``) whose copper in candidate B check_weird grades
+    no worse than in candidate A in ANY category -- a track narrower than
+    the board allows by its length, not its count, since a rebuilt run may
+    split it. Returns (those nets, the nets where A is kept although B
+    differs). The graders read the rules at ``rules_path`` (the run's input,
+    not the floors the run wrote back)."""
+    import copy as _copy
+    import contextlib
+    import glob as _glob
+    import io
+    import re as _re
+    from collections import Counter, defaultdict
+    from check_weird import check_weird
+
+    def sig(segs):
+        d = defaultdict(set)
+        for x in segs:
+            d[x.net_id].add((x.layer, round(x.start_x, 4), round(x.start_y, 4),
+                             round(x.end_x, 4), round(x.end_y, 4), round(x.width, 4)))
+        return d
+    sa, sb = sig(segs_a), sig(segs_b)
+    differ = {n for n in set(sa) | set(sb) if sa.get(n) != sb.get(n)} & set(scope)
+    same = set(scope) - differ
+    if not differ:
+        return same, 0
+    names = {n: board.nets[n].name for n in differ if n in board.nets}
+
+    def grade(segs):
+        b = _copy.copy(board)
+        b.segments = list(segs)
+        if rules_path:
+            b.source_path = rules_path
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            f, _sk = check_weird(b, net_patterns=[_glob.escape(x) for x in names.values()],
+                                 tolerance=0, smd_to_corner=smd_to_corner)
+        by = defaultdict(Counter)
+        name_to_id = {v: k for k, v in names.items()}
+        for x in f:
+            nid = name_to_id.get(x['net'])
+            if nid is None:
+                continue
+            if x['category'] == 'necked-track':
+                m = _re.search(r'\(([\d.]+)mm long\)', x['detail'])
+                by[nid]['necked_um'] += int(round(1000 * float(m.group(1)))) if m else 1
+            else:
+                by[nid][x['category']] += 1
+        return by
+    ga, gb = grade(segs_a), grade(segs_b)
+    keep_b = {n for n in differ if not any(gb[n][k] > ga[n][k] for k in gb[n])}
+    return same | keep_b, len(differ - keep_b)
+
+
+def _late_merge_clears(board, segs_a, segs_b, keep_b, before, config):
+    """``keep_b`` less the nets whose candidate-B copper fails the clearance
+    gates against the MERGED board (B on ``keep_b``, A elsewhere).
+
+    Each candidate was gated against its own board only: B laid a net's exit
+    beside another net's B copper, and when that other net then kept A, the
+    merged board carried a short (an exit run into the neighbouring pad's
+    A track). A new segment -- one not in ``before`` -- that clears in its
+    own candidate but not in the merge reverts the B net it meets to A: its
+    own net when it is B copper, the B nets within reach of it when it is A
+    copper. All-A is the plain pass, so the loop ends.
+    Returns (nets kept on B, nets reverted)."""
+    import copy as _copy
+    from geometry_utils import segment_to_segment_distance_seg
+    from pcb_modification import _copper_clearance_gates
+    clr = getattr(config, 'clearance', 0.1) or 0.1
+    ncl = getattr(config, 'net_clearances', None) or None
+    edge = getattr(config, 'board_edge_clearance', 0.0) or 0.0
+    reach = max([clr] + list((ncl or {}).values()))
+    old = {id(x) for x in before}
+
+    def gates_for(segs):
+        bd = _copy.copy(board)
+        bd.segments = list(segs)
+        for attr in ('_foreign_seg_arr_cache', '_foreign_via_arr_cache',
+                     '_foreign_pad_arr_cache'):
+            if getattr(bd, attr, None) is not None:
+                setattr(bd, attr, None)
+        return _copper_clearance_gates(bd, clr, ncl, edge, config)
+
+    def failing(segs, only):
+        g = gates_for(segs)
+        return {id(x) for x in segs if id(x) in only and not g.clears(
+            x.start_x, x.start_y, x.end_x, x.end_y, x.layer, x.net_id, x.width)}
+
+    new_a = {id(x) for x in segs_a if id(x) not in old}
+    new_b = {id(x) for x in segs_b if id(x) not in old}
+    own_bad = failing(segs_a, new_a) | failing(segs_b, new_b)
+    keep_b = set(keep_b)
+    reverted = set()
+    while True:
+        merged = ([x for x in segs_b if x.net_id in keep_b]
+                  + [x for x in segs_a if x.net_id not in keep_b])
+        live_b = [x for x in merged if x.net_id in keep_b]
+        bad = failing(merged, (new_a | new_b) - own_bad)
+        hit = set()
+        for x in merged:
+            if id(x) not in bad:
+                continue
+            if x.net_id in keep_b:
+                hit.add(x.net_id)
+                continue
+            for y in live_b:
+                if (y.layer == x.layer and y.net_id != x.net_id
+                        and segment_to_segment_distance_seg(x, y)
+                        < reach + (x.width + y.width) / 2):
+                    hit.add(y.net_id)
+        hit &= keep_b
+        if not hit:
+            return keep_b, len(reverted)
+        keep_b -= hit
+        reverted |= hit
+
+
 def _late_pad_exits(pcb_data, output_file, return_results, results_data,
                     write_model, input_signature, scope_names,
                     keep_input_copper, config=None):
@@ -1881,6 +2038,14 @@ def _late_pad_exits(pcb_data, output_file, return_results, results_data,
     _late_strict_collapse1063: the written file on the CLI, the write model on
     the GUI; input copper by VALUE, read-only under --keep-input-copper.
     Protected / coupled / impedance / length-graded nets keep their exits.
+
+    That is candidate A. Candidate B, from the same copper, adds what only a
+    pass after which nothing is routed may do: the final gloss, the exits and
+    corners at the INPUT's declared floors (then the run's), the end-of-run
+    exit rules (rebuild_pad_exits final=True) and every net's via ends taken
+    to the via centre. Per net, B ships where check_weird grades it no worse
+    than A in every category (_late_choose_no_worse), A elsewhere -- see
+    docs/routing-architecture.md, Post-Processing.
     Returns (exits rebuilt, connectors added)."""
     import copy as _copy
     from collections import Counter
@@ -1888,6 +2053,12 @@ def _late_pad_exits(pcb_data, output_file, return_results, results_data,
     from pcb_modification import (rebuild_pad_exits, close_soft_joints,
                                   collapse_strict_redundant, fix_acute_corners)
     from cleanup_pipeline import pad_exit_skip_net_ids
+    # The copper this pass moves keeps the clearances the INPUT declares
+    # (declared); what that cannot rebuild then gets the run's own pass, at
+    # the run's floors, as before -- so no exit the run used to rebuild is
+    # left behind for the stricter floor.
+    run_config = config
+    config = _declared_floor_config(config, pcb_data)
     try:
         if return_results:
             rd = results_data if results_data is not None else {}
@@ -1919,42 +2090,131 @@ def _late_pad_exits(pcb_data, output_file, return_results, results_data,
             else:
                 owned.add(id(s))
         before = list(board.segments)
-        added_res = []
-        n_x = 0
-        n_ac = 0
-        skip = pad_exit_skip_net_ids(board, config)
-        left = {}
-        corners_left = {}
-        for _round in range(3):
-            left = {}
-            corners_left = {}
-            n, _strip, added = rebuild_pad_exits(
-                added_res, board, scope, config,
-                editable=(None if not keep_input_copper
-                          else (lambda x: id(x) in owned)),
-                skip_net_ids=skip, stats=left)
-            n_x += n
-            n_c, _strip_c, added_c = fix_acute_corners(
-                added_res, board, scope, config,
-                editable=(None if not keep_input_copper
-                          else (lambda x: id(x) in owned)),
-                skip_net_ids=skip, stats=corners_left)
-            n_ac += n_c
-            added = list(added) + list(added_c)
-            n += n_c
-            if not n:
-                break
-            owned |= {id(x) for x in added}
-            mine = [x for x in board.segments if id(x) in owned]
+        skip = pad_exit_skip_net_ids(board, run_config)
+
+        def _rounds(bd, res, own, cfg_first, final):
+            """rebuild_pad_exits + fix_acute_corners + the strict collapse of
+            what they left redundant, in rounds. ``final``: first at the
+            declared floors with the final-pass rules, then at the run's."""
+            n_x = n_ac = 0
+            left, corners_left = {}, {}
+            for _round in range(3):
+                left, corners_left = {}, {}
+                _ed = (None if not keep_input_copper else (lambda x: id(x) in own))
+                added = []
+                n = 0
+                if final:
+                    n, _st, added = rebuild_pad_exits(
+                        res, bd, scope, cfg_first, editable=_ed,
+                        skip_net_ids=skip, stats={}, final=True)
+                n_b, _st, added_b = rebuild_pad_exits(
+                    res, bd, scope, run_config, editable=_ed,
+                    skip_net_ids=skip, stats=left)
+                n += n_b
+                added = list(added) + list(added_b)
+                n_x += n
+                n_c = 0
+                added_c = []
+                if final:
+                    n_c, _st, added_c = fix_acute_corners(
+                        res, bd, scope, cfg_first, editable=_ed,
+                        skip_net_ids=skip, stats={})
+                n_c2, _st, added_c2 = fix_acute_corners(
+                    res, bd, scope, run_config, editable=_ed,
+                    skip_net_ids=skip, stats=corners_left)
+                n_c += n_c2
+                n_ac += n_c
+                added = list(added) + list(added_c) + list(added_c2)
+                n += n_c
+                if not n:
+                    break
+                own |= {id(x) for x in added}
+                mine = [x for x in bd.segments if id(x) in own]
+                collapse_strict_redundant(
+                    [{'new_segments': mine, 'new_vias': []}], bd,
+                    {x.net_id for x in added}, keep_input_copper=keep_input_copper)
+            return n_x, n_ac, left, corners_left
+
+        # Candidate A: the pass as it has always run, at the run's floors.
+        bd_a = _copy.copy(board)
+        bd_a.segments = list(before)
+        res_a, own_a = [], set(owned)
+        _rounds(bd_a, res_a, own_a, run_config, False)
+        close_soft_joints(res_a, bd_a, scope, run_config, pad_entries_only=True)
+
+        # Candidate B: the final gloss, then the exits and corners at the
+        # floors the INPUT declares (then at the run's, for what that cannot
+        # rebuild), the pad entries, and every net's via ends taken to the
+        # via's centre. Nothing is routed after this pass, so the gloss may
+        # straighten inside a fine-pitch field and take an offset under one
+        # track width at any angle (smooth_octolinear_chains).
+        bd_b = _copy.copy(board)
+        bd_b.segments = list(before)
+        res_b, own_b = [], set(owned)
+        n_gloss = 0
+        if not keep_input_copper:
+            from pcb_modification import (smooth_octolinear_chains,
+                                          MICRO_ANY_ANGLE_WIDTHS)
+            from cleanup_pipeline import _smooth_skip_net_ids
+            _g = smooth_octolinear_chains(
+                res_b, bd_b, scope, clearance=getattr(config, 'clearance', 0.1),
+                net_clearances=getattr(config, 'net_clearances', None) or None,
+                board_edge_clearance=getattr(config, 'board_edge_clearance', 0.0) or 0.0,
+                config=config,
+                skip_net_ids=set(skip) | set(_smooth_skip_net_ids(bd_b)),
+                max_net_segs=4000, max_chain_segs=1000,
+                micro_any_angle=MICRO_ANY_ANGLE_WIDTHS,
+                protect_dense_fields=False, no_new_contacts=True)
+            n_gloss = _g[4].get('spans', 0)
+            own_b |= {id(x) for x in _g[3]}
+        n_x, n_ac, left, corners_left = _rounds(bd_b, res_b, own_b, config, True)
+        _n_res = len(res_b)
+        n_e = close_soft_joints(res_b, bd_b, scope, config,
+                                pad_entries_only=True,
+                                via_centres_all_nets=True)
+        n_e += close_soft_joints(res_b, bd_b, scope, run_config,
+                                 pad_entries_only=True)
+        # A via-centre bridge can land beside a track that already reaches
+        # the centre from a vertex the bridge's end shares a cap with: one
+        # of the two is then redundant. Collapse those nets keeping a
+        # rim-to-centre stub on every via (check_weird grades the same way).
+        _bridged_nets = {x.net_id for r in res_b[_n_res:]
+                         if r.get('cleanup') == 'via_centre_bridge'
+                         for x in (r.get('new_segments') or [])}
+        if _bridged_nets:
+            _new_ids = {id(y) for r in res_b for y in (r.get('new_segments') or [])}
+            mine = [x for x in bd_b.segments if id(x) in own_b or id(x) in _new_ids]
             collapse_strict_redundant(
-                [{'new_segments': mine, 'new_vias': []}], board,
-                {x.net_id for x in added}, keep_input_copper=keep_input_copper)
-        n_e = close_soft_joints(added_res, board, scope, config,
-                                pad_entries_only=True)
+                [{'new_segments': mine, 'new_vias': []}], bd_b, _bridged_nets,
+                keep_input_copper=keep_input_copper, centre_stubs_all_nets=True)
+
+        # Per net, B only where check_weird grades it no worse than A in any
+        # category; A elsewhere.
+        keep_b, n_reverted = _late_choose_no_worse(
+            board, bd_a.segments, bd_b.segments, scope,
+            getattr(pcb_data, 'source_path', None),
+            smd_to_corner=getattr(config, 'smd_to_corner', None))
+        keep_b, n_clash = _late_merge_clears(board, bd_a.segments,
+                                             bd_b.segments, keep_b, before,
+                                             run_config)
+        if n_clash:
+            print(f"  End-of-run pass: {n_clash} net(s) keep the plain exit "
+                  f"rebuild (their final-pass copper would not clear the "
+                  f"other nets' chosen copper)")
+        board.segments = ([x for x in bd_b.segments if x.net_id in keep_b]
+                          + [x for x in bd_a.segments if x.net_id not in keep_b])
+        added_res = res_a + res_b
+        owned = own_a | own_b
         kept = {id(s) for s in board.segments}
         removed = [s for s in before if id(s) not in kept]
         new = [x for r in added_res for x in (r.get('new_segments') or [])
                if id(x) in kept]
+        if n_reverted:
+            print(f"  End-of-run pass: {n_reverted} net(s) keep the plain exit "
+                  f"rebuild (the final gloss graded worse there)")
+        if n_gloss:
+            print(f"  Final gloss (end of run): straightened {n_gloss} "
+                  f"staircase/jog span(s)")
         if left:
             print("  Pad exits (end of run): left as routed -- "
                   + ", ".join(f"{k.replace('_', ' ')} {v}"

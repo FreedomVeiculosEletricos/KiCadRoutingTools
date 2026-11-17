@@ -556,6 +556,18 @@ def _check_dangles(net_id, name, net_segs, net_vias, net_pads, net_zones,
                 size=seg_len))
 
 
+def _via_centre_stub(s, vias) -> bool:
+    """Is ``s`` a stub from inside a same-net via's copper to its centre?"""
+    for v in vias:
+        r = (getattr(v, 'size', 0.0) or 0.0) / 2.0
+        for (ax, ay), (bx, by) in (((s.start_x, s.start_y), (s.end_x, s.end_y)),
+                                   ((s.end_x, s.end_y), (s.start_x, s.start_y))):
+            if (math.hypot(bx - v.x, by - v.y) <= 1e-3
+                    and math.hypot(ax - v.x, ay - v.y) <= r + 1e-6):
+                return True
+    return False
+
+
 def _check_cycles(net_id, name, net_segs, net_vias, net_pads, has_zone,
                   findings, removable=None):
     """Report-only spanning-tree reduction (prune_redundant_cycles machinery).
@@ -588,6 +600,10 @@ def _check_cycles(net_id, name, net_segs, net_vias, net_pads, has_zone,
         # copper no pass will ever take out.
         _k, removed = _restore_soft_joint_bridges(list(kept), list(removed),
                                                   net_vias, net_pads)
+        # ...and keeps a via-centre stub (a track from inside a via's copper
+        # to its centre): the removal model keeps those on every net, since
+        # an end left on the via's rim is off-centre-via-end.
+        removed = [s for s in removed if not _via_centre_stub(s, net_vias)]
     for s in removed:
         mx, my = (s.start_x + s.end_x) / 2.0, (s.start_y + s.end_y) / 2.0
         findings.append(_finding(
@@ -1196,20 +1212,32 @@ def _check_shallow_pad_entry(name, net_segs, net_vias, net_pads, findings):
                 f"the track", size=None))
 
 
-def _check_smd_exit(name, net_segs, net_vias, net_pads, findings):
+def _check_smd_exit(name, net_segs, net_vias, net_pads, findings,
+                    to_corner=None):
     # (callers skip the nets whose exits are the spec: pad_exit_skip_net_ids)
     """Flag SMD pad exits that fail Altium's SMT rules
     (pcb_modification.smd_exit_violations, what rebuild_pad_exits repairs):
     ``smd-entry`` -- the track crosses the pad outline through a corner, at an
     angle, or through a side SMD_ENTRY_SIDE forbids; ``smd-to-corner`` -- it
-    bends within exit_distance of the outline. Read-only; no size."""
+    bends within exit_distance of the outline (``to_corner``, None =
+    routing_defaults.SMD_TO_CORNER_MM). Every connection to the pad is
+    graded: a track ending in it, each track leaving a junction inside it, and
+    both halves of a track passing through it (smd_exit_violations' through);
+    a track whose copper only touches the pad's side is an ``smd-entry``.
+    Read-only; no size."""
     if not net_pads or not net_segs:
         return
     from pcb_modification import smd_exit_violations
     from pad_entry import exit_distance
-    for s, (ex, ey), pad, pts, _cs, _r, rules in smd_exit_violations(
-            net_segs, net_vias, net_pads):
+    for s, (ex, ey), pad, pts, _cs, reason, rules in smd_exit_violations(
+            net_segs, net_vias, net_pads, to_corner=to_corner, through=True):
         ref = f"{pad.component_ref}.{pad.pad_number}"
+        if reason == 'graze':
+            findings.append(_finding(
+                'smd-entry', name, s.layer, ex, ey,
+                f"{s.width:.3f}mm track runs along SMD pad {ref}'s side, "
+                f"its centreline outside the pad", size=None))
+            continue
         if 'smd-entry' in rules:
             findings.append(_finding(
                 'smd-entry', name, s.layer, ex, ey,
@@ -1219,7 +1247,8 @@ def _check_smd_exit(name, net_segs, net_vias, net_pads, findings):
             findings.append(_finding(
                 'smd-to-corner', name, s.layer, ex, ey,
                 f"{s.width:.3f}mm track bends less than "
-                f"{exit_distance(s.width):.3f}mm from SMD pad {ref}", size=None))
+                f"{exit_distance(s.width, to_corner):.3f}mm from SMD pad {ref}",
+                size=None))
 
 
 def _check_acute_corners(name, net_segs, net_vias, net_pads, min_angle,
@@ -1834,9 +1863,9 @@ def check_weird(pcb_data: PCBData, net_patterns: Optional[List[str]] = None,
     # verdict. A board with no project falls back to its thinnest track.
     from fix_kicad_drc_settings import connection_width_floor
     min_track_w = connection_width_floor(pcb_data)
-    # #1798: the nets the removal pass keeps via-centre stubs on.
-    from cleanup_pipeline import _centre_stub_net_ids
-    stub_ids = _centre_stub_net_ids(pcb_data)
+    # #1798 kept via-centre stubs on the nets a skew rule grades; every track
+    # end into a via now reaches its centre (off-centre-via-end is a defect on
+    # any net), so the removal model keeps them on every net.
 
     net_ids = set(segs_by_net) | set(vias_by_net)
     check_ids = []
@@ -1880,7 +1909,7 @@ def check_weird(pcb_data: PCBData, net_patterns: Optional[List[str]] = None,
         removable = _strict_removable(net_id, name, net_segs, net_vias,
                                       net_pads, has_zone, copper_layers,
                                       thorough, skipped_nets, min_track_w,
-                                      keep_centre_stubs=net_id in stub_ids)
+                                      keep_centre_stubs=True)
         _check_cycles(net_id, name, net_segs, net_vias, net_pads, has_zone,
                       findings, removable)
         _check_removable(net_id, name, net_segs, removable, findings)
@@ -1895,7 +1924,8 @@ def check_weird(pcb_data: PCBData, net_patterns: Optional[List[str]] = None,
                             min_track_w, findings)
         _check_shallow_pad_entry(name, net_segs, net_vias, net_pads, findings)
         if net_id not in smd_skip:
-            _check_smd_exit(name, net_segs, net_vias, net_pads, findings)
+            _check_smd_exit(name, net_segs, net_vias, net_pads, findings,
+                            smd_to_corner)
             _check_acute_corners(name, net_segs, net_vias, net_pads,
                                  min_corner_angle, findings)
             _check_in_pad_off_axis(name, net_segs, net_pads, findings)
