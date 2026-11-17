@@ -651,6 +651,10 @@ it meets back to A, until the merge clears (all-A is the plain pass). Without
 it a net's B exit could run into a neighbour's A track -- a short.
 
 `_late_stacked_dedup162` removes exact same-net copies and, since a reroute
+can land on its own tie or tap, a segment lying wholly on a longer same-net
+track of the same layer, no wider, that nothing meets off the track's ends.
+
+### Corner limit after the router
 ## Visualizing the Search
 
 The interactive PyGame visualizer was removed in #569: the debugging workflow it predated (grade with `check_drc`/`check_connected`, replay a recorded chain from its `redo_commands.sh` manifest, read the per-net JSON summary and blocker report, or step a board in the GUI plugin) covers the same questions without a second rendering path to keep in sync with the engine.

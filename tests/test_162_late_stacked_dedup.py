@@ -19,7 +19,9 @@ the widest copy of a same-net, same-layer, same-span group stays.
   2. CLI: a 0.127 copy under a 0.3 track and a byte-identical twin both go;
      the 0.3 track and one twin stay, and the count says so;
   3. --keep-input-copper: an input copy stays; a locked group is left alone;
-  4. GUI: the copy leaves its result's new_segments and pcb_data.
+  4. GUI: the copy leaves its result's new_segments and pcb_data;
+  5. a copy lying wholly on a longer same-net track, meeting nothing off the
+     track's ends, goes too; one another track meets at its end stays.
 
     python3 tests/test_162_late_stacked_dedup.py
 """
@@ -131,6 +133,30 @@ def cli(tmp):
           n == 0 and widths(path) == [0.127, 0.3], f'removed {n}')
 
 
+def contained(tmp):
+    print('5. a copy lying ON a longer track, its far end loose, goes')
+    from route import _late_stacked_dedup162
+    # G1 -> (12, 15) along the 5..15 trunk: a reroute landing on the trunk.
+    base, path = board(tmp, 'cont', lambda rb: rb.seg(5, 15, 12, 15, 'GND', w=0.3))
+    b = parse_kicad_pcb(base)
+    sig = copper_signature(b.segments, b.vias,
+                           {i: n.name for i, n in b.nets.items()}.get)
+    n = _late_stacked_dedup162(None, path, False, None, None, sig, {'GND'},
+                               False)
+    pcb = parse_kicad_pcb(path)
+    check('the contained copy is removed, the trunk stays',
+          n == 1 and len(pcb.segments) == 2, f'removed {n}')
+
+    def branch(rb):
+        rb.seg(5, 15, 12, 15, 'GND', w=0.3)
+        rb.seg(12, 15, 12, 20, 'GND', w=0.3)      # a branch leaves its end
+    _b, path = board(tmp, 'cont2', branch)
+    n = _late_stacked_dedup162(None, path, False, None, None, sig, {'GND'},
+                               False)
+    check('a copy another track meets at its end stays', n == 0,
+          f'removed {n}')
+
+
 def gui(tmp):
     print('4. GUI: the copy leaves the write model')
     from route import _late_stacked_dedup162
@@ -163,6 +189,7 @@ def main():
         match_width(tmp)
         cli(tmp)
         gui(tmp)
+        contained(tmp)
     print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILED: ' + ', '.join(FAILS)}")
     return 1 if FAILS else 0
 

@@ -2474,6 +2474,53 @@ def _late_stacked_dedup162(pcb_data, output_file, return_results, results_data,
                     continue
                 removed.append(s)
                 nets.add(nid)
+        # A segment lying wholly ON a longer same-net segment of the same
+        # layer, at most as wide, is a stack too when nothing else meets it
+        # off the host's own ends: it carries no copper the host does not.
+        # (A reroute that lands on a tie or tap it already has lays one: a
+        # pad-to-mid-track copy along the track, its far end dangling.)
+        import math
+        from geometry_utils import point_to_segment_distance as _p2s162
+        done = {id(x) for x in removed}
+        by_nl = defaultdict(list)
+        ends = Counter()
+        for s in board.segments:
+            if not s.net_id or getattr(s, 'graphic', False) \
+                    or name_of.get(s.net_id) not in names:
+                continue
+            by_nl[(s.net_id, s.layer)].append(s)
+            for e in ((s.start_x, s.start_y), (s.end_x, s.end_y)):
+                ends[(s.net_id, s.layer, round(e[0], 3), round(e[1], 3))] += 1
+        via_at = {(v.net_id, round(v.x, 3), round(v.y, 3)) for v in board.vias}
+        for (nid, layer), segs in by_nl.items():
+            for s in segs:
+                if id(s) in done or is_immutable_copper(s) \
+                        or (keep_input_copper and id(s) in is_input):
+                    continue
+                pts = ((s.start_x, s.start_y), (s.end_x, s.end_y))
+                ln = math.hypot(s.end_x - s.start_x, s.end_y - s.start_y)
+                for h in segs:
+                    if h is s or id(h) in done or h.width + 1e-6 < s.width \
+                            or math.hypot(h.end_x - h.start_x,
+                                          h.end_y - h.start_y) <= ln + 1e-6:
+                        continue
+                    if any(_p2s162(x, y, h.start_x, h.start_y, h.end_x,
+                                   h.end_y) > 1e-3 for x, y in pts):
+                        continue
+                    h_ends = ((h.start_x, h.start_y), (h.end_x, h.end_y))
+
+                    def _free(x, y):
+                        if any(math.hypot(x - a, y - b) <= 1e-3
+                               for a, b in h_ends):
+                            return True
+                        k = (round(x, 3), round(y, 3))
+                        return (ends[(nid, layer) + k] == 1
+                                and (nid,) + k not in via_at)
+                    if all(_free(x, y) for x, y in pts):
+                        removed.append(s)
+                        done.add(id(s))
+                        nets.add(nid)
+                        break
         if not removed:
             return 0
         if return_results:
