@@ -4013,6 +4013,19 @@ def _place_shrunk_via_in_pad(pad_obj, obstacles, config, pcb_data, net_id,
     return r
 
 
+def _via_on_same_net_pad(pcb_data, net_id, x, y, size, clearance):
+    """Does a via of ``size`` at (x, y) come within ``clearance`` of the
+    copper of any SMD pad of ``net_id`` (overlap included)?"""
+    from check_drc import point_to_pad_distance
+    r = (size or 0.0) / 2.0
+    for p in (pcb_data.pads_by_net.get(net_id) or []):
+        if getattr(p, 'drill', 0):
+            continue
+        if point_to_pad_distance(x, y, p) - r < max(clearance, 0.0) - 1e-6:
+            return True
+    return False
+
+
 def _place_shrunk_via_in_pad_impl(pad_obj, obstacles, config, pcb_data, net_id, coord, layer_names,
                                   pending_vias=None):
     """Issue #189: drop a DRC-legal fab-floor via INSIDE a boxed-in SMD pad so a
@@ -4170,6 +4183,17 @@ def _place_shrunk_via_in_pad_impl(pad_obj, obstacles, config, pcb_data, net_id, 
                 _tv = tap_res.via
                 if _unblock_via_refit(pcb_data, net_id, _tv['x'], _tv['y'],
                                       (_tv['size'], _tv['drill']), config) != (_tv['size'], _tv['drill']):
+                    tap_res = None
+                    continue
+                # #581: under an active same-net pad via clearance the via
+                # keeps it from EVERY pad of its net -- the boxed pad itself
+                # included. The off-pad rung's search can settle on a site
+                # still over the pad it escapes (a 0.1 mm "stub" from the
+                # pad centre to a barrel inside the pad), which is the
+                # via-in-pad the flag forbids.
+                if not _allow_in_pad and _via_on_same_net_pad(
+                        pcb_data, net_id, _tv['x'], _tv['y'], _tv['size'],
+                        getattr(config, 'same_net_pad_clearance', 0.0)):
                     tap_res = None
                     continue
                 if (vd, dr) in escalated_pair:

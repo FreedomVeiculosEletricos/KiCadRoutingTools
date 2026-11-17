@@ -676,6 +676,11 @@ they keep the right angle they always kept. When the limit is wider than 90,
 `_late_move_exit_vias`, the last pass that lays copper; an acute corner one
 octolinear cut cannot fix gets two (`corner_angle.corner_cut_chains`).
 
+Under `--same-net-pad-clearance` no new via sits on a pad of its own net:
+the via-in-pad unblock's off-pad escape rung re-checks the site it settles on
+(`single_ended_routing._via_on_same_net_pad`), and the KiCad-oracle link
+router declines a link whose via would.
+
 ### Exposed pads and open pads
 
 Before any net is routed, `exposed_pad_ties.tie_pins_to_exposed_pads` joins

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The passes that lay copper after the router keep its corner limit
-(--max-turn-angle / --min-corner-angle).
+(--max-turn-angle / --min-corner-angle), and an unblock via never lands on
+a pad of its own net under --same-net-pad-clearance.
 
 Plain python3-runnable, no pytest."""
 import os
@@ -55,6 +56,22 @@ def test_creates_acute_takes_the_limit():
     print("PASS a right-angle joint is refused under a 135-degree limit")
 
 
+def test_unblock_via_on_its_own_pad_is_refused():
+    from single_ended_routing import _via_on_same_net_pad
+    pad = SimpleNamespace(global_x=42.03, global_y=63.9, size_x=0.59,
+                          size_y=0.64, shape='roundrect', rect_rotation=0,
+                          roundrect_rratio=0.25, drill=0, layers=['F.Cu'],
+                          net_id=7, polygons=None)
+    pcb = SimpleNamespace(pads_by_net={7: [pad]})
+    # the shipped defect: a 0.5 mm via 0.1 mm off the pad centre
+    assert _via_on_same_net_pad(pcb, 7, 42.0, 63.8, 0.5, 0.001)
+    # clear of the pad by more than its radius
+    assert not _via_on_same_net_pad(pcb, 7, 42.03, 63.9 + 0.32 + 0.26, 0.5, 0.001)
+    # another net's pad is not this check's business
+    assert not _via_on_same_net_pad(pcb, 8, 42.0, 63.8, 0.5, 0.001)
+    print("PASS an unblock via over its own net's pad is refused")
+
+
 def test_final_corner_pass_is_off_at_the_default_limit():
     from route import _late_final_corners
     # at the default limit the pass returns before touching the board
@@ -90,6 +107,7 @@ TESTS = [test_min_corner_follows_the_turn_limit,
          test_bend_test_matches_the_old_one_at_90,
          test_bend_test_at_135_allows_only_45_degree_turns,
          test_creates_acute_takes_the_limit,
+         test_unblock_via_on_its_own_pad_is_refused,
          test_final_corner_pass_is_off_at_the_default_limit]
 
 if __name__ == '__main__':

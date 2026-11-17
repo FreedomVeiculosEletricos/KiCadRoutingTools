@@ -3758,6 +3758,21 @@ def oracle_reconnect(board_file: str, net_names, config,
                       f"{used_width:.4g}mm; left unconnected)")
                 failed += 1
                 continue
+            # #581: under an active same-net pad via clearance no via the
+            # link drops may sit on (or within the clearance of) a pad of its
+            # own net -- the via-in-pad the flag forbids. The link search
+            # does not know the rule, so decline here like a clearance miss.
+            _snpc = getattr(config, 'same_net_pad_clearance', 0.0) or 0.0
+            if _snpc > 0 and via_positions:
+                from single_ended_routing import _via_on_same_net_pad
+                if any(_via_on_same_net_pad(pcb_data, net_id, vx, vy,
+                                            used_via_size, _snpc)
+                       for vx, vy in via_positions):
+                    print(f"    {net_name}: ({ax:.2f},{ay:.2f})<->({bx:.2f},{by:.2f})"
+                          f"  DECLINED (a via would sit on a pad of its own net "
+                          f"under --same-net-pad-clearance; left unconnected)")
+                    failed += 1
+                    continue
             n_segs = 0
             # #1169: wide where the net's own width fits, narrow at the pinch.
             _legs = widen_link_legs(route_points, used_width, pcb_data,
