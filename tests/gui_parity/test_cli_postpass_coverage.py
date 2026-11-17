@@ -255,6 +255,17 @@ KNOWN_CLI_ONLY = {
     # delivered file -- it applies copper to the user's open board, where
     # KiCad fills live and pressing B is the same operation. A GUI twin would
     # be a button that does what the application already does.
+    # route.py's end-of-run open-pad unboxing (open_pad_unbox.py): takes the
+    # tracks boxing an open pad off a copy of the WRITTEN board, reroutes those
+    # nets through batch_route, and ships the copy only when it frees pads with
+    # no net losing one and no more DRC findings. It works on the output FILE
+    # and the GUI does not run it yet: a GUI twin is a known gap, not a
+    # deliberate difference.
+    'unbox_open_pads': 'route.py: end-of-run open-pad unboxing on the WRITTEN '
+                       'board (--no-unbox skips it); the GUI does not run it '
+                       'yet -- a known gap',
+    'open_pads': 'route.py: the COMPLETION: line and --require-complete grade '
+                 'on the written board (report-only, no board mutation)',
     'write_filled_board': 'route.py --write-fill: fills the WRITTEN board for '
                           'delivery; the GUI mutates a live board KiCad fills '
                           'itself, so there is no file to fill',

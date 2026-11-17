@@ -264,6 +264,31 @@ def _gui_calls(path, fname):
     return out
 
 
+# CLI engine calls made with `**dict`, keyed by the CLI call name: the
+# module-level `variable = dict(...)` the gate reads instead. route.py builds
+# its batch_route kwargs once, because the open-pad unboxing pass reroutes
+# with the same options; read only the call's own keywords, the pair would be
+# reported as a missing call site.
+CLI_KWARGS_DICTS = {
+    "batch_route": "_route_kw",
+}
+
+
+def _cli_calls(path, fname):
+    """_calls for the CLI side, plus the dict(...) CLI_KWARGS_DICTS names for
+    a call made with **dict."""
+    out = _calls(path, fname)
+    var = CLI_KWARGS_DICTS.get(fname)
+    if var is None:
+        return out
+    for n in ast.walk(ast.parse(open(path).read())):
+        if (isinstance(n, ast.Assign) and isinstance(n.value, ast.Call)
+                and isinstance(n.value.func, ast.Name) and n.value.func.id == "dict"
+                and any(isinstance(t, ast.Name) and t.id == var for t in n.targets)):
+            out.append((n.lineno,) + _kwarg_info(n.value.keywords))
+    return out
+
+
 def _unread_starstar(path, fname):
     """Lines of fname calls passing **X that GUI_KWARGS_DICTS does not map:
     kwargs this gate cannot see, so it must not report the pair as checked."""
@@ -283,7 +308,7 @@ def check_class1():
     failures = []
     print("CLASS 1 -- kwargs the CLI passes but the GUI does not")
     for cli, gui, cli_fn, gui_fn in PAIRS:
-        cln, cset, _, _ = _cli_main_call(_calls(os.path.join(REPO, cli), cli_fn))
+        cln, cset, _, _ = _cli_main_call(_cli_calls(os.path.join(REPO, cli), cli_fn))
         gln, gset, _, _ = _widest(_gui_calls(os.path.join(REPO, gui), gui_fn))
         # A pair this gate cannot read is a FAIL, never a SKIP: a SKIP printed
         # above an OK verdict is how the fanout pairs went unchecked (#621).

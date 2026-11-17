@@ -10881,6 +10881,30 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
         return successful, failed, total_time, results_data
     return successful, failed, total_time
 
+def _unbox_reroute_child(input_file, output_file, net_names, kwargs):
+    """The open-pad unboxing reroute, in its own process: batch_route keeps
+    run state in module globals (the #1807 lap record, the design-rules
+    disclosure, the summary sink), and a reroute run in the step's own
+    process would leave its state for the step's main() to persist as the
+    step's."""
+    import contextlib
+    import io
+    with contextlib.redirect_stdout(io.StringIO()):
+        batch_route(input_file, output_file, net_names, **kwargs)
+
+
+def _unbox_reroute(input_file, output_file, net_names, kwargs):
+    """Run _unbox_reroute_child in a SPAWNED process (a fresh interpreter on
+    every platform). A child that fails writes no board, which the unboxing
+    pass reads as "left as routed"."""
+    import multiprocessing
+    proc = multiprocessing.get_context('spawn').Process(
+        target=_unbox_reroute_child,
+        args=(input_file, output_file, net_names, kwargs))
+    proc.start()
+    proc.join()
+
+
 if __name__ == "__main__":
     import argparse
     # Windows consoles default to cp1252, which can't encode the non-ASCII glyphs
@@ -11249,6 +11273,16 @@ For differential pair routing, use route_diff.py:
     _sm.add_argument("--no-smoothing", dest="smoothing", action="store_false",
                      help="Disable #536 octolinear smoothing for this step. "
                           "KICAD_SMOOTH_ROUTE=0/1 overrides either way.")
+    parser.add_argument("--require-complete", action="store_true",
+                        help="Exit with status 4 when the written board still has a pad off "
+                             "its net (after the open-pad unboxing pass). The board is "
+                             "written either way, so it can be inspected.")
+    parser.add_argument("--no-unbox", action="store_true",
+                        help="Skip the end-of-run open-pad unboxing pass "
+                             "(open_pad_unbox.py), which takes other nets' tracks that box "
+                             "an open pad in off a copy of the board and reroutes those "
+                             "nets, shipping the copy only when it frees pads and is no "
+                             "worse in connectivity and DRC.")
     parser.add_argument("--keep-input-copper", action="store_true",
                         help="Treat the input file's own copper as read-only: the post-route "
                              "cleanup passes (dead-end sweep, orphan islands, cycle/redundancy "
@@ -11898,8 +11932,7 @@ For differential pair routing, use route_diff.py:
     # --preview: the engine already supports this -- return_results=True with
     # an empty output_file routes fully, mutates only the in-memory PCBData
     # and writes nothing. This just exposes it on the CLI (#459 follow-on).
-    _preview_out = batch_route(args.input_file,
-                "" if args.preview else args.output_file, net_names,
+    _route_kw = dict(
                 return_results=args.preview,
                 quick=args.quick,
                 direction_order=args.direction,
@@ -11995,6 +12028,9 @@ For differential pair routing, use route_diff.py:
                 add_teardrops=args.add_teardrops,
                 collect_stats=args.stats,
                 fix_drc_settings=not args.no_fix_drc_settings)
+    _preview_out = batch_route(args.input_file,
+                               "" if args.preview else args.output_file,
+                               net_names, **_route_kw)
 
     if args.preview:
         _ok, _fail, _t, _data = _preview_out
@@ -12038,6 +12074,47 @@ For differential pair routing, use route_diff.py:
         print("  (improvement gate reverted the output -- skipping the "
               "castellated retract and the DRC-settings writeback; the "
               "output is the input board, project and rules included)")
+
+    # Open pads boxed in by other nets' copper (open_pad_unbox.py): take the
+    # boxing tracks off a copy of the written board, reroute the open pad's
+    # net and theirs with this run's options, and ship the copy only when it
+    # frees pads without costing any net a pad or adding DRC findings.
+    _still_open = None
+    if (not args.skip_routing and not _gate_reverted and args.output_file
+            and os.path.isfile(args.output_file)):
+        from open_pad_unbox import unbox_open_pads, open_pads
+        from kicad_parser import parse_kicad_pcb as _pk_unbox
+        _scope_unbox = set(net_names or ())
+        if not args.no_unbox:
+            _keep_in = None
+            if args.keep_input_copper:
+                from improvement_gate import copper_item_key
+                _keep_in = {copper_item_key(x)
+                            for x in _pk_unbox(args.input_file).segments}
+
+            def _reroute_unbox(_tin, _tout, _nets):
+                _kw = dict(_route_kw, return_results=False, json_out=None,
+                           net_name_patterns=list(_nets),
+                           rip_existing_nets=None, force_reroute=False)
+                _unbox_reroute(_tin, _tout, list(_nets), _kw)
+            print("\nOpen-pad unboxing (end of run):")
+            _freed = unbox_open_pads(
+                args.output_file, _scope_unbox, _reroute_unbox,
+                clearance=getattr(args, 'clearance', None) or 0.1,
+                width=getattr(args, 'track_width', None) or 0.15,
+                hole_to_hole=getattr(args, 'hole_to_hole_clearance', None) or 0.2,
+                edge=getattr(args, 'board_edge_clearance', None) or 0.0,
+                keep_input=_keep_in)
+            print(f"  Open-pad unboxing: freed {_freed} pad(s)")
+        _b_unbox = _pk_unbox(args.output_file)
+        _sc_ids = {nid for nid, n in _b_unbox.nets.items()
+                   if n.name in _scope_unbox}
+        _still_open = open_pads(_b_unbox, _sc_ids)
+        _name_unbox = {nid: n.name for nid, n in _b_unbox.nets.items()}
+        print(f"COMPLETION: {len(_still_open)} pad(s) off their net"
+              + (": " + ", ".join(f"{_name_unbox[n]}@({x:.2f},{y:.2f})"
+                                  for n, (x, y) in _still_open)
+                 if _still_open else " -- every routed net is complete"))
 
     # Castellated landings (run-6 fix 1.7): pull track ends that landed inside
     # a castellated pad's edge-clearance zone back to the pad's inner reach.
@@ -12161,4 +12238,8 @@ For differential pair routing, use route_diff.py:
     _rc857 = finish_design_rules(args, 0, print_line=False)
     if _rc857:
         sys.exit(_rc857)
+    if args.require_complete and _still_open:
+        print(f"INCOMPLETE: {len(_still_open)} pad(s) off their net "
+              f"(--require-complete)")
+        sys.exit(4)
 

@@ -835,6 +835,10 @@ ROUTE_CLI_ONLY = {
                        "the recorded path is the recording host's",
     '--write-fill': "fills zones in the OUTPUT FILE for delivery (#910); the "
                     "GUI edits a live board KiCad fills itself",
+    '--require-complete': "a harness EXIT-CODE flag (exit 4 when the written "
+                          "board has a pad off its net); changes no copper",
+    '--no-unbox': "skips route.py's end-of-run open-pad unboxing, a pass on "
+                  "the written FILE that the GUI does not run yet",
     '--enable-used-layers': "adds used layers back to the output FILE's "
                             "(layers) table; changes no copper",
     # A placement review's first round or the seed judge (the placement

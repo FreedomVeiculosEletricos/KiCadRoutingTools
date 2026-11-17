@@ -1024,6 +1024,8 @@ See [Rip-Up and Reroute](rip-up-reroute.md) for how failed routes trigger rip-up
 | `--schematic-dir` | - | Directory of `.kicad_sch` files to update with the pad swaps made (default: no schematic update) |
 | `--smoothing` / `--no-smoothing` | on | `route.py`: collapse grid-A* staircase micro-jogs into octolinear shortcuts (#536). `KICAD_SMOOTH_ROUTE=0/1` overrides either way |
 | `--keep-input-copper` | off | Treat the input file's own copper as read-only in the post-route cleanup: no pass removes or rewrites it, only this run's copper, including stubs of nets this run failed to route. For chains whose earlier steps author copper (fanout stubs, hand routes) a later step must see verbatim. Off: dead input stubs on in-scope nets are swept (#84) |
+| `--require-complete` | off | Exit with status 4 when the written board still has a pad off its net after the open-pad unboxing pass (`COMPLETION:` line). The board is written either way |
+| `--no-unbox` | off | Skip the end-of-run open-pad unboxing pass (`open_pad_unbox.py`): other nets' tracks boxing an open pad come off a copy of the board, those nets are rerouted, and the copy ships only when it frees pads with no net losing one and no more DRC findings |
 
 The options above are on both `route.py` and `route_diff.py` unless marked.
 

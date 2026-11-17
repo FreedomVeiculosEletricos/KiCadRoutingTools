@@ -376,6 +376,8 @@ REFUSAL_SITES = {
         'call:finish_design_rules':
             ('after the run', '--strict-sizes: exit 3 after routing'),
         'if _rc857': ('after the run', '--strict-sizes: exit 3 after routing'),
+        'if args.require_complete and _still_open':
+            ('after the run', '--require-complete: exit 4, a pad off its net'),
         'call:load_net_clearances': ('file', '_net_clearances_unreadable'),
     },
     'route_diff.py': {
