@@ -608,6 +608,10 @@ ships, after the plane finalize and the reconciliation have laid their copper
 (#1063). `KICAD_BOARD_LEDGER=1` checks, per net, that the copper in memory and
 the copper the writer produces are identical.
 
+`_late_stacked_dedup162` removes exact same-net copies and, since a reroute
+can land on its own tie or tap, a segment lying wholly on a longer same-net
+track of the same layer, no wider, that nothing meets off the track's ends.
+
 ## Visualizing the Search
 
 The interactive PyGame visualizer was removed in #569: the debugging workflow it predated (grade with `check_drc`/`check_connected`, replay a recorded chain from its `redo_commands.sh` manifest, read the per-net JSON summary and blocker report, or step a board in the GUI plugin) covers the same questions without a second rendering path to keep in sync with the engine.
