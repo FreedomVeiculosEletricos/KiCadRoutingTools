@@ -645,6 +645,15 @@ one pad to one via or junction are parallel copper: the one rebuilt first
 replaces the others. A track whose copper only touches the pad's side is
 reported, not rebuilt.
 
+Then `_late_move_exit_vias` takes the exits still left without room: a
+through via of another net near the pad, whose removal lets the exit rebuild,
+is moved to the nearest grid point (up to `MOVE_VIA_MAX_MM`) where it clears
+everything, its tracks re-laid to the new centre clear, the exit rebuilds
+clean and neither net grades worse in connectivity, soft joints or KiCad
+dangling ends (`move_vias_blocking_pad_exits`). The via, its tracks and the
+exit are one change, applied apart from the per-net A/B choice above.
+
+The per-net A/B choice mixes two boards that were each gated against their
 own copper only. `_late_merge_clears` checks the merge: a new segment that
 cleared in its own candidate but not against the merged board sends the B net
 it meets back to A, until the merge clears (all-A is the plain pass). Without

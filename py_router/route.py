@@ -2271,6 +2271,130 @@ def _late_pad_exits(pcb_data, output_file, return_results, results_data,
         return 0, 0
 
 
+def _late_move_exit_vias(pcb_data, output_file, return_results, results_data,
+                         write_model, input_signature, scope_names,
+                         keep_input_copper, config=None):
+    """Move a via of another net that leaves an SMD pad exit no room
+    (pcb_modification.move_vias_blocking_pad_exits), on the board this run
+    SHIPS, after _late_pad_exits: the exits the end-of-run rebuild left as
+    routed for want of room. The via, its re-laid tracks and the rebuilt exit
+    are one change -- all or nothing -- so it runs apart from that pass's
+    per-net A/B choice, which could keep one net's half of it alone.
+
+    Same plumbing as _late_dangling_via_sweep1166: the written file on the
+    CLI, the write model on the GUI; input copper told by VALUE and
+    read-only under --keep-input-copper; protected / coupled / impedance /
+    length-graded nets (pad_exit_skip_net_ids) neither move a via nor have
+    theirs moved. Returns the number of vias moved."""
+    import copy as _copy
+    from collections import Counter
+    from improvement_gate import copper_item_key
+    from pcb_modification import move_vias_blocking_pad_exits
+    from cleanup_pipeline import pad_exit_skip_net_ids
+    try:
+        rd = None
+        if return_results:
+            rd = results_data if results_data is not None else {}
+            board = _copy.copy(pcb_data)
+            if write_model is not None:
+                segs_by_net, vias_by_net = write_model(rd)
+                board.segments = [x for _l in segs_by_net.values() for x in _l]
+                board.vias = [x for _l in vias_by_net.values() for x in _l]
+            else:
+                board.segments = list(pcb_data.segments)
+                board.vias = list(pcb_data.vias)
+        elif output_file and os.path.isfile(output_file):
+            from kicad_parser import parse_kicad_pcb as _pkmv
+            board = _pkmv(output_file)
+            if getattr(pcb_data, '_net_keepouts', None):
+                board._net_keepouts = list(pcb_data._net_keepouts)
+        else:
+            return 0
+        name_of = {nid: n.name for nid, n in board.nets.items()}
+        scope = {nid for nid, nm in name_of.items() if nm in set(scope_names or ())}
+        if not scope:
+            return 0
+        left = {n: Counter(c) for n, c in (input_signature or {}).items()}
+        owned, protected = set(), set()
+        for item in list(board.segments) + list(board.vias):
+            c = left.get(name_of.get(item.net_id))
+            k = copper_item_key(item)
+            if c and c[k] > 0:
+                c[k] -= 1                   # input copper
+                if keep_input_copper:
+                    protected.add(id(item))
+            else:
+                owned.add(id(item))
+        cfg = _declared_floor_config(config, pcb_data)
+        skip = pad_exit_skip_net_ids(board, config)
+        before_s = list(board.segments)
+        before_v = list(board.vias)
+        stats = {}
+        rem_s, add_s, rem_v, add_v = move_vias_blocking_pad_exits(
+            board, scope, cfg, editable=lambda x: id(x) not in protected,
+            skip_net_ids=skip, stats=stats)
+        if not (rem_v or rem_s or add_s):
+            if stats.get('exits_blocked'):
+                print(f"  Pad exits (end of run): {stats['exits_blocked']} exit(s) "
+                      f"without room, no via move frees one")
+            return 0
+        gone = {id(x) for x in rem_s + rem_v}
+        if return_results:
+            for r in rd.get('results') or []:
+                for key in ('new_segments', 'new_vias'):
+                    if r.get(key):
+                        r[key] = [x for x in r[key] if id(x) not in gone]
+            for key in ('all_swap_segments', 'all_swap_vias'):
+                if rd.get(key):
+                    rd[key] = [x for x in rd[key] if id(x) not in gone]
+            rd.setdefault('segments_to_remove', []).extend(
+                x for x in rem_s if id(x) not in owned)
+            rd.setdefault('vias_to_remove', []).extend(
+                x for x in rem_v if id(x) not in owned)
+            rd.setdefault('results', []).append({
+                'new_segments': list(add_s), 'new_vias': list(add_v),
+                'cleanup': 'pad_exit_via_move'})
+            pcb_data.segments = [x for x in pcb_data.segments
+                                 if id(x) not in gone] + list(add_s)
+            pcb_data.vias = [x for x in pcb_data.vias
+                             if id(x) not in gone] + list(add_v)
+            bump_copper_epoch(pcb_data)
+        else:
+            n_s, n_v = _strip_written_copper(output_file, rem_s, rem_v, name_of)
+            if (n_s, n_v) != (len(rem_s), len(rem_v)):
+                print(f"  WARNING: pad-exit via moves: chose {len(rem_s)} "
+                      f"segment(s) and {len(rem_v)} via(s) to replace, found "
+                      f"{n_s} and {n_v} in the written file")
+            from kicad_parser import board_uses_name_nets
+            from kicad_writer import generate_segment_sexpr, generate_via_sexpr
+            with open(output_file, 'r', encoding='utf-8') as _f:
+                _content = _f.read()
+            _v10 = board_uses_name_nets(_content)
+            _sx = [generate_segment_sexpr(
+                (w.start_x, w.start_y), (w.end_x, w.end_y), w.width, w.layer,
+                w.net_id, name_of.get(w.net_id) if _v10 else None)
+                for w in add_s]
+            _sx += [generate_via_sexpr(
+                v.x, v.y, v.size, v.drill, list(v.layers), v.net_id,
+                free=getattr(v, 'free', False),
+                net_name=name_of.get(v.net_id) if _v10 else None,
+                tenting_attrs=getattr(v, 'tenting_attrs', None) or None,
+                via_type=getattr(v, 'via_type', None)) for v in add_v]
+            _lp = _content.rfind(')')
+            _content = _content[:_lp] + '\n'.join(_sx) + '\n' + _content[_lp:]
+            with open(output_file, 'w', encoding='utf-8') as _f:
+                _f.write(_content)
+        moved = len(add_v)
+        print(f"  Pad exits (end of run): moved {moved} via(s) of other nets "
+              f"so {moved} exit(s) leave straight"
+              + (f"; {stats['no_via_move_fits']} exit(s) still without room"
+                 if stats.get('no_via_move_fits') else ""))
+        return moved
+    except Exception as _e:                                     # noqa: BLE001
+        print(f"  (end-of-run pad-exit via moves skipped: {type(_e).__name__}: {_e})")
+        return 0
+
+
 def _late_dangling_via_sweep1166(pcb_data, output_file, return_results,
                                  results_data, write_model, input_signature,
                                  scope_names, keep_input_copper):
@@ -4558,6 +4682,9 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                 _late_pad_exits(pcb_data, output_file, as_gui, rd, None,
                                 _input_sig1069, _scope1166, keep_input_copper,
                                 config)
+                _late_move_exit_vias(pcb_data, output_file, as_gui, rd, None,
+                                     _input_sig1069, _scope1166,
+                                     keep_input_copper, config)
             _moved = []
             if _sk:
                 from check_drc import skew_moved_out_of_range as _smo1798
@@ -10195,6 +10322,11 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     if (final_reconcile and not skip_routing and not _ckpt_stop
             and quick < 2 and not env_knobs.NO_SOFT_JOINT_BRIDGE):
         _late_pad_exits(
+            pcb_data, output_file, return_results,
+            locals().get('results_data'), _gui_write_model, _input_sig1069,
+            {pcb_data.nets[_n].name for _n in sweep_scope_ids
+             if _n in pcb_data.nets}, keep_input_copper, config)
+        _late_move_exit_vias(
             pcb_data, output_file, return_results,
             locals().get('results_data'), _gui_write_model, _input_sig1069,
             {pcb_data.nets[_n].name for _n in sweep_scope_ids

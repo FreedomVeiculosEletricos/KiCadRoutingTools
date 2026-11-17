@@ -18,7 +18,8 @@ sys.path.insert(0, os.path.join(ROOT, 'py_router'))
 sys.path.insert(0, os.path.join(ROOT, 'py_tools'))
 
 from kicad_parser import parse_kicad_pcb  # noqa: E402
-from pcb_modification import rebuild_pad_exits, smd_exit_violations  # noqa: E402
+from pcb_modification import (rebuild_pad_exits, smd_exit_violations,  # noqa: E402
+                              move_vias_blocking_pad_exits)
 from check_weird import check_weird  # noqa: E402
 from check_connected import check_net_connectivity  # noqa: E402
 import pad_entry  # noqa: E402
@@ -383,6 +384,33 @@ def test_parallel_runs_to_one_via_leave_one_exit():
     print("PASS parallel runs to one via -> one exit left")
 
 
+def test_via_blocking_the_only_exit_is_moved():
+    """Net 2 fences A on three sides; its via, 0.25 mm off A's right exit
+    point, blocks the fourth. The end-of-run rebuild leaves the exit as
+    routed; moving the via down its own track lets it rebuild straight."""
+    fence = ([(12.0, 11.3), (9.1, 11.3), (9.1, 8.7), (12.0, 8.7)], 0.1, 2)
+    run = ([(10.3, 10.5), (10.7, 10.9), (13.0, 10.9), (14.0, 10.0),
+            (20.0, 10.0)], W, 1)
+    tail = ([(11.0, 10.0), (11.0, 9.2), (12.0, 9.2)], W, 2)
+    stats = {}
+    rebuild_pad_exits([], _board([fence, run, tail], vias=[(11.0, 10.0, 2)]),
+                      {1}, _cfg(), final=True, stats=stats)
+    assert stats.get('no_clear_exit') == 1, stats
+    pcb = _board([fence, run, tail], vias=[(11.0, 10.0, 2)])
+    cfg = _cfg()
+    cfg.grid_step = 0.05
+    stats = {}
+    _rs, added, gone_v, new_v = move_vias_blocking_pad_exits(pcb, {1}, cfg,
+                                                             stats=stats)
+    assert stats.get('vias_moved') == 1, stats
+    assert [(v.x, v.y) for v in gone_v] == [(11.0, 10.0)]
+    assert [(v.x, v.y) for v in new_v] == [(11.0, 9.45)], new_v
+    assert _rules(pcb) == [] and _connected(pcb)
+    assert any((x.end_x, x.end_y) == (11.0, 9.45) or (x.start_x, x.start_y) == (11.0, 9.45)
+               for x in pcb.segments if x.net_id == 2), "net 2's track reaches the via"
+    print("PASS via blocking the only exit -> moved down its track, exit rebuilt")
+
+
 TESTS = [test_straight_exit_is_clean, test_off_axis_inside_the_pad_is_rebuilt,
          test_corner_exit_is_flagged_and_rebuilt,
          test_bend_on_the_edge_is_flagged_and_rebuilt,
@@ -395,7 +423,8 @@ TESTS = [test_straight_exit_is_clean, test_off_axis_inside_the_pad_is_rebuilt,
          test_junction_inside_the_pad_is_graded_and_rebuilt,
          test_track_through_the_pad_is_split_and_rebuilt,
          test_track_grazing_the_side_is_flagged,
-         test_parallel_runs_to_one_via_leave_one_exit]
+         test_parallel_runs_to_one_via_leave_one_exit,
+         test_via_blocking_the_only_exit_is_moved]
 
 if __name__ == "__main__":
     for t in TESTS:

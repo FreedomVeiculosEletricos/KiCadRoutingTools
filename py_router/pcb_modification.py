@@ -7089,6 +7089,333 @@ def rebuild_pad_exits(results, pcb_data: PCBData, scope_net_ids, config,
     return rebuilt, strip, added
 
 
+#: End-of-run pad exits: how far (mm) a foreign via blocking an SMD pad's
+#: exit may be moved so the exit fits (move_vias_blocking_pad_exits).
+MOVE_VIA_MAX_MM = 1.0
+#: How many positions that pass the cheap checks are tried in full per via.
+MOVE_VIA_MAX_TRIALS = 6
+#: A track of a moved via longer than this (mm) keeps its far part: only its
+#: last MOVE_VIA_REJOIN_MM is re-laid to the new centre.
+MOVE_VIA_REJOIN_MM = 0.5
+#: How many positions passing the cheap checks are ranked per via.
+MOVE_VIA_MAX_SPOTS = 60
+
+
+def _rejoin_cost(new, old):
+    """Bends plus legs shorter than their width, of the tracks ``new`` minus
+    those of ``old`` (a moved via's tracks before and after)."""
+    def cost(segs):
+        from collections import defaultdict
+        n = sum(1 for x in segs if math.hypot(x.end_x - x.start_x,
+                                                x.end_y - x.start_y) < x.width)
+        ends = defaultdict(list)
+        for x in segs:
+            ends[(x.layer, round(x.start_x, 4), round(x.start_y, 4))].append(
+                (x.end_x - x.start_x, x.end_y - x.start_y))
+            ends[(x.layer, round(x.end_x, 4), round(x.end_y, 4))].append(
+                (x.start_x - x.end_x, x.start_y - x.end_y))
+        for d in ends.values():
+            if len(d) == 2:
+                (ax, ay), (bx, by) = d
+                la, lb = math.hypot(ax, ay), math.hypot(bx, by)
+                if la > 1e-9 and lb > 1e-9 and \
+                        (ax * bx + ay * by) / (la * lb) > -0.9999:
+                    n += 1
+        return n
+    return cost(new) - cost(old)
+
+
+def move_vias_blocking_pad_exits(pcb_data: PCBData, scope_net_ids, config,
+                                 editable=None, skip_net_ids=None,
+                                 stats=None, max_shift: float = MOVE_VIA_MAX_MM):
+    """Move a via of another net out of the way of an SMD pad exit that
+    rebuild_pad_exits (final) left as routed for want of room -- Altium's
+    "push" of a fanout via, done after routing: a through via near the pad
+    whose removal lets the exit rebuild is moved to the nearest grid point
+    (within ``max_shift``) where
+
+    - the via clears every foreign object (_copper_clearance_gates, the via
+      as a point of its diameter on every copper layer), every other drill at
+      the hole-to-hole rule, and overlaps no SMD pad of its own net;
+    - each track of the via's net ending on it is re-laid from its far end
+      to the new centre (straight when octolinear, else one 45-degree elbow)
+      and clears;
+    - the exit then rebuilds clean (rebuild_pad_exits final, on this pad's
+      copper only) against the moved via and its tracks;
+    - neither net loses connectivity nor gains a soft joint or a KiCad-
+      dangling end.
+
+    All or nothing per via. Only ``editable(item)`` vias and tracks move
+    (default: all); locked, sense, graphic copper never does; nets in
+    ``skip_net_ids`` keep their copper. ``pcb_data``'s segments and vias are
+    updated. Returns (removed_segments, added_segments, removed_vias,
+    added_vias); ``stats`` counts the moves and what was left, by reason."""
+    import copy as _copy
+    from check_connected import check_net_connectivity
+    from pad_entry import (pad_depth, smd_gradable, exit_distance, is_smd)
+    skip = set(skip_net_ids or ())
+    to_corner = getattr(config, 'smd_to_corner', None)
+    h2h = getattr(config, 'hole_to_hole_clearance', 0.0) or 0.0
+    grid = getattr(config, 'grid_step', 0.05) or 0.05
+    copper = list(getattr(getattr(pcb_data, 'board_info', None),
+                          'copper_layers', None) or ['F.Cu', 'B.Cu'])
+    st = stats if stats is not None else {}
+
+    def bump(k):
+        st[k] = st.get(k, 0) + 1
+
+    def frozen(x):
+        return (getattr(x, 'graphic', False) or getattr(x, 'locked', False)
+                or is_immutable_copper(x) or _sense_copper(x)
+                or (editable is not None and not editable(x)))
+
+    def board_with(segs, vias):
+        b = _copy.copy(pcb_data)
+        b.segments = list(segs)
+        b.vias = list(vias)
+        for _a in ('_foreign_seg_arr_cache', '_foreign_via_arr_cache',
+                   '_foreign_pad_arr_cache'):
+            if getattr(b, _a, None) is not None:
+                setattr(b, _a, None)
+        return b
+
+    def gates_of(b):
+        g = _copper_clearance_gates(
+            b, getattr(config, 'clearance', 0.1),
+            getattr(config, 'net_clearances', None) or None,
+            getattr(config, 'board_edge_clearance', 0.0) or 0.0, config)
+        from check_drc import filled_graphic_shapes
+        fills = filled_graphic_shapes(b)
+        clr = getattr(config, 'clearance', 0.1)
+        base = g.clears
+        return (lambda x1, y1, x2, y2, layer, nid, w:
+                base(x1, y1, x2, y2, layer, nid, w)
+                and _filled_graphics_clear(fills, x1, y1, x2, y2, layer,
+                                           nid, w, clr))
+
+    drills = [(v, v.x, v.y, (getattr(v, 'drill', 0) or 0) / 2.0)
+              for v in pcb_data.vias if (getattr(v, 'drill', 0) or 0) > 0]
+    try:
+        from kicad_parser import pad_drill_circles
+        for fp in pcb_data.footprints.values():
+            for p in fp.pads:
+                if (p.drill or 0) > 0:
+                    for hx, hy, hd in pad_drill_circles(p):
+                        drills.append((p, hx, hy, hd / 2.0))
+    except Exception:                                    # noqa: BLE001
+        pass
+
+    def holes_clear(v, x, y):
+        r = (getattr(v, 'drill', 0) or 0) / 2.0
+        return all(math.hypot(x - hx, y - hy) >= r + hr + h2h - 1e-4
+                   for o, hx, hy, hr in drills if o is not v)
+
+    def failing_here(b, pad):
+        """This pad's exits that still fail, as (rules, chain seg ids)."""
+        nid = pad.net_id
+        segs = [s for s in b.segments if s.net_id == nid]
+        vias = [v for v in b.vias if v.net_id == nid]
+        out = []
+        for it in smd_exit_violations(segs, vias, pcb_data.pads_by_net.get(nid, []),
+                                      nid, in_pad=True, clean=True,
+                                      to_corner=to_corner, through=True):
+            if it[2] is pad:
+                out.append((it[6], it[5], {id(c) for c in it[4]}))
+        return out
+
+    def rebuild_here(b, pad):
+        """Rebuild this pad's exits on ``b``; True when none fails after."""
+        own = set()
+        for _r, _why, ids in failing_here(b, pad):
+            own |= ids
+        rebuild_pad_exits([], b, {pad.net_id}, config,
+                          editable=lambda c: id(c) in own, final=True,
+                          stats={})
+        return not any(r for r, why, _ids in failing_here(b, pad)
+                       if why != 'graze')
+
+    def net_state(b, nid):
+        segs = [s for s in b.segments if s.net_id == nid]
+        vias = [v for v in b.vias if v.net_id == nid]
+        pads = pcb_data.pads_by_net.get(nid, [])
+        c = check_net_connectivity(nid, segs, vias, pads, [])
+        return (len(c.get('disconnected_pads') or []),
+                c.get('num_components') or 1,
+                len(_soft_joint_pairs(segs, vias, pads)),
+                _kicad_dangling_count(segs, vias, pads, copper))
+
+    def no_worse(b, nid):
+        a, z = net_state(pcb_data, nid), net_state(b, nid)
+        return all(y <= x for x, y in zip(a, z))
+
+    def rejoin(b, gate, v, P, attached):
+        """Each attached track re-laid to P, or None: from its far end when
+        it is short, else from the point MOVE_VIA_REJOIN_MM along it from
+        the via (the rest of it kept); straight when octolinear, else one
+        45-degree elbow. A track lying wholly in the old barrel is dropped."""
+        new = []
+        net_segs = [s for s in b.segments if s.net_id == v.net_id]
+        skip_ids = {id(s) for s in attached}
+        r = v.size / 2.0 + 1e-6
+        for s in attached:
+            da = math.hypot(s.start_x - v.x, s.start_y - v.y)
+            db = math.hypot(s.end_x - v.x, s.end_y - v.y)
+            if da <= r and db <= r:
+                continue                      # inside the old barrel
+            if da <= db:
+                E, F = (s.start_x, s.start_y), (s.end_x, s.end_y)
+            else:
+                E, F = (s.end_x, s.end_y), (s.start_x, s.start_y)
+            L = math.hypot(F[0] - E[0], F[1] - E[1])
+            if L > MOVE_VIA_REJOIN_MM + 1e-6:
+                t = MOVE_VIA_REJOIN_MM / L
+                Q = (round(E[0] + (F[0] - E[0]) * t, 4),
+                     round(E[1] + (F[1] - E[1]) * t, 4))
+            else:
+                Q = F
+            # P on the track's own line, past F: the track just ends there
+            fx, fy = E[0] - F[0], E[1] - F[1]
+            px, py = P[0] - F[0], P[1] - F[1]
+            options = [[F, P]] if (abs(fx * py - fy * px) <= 1e-6 * max(L, 1e-9)
+                                   and fx * px + fy * py > 0) else []
+            options += [([F] if Q is not F else []) + [Q] + list(mids) + [P]
+                        for mids in _octolinear_bends(Q, P)]
+            path = None
+            for cand in options:
+                cand = [p for k, p in enumerate(cand) if k == 0 or math.hypot(
+                    p[0] - cand[k - 1][0], p[1] - cand[k - 1][1]) > 1e-6]
+                # no bend sharper than 90 degrees along the new run
+                if any((cand[k][0] - cand[k - 1][0]) * (cand[k + 1][0] - cand[k][0])
+                       + (cand[k][1] - cand[k - 1][1]) * (cand[k + 1][1] - cand[k][1])
+                       < -1e-9
+                       for k in range(1, len(cand) - 1)):
+                    continue
+                if not all(gate(*cand[k], *cand[k + 1], s.layer, v.net_id, s.width)
+                           for k in range(len(cand) - 1)):
+                    continue
+                if _creates_acute(cand, s.layer, net_segs, skip_ids=skip_ids):
+                    continue
+                path = cand
+                break
+            if path is None:
+                return None
+            if len(path) < 2:
+                continue
+            new += [Segment(start_x=path[k][0], start_y=path[k][1],
+                            end_x=path[k + 1][0], end_y=path[k + 1][1],
+                            width=s.width, layer=s.layer, net_id=v.net_id)
+                    for k in range(len(path) - 1)]
+        return new
+
+    removed_s, added_s, removed_v, added_v = [], [], [], []
+    nets = sorted(n for n in (scope_net_ids or ()) if n not in skip)
+    for nid in nets:
+        for pad in list(pcb_data.pads_by_net.get(nid, [])):
+            if not is_smd(pad):
+                continue
+            if not any(r and why != 'graze'
+                       for r, why, _ in failing_here(pcb_data, pad)):
+                continue
+            if rebuild_here(board_with(pcb_data.segments, pcb_data.vias), pad):
+                continue        # the exit rebuilds as it is: not this pass's
+            bump('exits_blocked')
+            reach = (max(pad.size_x, pad.size_y) / 2.0
+                     + exit_distance(getattr(config, 'track_width', 0.15),
+                                     to_corner)
+                     + EXIT_ALIGN_REACH_MM + 0.5)
+            cands = sorted(
+                (v for v in pcb_data.vias
+                 if v.net_id != nid and v.net_id not in skip
+                 and getattr(v, 'via_type', None) in (None, '', 'through')
+                 and not frozen(v)
+                 and math.hypot(v.x - pad.global_x, v.y - pad.global_y)
+                 <= reach + v.size / 2.0),
+                key=lambda v: math.hypot(v.x - pad.global_x, v.y - pad.global_y))
+            moved = False
+            for v in cands:
+                attached = [s for s in pcb_data.segments if s.net_id == v.net_id
+                            and min(math.hypot(s.start_x - v.x, s.start_y - v.y),
+                                    math.hypot(s.end_x - v.x, s.end_y - v.y))
+                            <= v.size / 2.0 + 1e-6]
+                if any(frozen(s) for s in attached) or len(attached) > 6:
+                    continue
+                att_ids = {id(s) for s in attached}
+                rest_s = [s for s in pcb_data.segments if id(s) not in att_ids]
+                rest_v = [x for x in pcb_data.vias if x is not v]
+                # does the exit fit with the via (and its tracks) gone?
+                b0 = board_with(rest_s, rest_v)
+                if not rebuild_here(b0, pad):
+                    continue
+                # where the via may go: clear of everything, the new exit too
+                gate0 = gates_of(b0)
+                n = int(max_shift / grid + 1e-9)
+                spots = sorted(
+                    ((round(v.x + i * grid, 4), round(v.y + j * grid, 4))
+                     for i in range(-n, n + 1) for j in range(-n, n + 1)
+                     if (i or j) and math.hypot(i, j) * grid <= max_shift + 1e-9),
+                    key=lambda P: (math.hypot(P[0] - v.x, P[1] - v.y), P))
+                # positions that pass the cheap checks, best first: the
+                # fewest new bends and short legs on the via's tracks, then
+                # the shortest move
+                ok_spots = []
+                for P in spots:
+                    if len(ok_spots) >= MOVE_VIA_MAX_SPOTS:
+                        break
+                    if not all(gate0(P[0], P[1], P[0], P[1], L, v.net_id, v.size)
+                               for L in copper):
+                        continue
+                    if not holes_clear(v, *P):
+                        continue
+                    if any(is_smd(p) and pad_depth(p, *P) > -v.size / 2.0
+                           for p in pcb_data.pads_by_net.get(v.net_id, [])):
+                        continue
+                    joined = rejoin(b0, gate0, v, P, attached)
+                    if joined is None:
+                        continue
+                    ok_spots.append((_rejoin_cost(joined, attached),
+                                     math.hypot(P[0] - v.x, P[1] - v.y), P, joined))
+                ok_spots.sort(key=lambda t: (t[0], t[1], t[2]))
+                for _c, _d, P, joined in ok_spots[:MOVE_VIA_MAX_TRIALS]:
+                    v2 = _copy.copy(v)
+                    v2.x, v2.y = P
+                    if hasattr(v2, 'uuid'):
+                        v2.uuid = ''
+                    b1 = board_with(rest_s + joined, rest_v + [v2])
+                    if not rebuild_here(b1, pad):
+                        continue
+                    if not (no_worse(b1, nid) and no_worse(b1, v.net_id)):
+                        continue
+                    old = {id(s) for s in pcb_data.segments}
+                    now = {id(s) for s in b1.segments}
+                    removed_s += [s for s in pcb_data.segments if id(s) not in now]
+                    added_s += [s for s in b1.segments if id(s) not in old]
+                    removed_v.append(v)
+                    added_v.append(v2)
+                    pcb_data.segments = list(b1.segments)
+                    pcb_data.vias = list(b1.vias)
+                    for _a in ('_foreign_seg_arr_cache', '_foreign_via_arr_cache',
+                               '_foreign_pad_arr_cache'):
+                        if getattr(pcb_data, _a, None) is not None:
+                            setattr(pcb_data, _a, None)
+                    drills[:] = [d for d in drills if d[0] is not v] + [
+                        (v2, v2.x, v2.y, (getattr(v2, 'drill', 0) or 0) / 2.0)]
+                    bump('vias_moved')
+                    moved = True
+                    break
+                if moved:
+                    break
+            if not moved:
+                bump('no_via_move_fits')
+    # a segment both added and later removed is neither
+    gone_new = {id(s) for s in removed_s} & {id(s) for s in added_s}
+    removed_s = [s for s in removed_s if id(s) not in gone_new]
+    added_s = [s for s in added_s if id(s) not in gone_new]
+    gone_v = {id(v) for v in removed_v} & {id(v) for v in added_v}
+    removed_v = [v for v in removed_v if id(v) not in gone_v]
+    added_v = [v for v in added_v if id(v) not in gone_v]
+    return removed_s, added_s, removed_v, added_v
+
+
 def fix_acute_corners(results, pcb_data: PCBData, scope_net_ids, config,
                       min_angle=None, editable=None, skip_net_ids=None,
                       stats=None):
