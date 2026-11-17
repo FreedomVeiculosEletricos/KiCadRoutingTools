@@ -676,6 +676,18 @@ strip between the pin row and the exposed pad, or the multipoint pass joined
 two pins round the outside of the row and boxed in the pin between them.
 
 After the CLI run writes its board, `open_pad_unbox.unbox_open_pads` takes the
+pads still off their net. For each, the other nets' branches that pass too
+close to it for a track to fit between (each extended along its net to the
+next pad, via or junction) come off a copy of the board, and the open pad's
+net and theirs are routed again on it with the run's own options. The copy
+ships when, on the whole board, fewer pads are open, no net lost a pad and
+check_drc finds no more of any kind; otherwise the board stays as it was. It
+frees what the rip-up ladder cannot: the plane repair never rips a plane net,
+and the reconciliation does not rip copper the run itself routed.
+`--no-unbox` skips it. Then the run prints `COMPLETION:` with the pads still
+open, and `--require-complete` exits with status 4 when there are any. The
+GUI plugin does not run this pass yet.
+
 ## Visualizing the Search
 
 The interactive PyGame visualizer was removed in #569: the debugging workflow it predated (grade with `check_drc`/`check_connected`, replay a recorded chain from its `redo_commands.sh` manifest, read the per-net JSON summary and blocker report, or step a board in the GUI plugin) covers the same questions without a second rendering path to keep in sync with the engine.
