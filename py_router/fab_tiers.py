@@ -256,6 +256,14 @@ def get_escalation_policy():
     return (_ESCALATION, floors)
 
 
+def project_writeback_allowed(policy, requested=True):
+    """Whether a run under ``policy`` may write DRC floors back to its
+    project: as ``requested``, but never under ``--escalation off``, which
+    promises the project's rules -- lowering them to what the board holds
+    would grade an object below them clean."""
+    return bool(requested) and (policy or DEFAULT_ESCALATION) != 'off'
+
+
 def project_writeback():
     """True when this run's DRC-floor writeback will run (the default), False
     under ``--no-fix-drc-settings`` or the GUI's box unticked (#1775)."""
@@ -1529,7 +1537,9 @@ def add_fab_tier_args(parser, *, include_escalation=True):
                  f"(default {DEFAULT_ESCALATION}). 'off': never -- sizes and clearances are exact, "
                  "a net that cannot complete at them fails and is reported (a wide "
                  "power/impedance net may still neck for at most "
-                 f"{defaults.PAD_ENTRY_NECK_MM:g} mm of path at a pad entry). 'board': "
+                 f"{defaults.PAD_ENTRY_NECK_MM:g} mm of path at a pad entry), and the "
+                 "project's DRC rules ship as declared (implies "
+                 "--no-fix-drc-settings). 'board': "
                  "down to the board's own declared floors (Board Setup rules.min_*; "
                  "an unset key falls back to the fab tier floor, an unset "
                  "min_clearance to the Default class). That is what KiCad's DRC "
@@ -1596,7 +1606,8 @@ def set_fab_tier_from_config(config):
     else:
         floors = drop_stale_board_floors(declared, requested)
     set_escalation_policy(policy, floors,
-                          writeback=bool(config.get('fix_drc_settings', True)))
+                          writeback=project_writeback_allowed(
+                              policy, config.get('fix_drc_settings', True)))
 
 
 def fab_tier_from_args(args):
@@ -1700,6 +1711,14 @@ def set_policy_from_args(args, pcb_path=None):
             graded = None
             rules = {}
     policy = getattr(args, 'escalation', None) or DEFAULT_ESCALATION
+    if policy == 'off' and not getattr(args, 'no_fix_drc_settings', False):
+        # --escalation off promises the project's rules: the writeback would
+        # lower them to the smallest object on the board -- an input pad
+        # drill under the project's hole floor included -- and KiCad's DRC
+        # would then grade that object clean. The project ships as declared.
+        args.no_fix_drc_settings = True
+        print("  --escalation off: the project's DRC rules ship as declared "
+              "(no floor is lowered to the board; implies --no-fix-drc-settings)")
     writeback = not getattr(args, 'no_fix_drc_settings', False)
     floors = board_policy_floors(
         policy, floors, {k: getattr(args, k, None) for k in _REQUEST_FLOOR_KEY},
