@@ -235,8 +235,15 @@ def iter_pad_blocked_cells(
     # +1 cell so the bbox still covers the region once shifted by the sub-cell offset.
     expand_x = int(math.ceil((gext_x + margin + corner_buffer) / grid_step)) + 1
     expand_y = int(math.ceil((gext_y + margin + corner_buffer) / grid_step)) + 1
-    margin_sq = margin * margin
-    buffered_margin_sq = (margin + corner_buffer) * (margin + corner_buffer)
+    # A cell exactly on the keep-out boundary is OPEN (GRID_TIE_EPS, #816):
+    # the gap there is exactly the clearance, which DRC passes. The relative
+    # frame made this rasterizer position-independent, but its ties still
+    # resolved by the last bit of margin vs cell offset -- e.g. 0.2/2 + 0.2 =
+    # 0.30000000000000004 -- and blocked a pad centre that sits exactly the
+    # clearance from its neighbour (a resistor array's end pad).
+    margin_sq = (margin - GRID_TIE_EPS) * (margin - GRID_TIE_EPS)
+    buffered_margin_sq = ((margin + corner_buffer - GRID_TIE_EPS)
+                          * (margin + corner_buffer - GRID_TIE_EPS))
 
     # Inner rectangle bounds (where corners start)
     # For rectangular pads (corner_radius=0), define corner region with a threshold
@@ -339,8 +346,9 @@ def pad_blocked_cells_array(
     # sub-cell offset.
     expand_x = int(math.ceil((gext_x + margin + corner_buffer) / grid_step)) + 1
     expand_y = int(math.ceil((gext_y + margin + corner_buffer) / grid_step)) + 1
-    margin_sq = margin * margin
-    buffered_margin_sq = (margin + corner_buffer) * (margin + corner_buffer)
+    margin_sq = (margin - GRID_TIE_EPS) * (margin - GRID_TIE_EPS)   # tie -> OPEN
+    buffered_margin_sq = ((margin + corner_buffer - GRID_TIE_EPS)
+                          * (margin + corner_buffer - GRID_TIE_EPS))
 
     corner_threshold = grid_step / 2 if corner_radius == 0 else 0
     inner_half_w = half_width - corner_radius - corner_threshold

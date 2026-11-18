@@ -123,6 +123,30 @@ def run():
     check("7 custom pad bbox not trusted when anchor exists",
           snap_stub_gaps(r7, pcb7, {5}, Cfg()) == 0)
 
+    # 8. Stub short of a real (rect) pad: the connector lands on the pad
+    #    CENTRE, not the outline -- an end on the outline joins through a
+    #    sliver (a shallow pad entry, pad_entry.py).
+    rpad = SimpleNamespace(global_x=5.0, global_y=0.0, size_x=0.5, size_y=0.5,
+                           layers=['F.Cu'], rotation=0.0, rect_rotation=0.0,
+                           shape='rect', pad_type='smd', net_id=5)
+    pcb8 = _pcb([_seg(5, 0.6, 5, 0.37, net=5)], pads_by_net={5: [rpad]})
+    r8 = []
+    check("8 one connector to the pad", snap_stub_gaps(r8, pcb8, {5}, Cfg()) == 1)
+    c8 = r8[0]['new_segments'][0] if r8 else None
+    check("8 connector lands on the pad centre",
+          c8 is not None and abs(c8.end_x - 5.0) < 1e-6 and abs(c8.end_y) < 1e-6)
+
+    # 9. A track ending AT a same-net via's centre beside a pad: the end is a
+    #    via terminal, already joined -- no connector to the pad's edge.
+    vpad = SimpleNamespace(global_x=5.0, global_y=0.0, size_x=0.5, size_y=0.5,
+                           layers=['F.Cu'], rotation=0.0, rect_rotation=0.0,
+                           shape='rect', pad_type='smd', net_id=5)
+    pcb9 = _pcb([_seg(5, 0.4, 7, 0.4, net=5)], pads_by_net={5: [vpad]})
+    pcb9.vias = [SimpleNamespace(x=5.0, y=0.4, size=0.3, drill=0.15, net_id=5,
+                                 layers=['F.Cu', 'B.Cu'])]
+    r9 = []
+    check("9 an end on a via centre is not snapped", snap_stub_gaps(r9, pcb9, {5}, Cfg()) == 0)
+
     print("=" * 60)
     if fails:
         for f in fails:
@@ -131,8 +155,9 @@ def run():
         return 1
     print("  PASS  snaps a clear small gap (trace + pad), refuses a too-big gap,")
     print("        a connector blocked by another net / a pour / a board cutout,")
-    print("        and doesn't trust a custom pad's bbox (8 cases)")
-    print("\n8/8 checks passed")
+    print("        doesn't trust a custom pad's bbox, lands a pad connector on the")
+    print("        pad centre, and leaves an end on a via centre alone (11 cases)")
+    print("\n11/11 checks passed")
     return 0
 
 

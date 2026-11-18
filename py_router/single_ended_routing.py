@@ -2167,6 +2167,123 @@ def _keepout_clear_cells(cells, gate, net_id, config, layer, coord):
     return out
 
 
+def _seeded_pad_weld(pcb_data, net_id, config, x, y, layer, pad=None):
+    """Where a route ending on a #479 seeded on-pad cell at (x, y) welds.
+
+    The pad centre's cell was blocked, but the map blocks conservatively: a
+    via is stamped out to the next whole cell plus a diagonal margin, so a
+    neighbour's via-in-pad can cover a centre a track there clears by the
+    rule. Measure the last leg exactly instead: the pad centre when the leg
+    to it clears every foreign object (_connector_clear, at the net's width
+    and clearance) and every keep-out forbidding tracks; else the first point
+    on the way that is the track's own width deep in the pad
+    (pad_entry.entry_points); else the cell itself (the #1777 weld). A route
+    welded to the cell edge-on enters the pad shallow -- joined through less
+    copper than the track (pad_entry.py)."""
+    from pad_entry import entry_points, pad_depth
+    if pad is None:
+        for p in pcb_data.pads_by_net.get(net_id, []) or []:
+            if not (layer in p.layers or any('*' in L for L in p.layers)):
+                continue
+            try:
+                if pad_depth(p, x, y) >= 0.0:
+                    pad = p
+                    break
+            except Exception:                                  # noqa: BLE001
+                continue
+    if pad is None:
+        return (x, y)
+    from pcb_modification import _connector_clear
+    w = config.get_net_track_width(net_id, layer)
+    clr = config.obstacle_clearance(net_id)
+    clr = config.layer_clearance(layer, clr, net_id)
+    gate = _keepout_gate(pcb_data)
+    for tx, ty in entry_points(pad, x, y, w):
+        if (_connector_clear(x, y, tx, ty, w, layer, net_id, pcb_data, clr,
+                             net_clearances=getattr(config, 'net_clearances',
+                                                    None) or None)
+                and not _track_refused(gate, net_id, config, layer,
+                                       (x, y), (tx, ty))):
+            return (tx, ty)
+    return (x, y)
+
+
+def _weld_passed_pads(segments, vias, pcb_data, net_id, config):
+    """Land a route on every same-net pad it passes without entering.
+
+    A path can run through or along a pad of its own net on its way to
+    another terminal: the multipoint router then credits the pad as joined
+    by touch, so no edge ends there and no end welds to its centre -- the
+    pad is joined only where the track grazes its edge or passes off its
+    axis (pad_entry.shallow_pad_contacts). For each such pad, split the
+    deepest segment at the point nearest the pad centre and lay a leg from
+    there to the centre, or to the first point the track's own width deep
+    (pad_entry.entry_points), when the leg clears every foreign object
+    exactly (_connector_clear) and no keep-out refuses it -- the check
+    _seeded_pad_weld makes. Without a clear leg the route is left as is.
+    Returns the new segment list."""
+    if pcb_data is None or not segments:
+        return segments
+    from pad_entry import (shallow_pad_contacts, segment_pad_depth,
+                           entry_points)
+    from pcb_modification import _connector_clear, _sense_copper
+    pads = [p for p in pcb_data.pads_by_net.get(net_id, []) or []
+            if not _sense_copper(p)]
+    if not pads:
+        return segments
+    board = [s for s in pcb_data.segments if s.net_id == net_id]
+    net_vias = [v for v in pcb_data.vias if v.net_id == net_id] + list(vias)
+    new_ids = {id(s) for s in segments}
+    out = list(segments)
+    for pad, layer, _d, _need, _pt in shallow_pad_contacts(
+            pads, board + out, net_vias):
+        cands = [(segment_pad_depth(pad, s.start_x, s.start_y,
+                                    s.end_x, s.end_y), s)
+                 for s in out if id(s) in new_ids and s.layer == layer]
+        cands = [c for c in cands if c[0] > -c[1].width / 2.0]
+        if not cands:
+            continue          # the shallow copper is not this route's
+        _, s = max(cands, key=lambda c: c[0])
+        dx, dy = s.end_x - s.start_x, s.end_y - s.start_y
+        L2 = dx * dx + dy * dy
+        t = 0.0 if L2 <= 0 else max(0.0, min(1.0, (
+            (pad.global_x - s.start_x) * dx + (pad.global_y - s.start_y) * dy) / L2))
+        px = round(s.start_x + dx * t, 6)
+        py = round(s.start_y + dy * t, 6)
+        w = s.width
+        clr = config.layer_clearance(layer, config.obstacle_clearance(net_id),
+                                     net_id)
+        gate = _keepout_gate(pcb_data)
+        leg = None
+        for tx, ty in entry_points(pad, px, py, w):
+            if math.hypot(tx - px, ty - py) < 1e-6:
+                continue
+            if (_connector_clear(px, py, tx, ty, w, layer, net_id, pcb_data,
+                                 clr, net_clearances=getattr(
+                                     config, 'net_clearances', None) or None)
+                    and not _track_refused(gate, net_id, config, layer,
+                                           (px, py), (tx, ty))):
+                leg = (tx, ty)
+                break
+        if leg is None:
+            continue
+        i = out.index(s)
+        pieces = []
+        if 1e-6 < t < 1 - 1e-6:
+            pieces = [replace(s, end_x=px, end_y=py, uuid='', end_x_str='',
+                              end_y_str=''),
+                      replace(s, start_x=px, start_y=py, uuid='',
+                              start_x_str='', start_y_str='')]
+        else:
+            pieces = [s]
+        pieces.append(replace(s, start_x=px, start_y=py, end_x=leg[0],
+                              end_y=leg[1], uuid='', start_x_str='',
+                              start_y_str='', end_x_str='', end_y_str=''))
+        out[i:i + 1] = pieces
+        new_ids.update(id(x) for x in pieces)
+    return out
+
+
 def _augment_blocked_pad_terminals(endpoints, pcb_data, net_id, config,
                                    obstacles):
     """#479 (kbic65 stabilizer NPTH): when a PAD endpoint's grid cell is
@@ -2204,9 +2321,14 @@ def _augment_blocked_pad_terminals(endpoints, pcb_data, net_id, config,
                     print(f"    endpoint cell blocked for {pad.component_ref}."
                           f"{pad.pad_number} -- seeded {len(free)} free "
                           f"on-pad cell(s)")
-                    out.extend((cgx, cgy, layer_idx,
-                                cgx * coord.grid_step, cgy * coord.grid_step)
-                               for cgx, cgy in free)
+                    _lyr = config.layers[layer_idx]
+                    for cgx, cgy in free:
+                        # weld to the pad centre (or the required depth)
+                        # when the last leg clears exactly, not edge-on
+                        wx, wy = _seeded_pad_weld(
+                            pcb_data, net_id, config, cgx * coord.grid_step,
+                            cgy * coord.grid_step, _lyr, pad)
+                        out.append((cgx, cgy, layer_idx, wx, wy))
             break
     return out
 
@@ -5762,16 +5884,22 @@ def _route_multipoint_main_impl(
             _start_orig = (_own[0], _own[1], layer_names[path[0][2]])
         elif tuple(path[0]) in _seeded:
             # a #479 seeded on-pad cell: its grid point is on the pad's
-            # copper, so it welds there -- the bridge back to the pad centre
-            # crossed the keep-out that blocked the centre (#1777)
-            _start_orig = (*coord.to_float(path[0][0], path[0][1]),
-                           layer_names[path[0][2]])
+            # copper. It welds to the pad centre (or the required depth) when
+            # the last leg clears exactly, else to the cell itself -- the
+            # bridge back to the centre would cross the keep-out that blocked
+            # it (#1777)
+            _start_orig = (*_seeded_pad_weld(
+                pcb_data, net_id, config,
+                *coord.to_float(path[0][0], path[0][1]),
+                layer_names[path[0][2]]), layer_names[path[0][2]])
         _own = _island_cells.get(pad_components.get(idx_b, idx_b), {}).get(tuple(path[-1]))
         if _own is not None:
             _end_orig = (_own[0], _own[1], layer_names[path[-1][2]])
         elif tuple(path[-1]) in _seeded:
-            _end_orig = (*coord.to_float(path[-1][0], path[-1][1]),
-                         layer_names[path[-1][2]])
+            _end_orig = (*_seeded_pad_weld(
+                pcb_data, net_id, config,
+                *coord.to_float(path[-1][0], path[-1][1]),
+                layer_names[path[-1][2]]), layer_names[path[-1][2]])
     # Barrel-in-fill completion (#562), Phase-1 parity with the tap edges.
     path, _fill_end = _trim_after_fill_via(path, coord, layer_names,
                                            pcb_data, net_id)
@@ -5788,6 +5916,8 @@ def _route_multipoint_main_impl(
     segments = _assign_wide_route_widths(
         segments, config, net_id, obstacles, coord, layer_names,
         track_margin, necked_down, uniform_width, neck_start=True, pcb_data=pcb_data)
+    # A pad the path only passes gets its own leg to the centre.
+    segments = _weld_passed_pads(segments, vias, pcb_data, net_id, config)
     # Re-neck terminal grazes AFTER width assignment (#212): the neckdown/uniform
     # passes above rebuild widths and would otherwise restore a grazing terminal leg
     # to base/power width, undoing the graze-neck applied during conversion.
@@ -6784,6 +6914,8 @@ def _route_multipoint_taps_impl(
         segments = _assign_wide_route_widths(
             segments, config, net_id, obstacles, coord, layer_names,
             track_margin, necked_down, uniform_width, neck_start=False, pcb_data=pcb_data)
+        # A pad the path only passes gets its own leg to the centre.
+        segments = _weld_passed_pads(segments, vias, pcb_data, net_id, config)
         # Re-neck terminal grazes AFTER width assignment (#212): the neckdown/uniform
         # passes rebuild widths and would otherwise restore a grazing terminal leg to
         # base/power width, undoing the graze-neck applied during conversion.

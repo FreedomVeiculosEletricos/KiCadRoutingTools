@@ -12,7 +12,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 
 from kicad_parser import PCBData, Segment, Via, is_immutable_copper
 from routing_utils import pos_key, POSITION_DECIMALS, into_pad_frame_point
-from geometry_utils import point_to_segment_distance, segments_intersect
+from geometry_utils import point_to_segment_distance, segments_intersect, via_on_layer
 
 # Read once at import: both are checked inside per-segment cleanup loops (hot).
 _COLLAPSE_DEBUG = os.environ.get('KICAD_COLLAPSE_DEBUG')
@@ -1330,7 +1330,7 @@ def snap_stub_gaps(results, pcb_data: PCBData, scope_net_ids, config,
                         if g > 1e-4 and _x_crossing(s, o) is not None:
                             continue
                         if best is None or g < best[0]:
-                            best = (g, (fx, fy))
+                            best = (g, (fx, fy), None)
                     # nearest same-net pad on this layer (land on its copper)
                     for pad in net_pads:
                         if _sense_copper(pad):
@@ -1355,49 +1355,80 @@ def snap_stub_gaps(results, pcb_data: PCBData, scope_net_ids, config,
                             continue
                         tp, g = _nearest_pad_point(px, py, pad)
                         if best is None or g < best[0]:
-                            best = (g, tp)
+                            best = (g, tp, pad)
                     # nearest same-net via (vias span layers): land just inside it
                     for v in net_vias:
                         dc = math.hypot(px - v.x, py - v.y)
                         r = getattr(v, 'size', 0.0) / 2
-                        if dc < 1e-9 or _sense_copper(v):
+                        if _sense_copper(v):
+                            continue
+                        if dc < 1e-9:
+                            if via_on_layer(v, lyr):
+                                # An end AT the via centre is a via terminal,
+                                # already joined -- gap 0, as for an end within
+                                # 0.9 r below and an end on a trace (a tee,
+                                # above). Skipping the via as a target sent it
+                                # to the next copper over: a redundant
+                                # connector from the via to the EDGE of a pad
+                                # the track already reached, a shallow pad
+                                # entry (pad_entry.py) once the track went.
+                                best = (0.0, (px, py), None)
+                                break
                             continue
                         ux, uy = (v.x - px) / dc, (v.y - py) / dc
                         tp = (px + ux * max(0.0, dc - 0.9 * r), py + uy * max(0.0, dc - 0.9 * r))
                         g = math.hypot(px - tp[0], py - tp[1])
                         if best is None or g < best[0]:
-                            best = (g, tp)
+                            best = (g, tp, None)
 
                     if best is None or not (1e-4 < best[0] <= limit):
                         continue  # already touching, no target, or gap too big
-                    tx, ty = best[1]
-
-                    # Don't add a connector coincident with an existing same-net
-                    # segment (issue #209): the endpoint only looked loose because
-                    # a via/TH pad anchors it to another layer, so the join already
-                    # exists. The duplicate would seed a degenerate cycle.
-                    if _duplicate_connector(px, py, tx, ty, segs):
-                        continue
-
-                    # Board-edge check (#281): the connector's copper must stay
-                    # on the board and keep clearance from the outline and
-                    # every cutout, exactly as check_drc grades segments.
-                    if edge_rings:
-                        if not (_point_on_board(px, py, edge_outer, edge_cutouts)
-                                and _point_on_board(tx, ty, edge_outer,
-                                                    edge_cutouts)):
-                            continue
-                        if _segment_to_rings_distance(px, py, tx, ty, edge_rings) \
-                                < w / 2 + max(coord_clear, _bec) - 1e-6:
-                            continue
-
-                    # Clearance check: the connector must keep `clearance` from
-                    # every OTHER net's copper. #498: a .kicad_dru layer rule
-                    # replaces the net/class value on the connector's layer.
                     _lyr_clear = (config.layer_clearance(lyr, coord_clear)
                                   if hasattr(config, 'layer_clearance') else coord_clear)
-                    if not _connector_clear(px, py, tx, ty, w, lyr, net_id,
-                                            pcb_data, _lyr_clear, net_clearances=_nc):
+
+                    def _lands(tx, ty):
+                        # Don't add a connector coincident with an existing
+                        # same-net segment (issue #209): the endpoint only
+                        # looked loose because a via/TH pad anchors it to
+                        # another layer, so the join already exists. The
+                        # duplicate would seed a degenerate cycle.
+                        if _duplicate_connector(px, py, tx, ty, segs):
+                            return False
+                        # Board-edge check (#281): the connector's copper must
+                        # stay on the board and keep clearance from the outline
+                        # and every cutout, exactly as check_drc grades segments.
+                        if edge_rings:
+                            if not (_point_on_board(px, py, edge_outer, edge_cutouts)
+                                    and _point_on_board(tx, ty, edge_outer,
+                                                        edge_cutouts)):
+                                return False
+                            if _segment_to_rings_distance(px, py, tx, ty, edge_rings) \
+                                    < w / 2 + max(coord_clear, _bec) - 1e-6:
+                                return False
+                        # Clearance check: the connector must keep `clearance`
+                        # from every OTHER net's copper. #498: a .kicad_dru
+                        # layer rule replaces the net/class value on the
+                        # connector's layer.
+                        return _connector_clear(px, py, tx, ty, w, lyr, net_id,
+                                                pcb_data, _lyr_clear,
+                                                net_clearances=_nc)
+
+                    # A pad target: land on the pad CENTRE, or at least the
+                    # track's own width (plus PAD_ENTRY_MARGIN_MM) inside it
+                    # (pad_entry.py). The nearest point of the outline joins
+                    # the end through a sliver -- a shallow pad entry -- and
+                    # is the last resort, when neither clears.
+                    from pad_entry import entry_points
+                    pad_hit = best[2]
+                    targets = (entry_points(pad_hit, px, py, w)
+                               if pad_hit is not None else [])
+                    targets.append(best[1])
+                    tx = ty = None
+                    for _t in targets:
+                        if _lands(*_t):
+                            tx, ty = _t
+                            break
+                    if tx is None:
                         continue
                     conn = Segment(start_x=px, start_y=py, end_x=tx, end_y=ty,
                                    width=w, layer=lyr, net_id=net_id)
@@ -1893,7 +1924,68 @@ def _restore_soft_joint_bridges(kept, removed, vias, pads):
                 break
         if not restored:
             break  # gap not attributable to these removals; leave it
+    # Same guard for a SHALLOW PAD ENTRY (pad_entry.py): removing the copper
+    # that carried an end into its pad exposes a track end joined to the pad
+    # through less than its own width. The overlap model calls that copper
+    # redundant; put it back, as StrictRemovalModel refuses it.
+    baseline = _shallow_entry_keys(list(kept) + list(removed), vias, pads)
+    for _ in range(len(removed)):
+        hot = _shallow_entry_keys(kept, vias, pads) - baseline
+        if not hot:
+            break
+        back = [r for r in removed
+                if (r.layer, _rk3(r.start_x, r.start_y)) in hot
+                or (r.layer, _rk3(r.end_x, r.end_y)) in hot]
+        if not back:
+            break
+        kept.append(back[0])
+        removed.remove(back[0])
     return kept, removed
+
+
+def _shallow_entry_keys(segs, vias, pads):
+    """(layer, 1um point) of every degree-1 track end that enters a pad
+    shallow (pad_entry.shallow_pad_entry): the soft-joint guard's twin. Plus
+    ('pad', layer, ref, number) of every pad its tracks join only through a
+    shallow contact -- passing its edge or bending on its corner
+    (pad_entry.shallow_pad_contacts)."""
+    from collections import defaultdict
+    from pad_entry import (shallow_pad_entry, shallow_pad_contacts, on_via,
+                           on_other_track)
+    if not pads:
+        return set()
+    deg = defaultdict(int)
+    for s in segs:
+        deg[(s.layer, _rk3(s.start_x, s.start_y))] += 1
+        deg[(s.layer, _rk3(s.end_x, s.end_y))] += 1
+    out = set()
+    for s in segs:
+        if getattr(s, 'graphic', False) or _sense_copper(s):
+            continue
+        for (ex, ey, nx, ny) in ((s.start_x, s.start_y, s.end_x, s.end_y),
+                                 (s.end_x, s.end_y, s.start_x, s.start_y)):
+            key = (s.layer, _rk3(ex, ey))
+            if deg[key] != 1 or on_via(vias, ex, ey):
+                continue
+            if on_other_track(segs, s, ex, ey):
+                continue
+            net_pads = [p for p in pads if p.net_id == s.net_id
+                        and not _sense_copper(p)]
+            if shallow_pad_entry(net_pads, s.layer, ex, ey, nx, ny,
+                                 s.width) is not None:
+                out.add(key)
+    by_net = defaultdict(list)
+    for s in segs:
+        if not getattr(s, 'graphic', False) and not _sense_copper(s):
+            by_net[s.net_id].append(s)
+    for nid, ns in by_net.items():
+        net_pads = [p for p in pads if p.net_id == nid and not _sense_copper(p)]
+        net_vias = [v for v in vias if getattr(v, 'net_id', nid) == nid]
+        for pad, layer, _d, _n, _pt in shallow_pad_contacts(net_pads, ns,
+                                                             net_vias):
+            out.add(('pad', layer, getattr(pad, 'component_ref', None),
+                     getattr(pad, 'pad_number', None)))
+    return out
 
 
 def sweep_dead_ends(results, pcb_data: PCBData, scope_net_ids=None,
@@ -2665,6 +2757,30 @@ class StrictRemovalModel:
         return terminal_web_neck_exact(view, self.net_id, s.layer, ex, ey,
                                        self._web_floor) is not False
 
+    def _shallow_terminal(self, node, E):
+        """check_weird's shallow-pad-entry test (pad_entry.shallow_pad_entry)
+        on the one end left at ``node`` once E is gone: an end touching a
+        same-net pad without its own width inside it. The model refuses to
+        CREATE one: the collapse never trims a track short of its pad."""
+        rest = [i for i in self._node_ends[node] if i not in E]
+        if len(rest) != 1:
+            return False
+        i = rest[0]
+        s = self.segs[i]
+        if getattr(s, 'graphic', False) or _sense_copper(s):
+            return False
+        from pad_entry import shallow_pad_entry, on_via, on_other_track
+        if self._seg_nodes[i][0] == node:
+            ex, ey, nx, ny = s.start_x, s.start_y, s.end_x, s.end_y
+        else:
+            ex, ey, nx, ny = s.end_x, s.end_y, s.start_x, s.start_y
+        if on_via(self.vias, ex, ey) or on_other_track(
+                [x for k, x in enumerate(self.segs) if k not in E], s, ex, ey):
+            return False
+        pads = [p for p in self.pads if not _sense_copper(p)]
+        return shallow_pad_entry(pads, s.layer, ex, ey, nx, ny,
+                                 s.width or 0.0) is not None
+
     def _dangle_ok(self, E, D, prev_E, prev_D):
         nodes = set()
         for i in E:
@@ -2687,6 +2803,48 @@ class StrictRemovalModel:
                 return False
             if self._narrow_terminal(n, E) and not self._narrow_terminal(n, prev_E):
                 return False
+            if (self._shallow_terminal(n, E)
+                    and not self._shallow_terminal(n, prev_E)):
+                return False
+        # A kept end lying on a removed segment's BODY was a T into copper
+        # that carried on to the pad (pad_entry.on_other_track); with that
+        # copper gone it is a pad entry in its own right -- a short stub left
+        # at the pad edge while the track that reached the centre goes. Grade
+        # those ends too, so the collapse removes the stub instead.
+        gone = [self.segs[i] for i in E if i not in prev_E]
+        t_nodes = set()
+        for i, s in enumerate(self.segs):
+            if i in E or getattr(s, 'graphic', False):
+                continue
+            for (x, y), n in zip(((s.start_x, s.start_y), (s.end_x, s.end_y)),
+                                 self._seg_nodes[i]):
+                if n in nodes or n in t_nodes or not any(
+                        g.layer == s.layer and point_to_segment_distance(
+                            x, y, g.start_x, g.start_y, g.end_x, g.end_y)
+                        <= 1e-3 for g in gone):
+                    continue
+                t_nodes.add(n)
+                if (self._shallow_terminal(n, E)
+                        and not self._shallow_terminal(n, prev_E)):
+                    return False
+        # A removal can also leave a pad joined only through a shallow
+        # contact with no end in it at all: the leg that reached the pad
+        # centre goes and the track that carries on passes the pad edge or
+        # bends on its corner (pad_entry.shallow_pad_contacts). Grade the
+        # pads the removed copper touched.
+        if gone and self.pads:
+            from pad_entry import shallow_pad_contacts, segment_pad_depth
+            hit = [p for p in self.pads if not _sense_copper(p) and any(
+                segment_pad_depth(p, g.start_x, g.start_y, g.end_x, g.end_y)
+                > -(g.width or 0.0) / 2.0 for g in gone)]
+            if hit:
+                def _bad(EE):
+                    keep = [x for k, x in enumerate(self.segs)
+                            if k not in EE and not _sense_copper(x)]
+                    return {(id(p), L) for p, L, _d, _n, _pt
+                            in shallow_pad_contacts(hit, keep, self.vias)}
+                if _bad(E) - _bad(prev_E):
+                    return False
         # #1161: removed copper narrows a terminal's web wherever it sat in
         # the exact test's window, not only at its own ends -- an in-pad
         # wiggle widening a neighbouring end's joint is a different unit.
@@ -5011,6 +5169,11 @@ def prune_grazing_segments(results, pcb_data: PCBData, scope_net_ids=None,
         # the coincident chain); only remove when even the fab floor cannot
         # clear. Baseline joints (pre-existing) never block a removal.
         baseline_joints = _soft_joint_pairs(net_segs, net_vias, net_pads)
+        # Nor may a removal leave a track end short of its own pad
+        # (pad_entry.py): the copper a graze is measured on often lies in that
+        # pad, which then grazes the same foreign object -- dropping it clears
+        # nothing and leaves the end joined through a sliver.
+        baseline_shallow = _shallow_entry_keys(net_segs, net_vias, net_pads)
         # Geometric tie-break -- equal-length grazers fell back to board order.
         for s in sorted(grazing, key=lambda s: (
                 math.hypot(s.end_x - s.start_x, s.end_y - s.start_y), s.layer,
@@ -5088,6 +5251,8 @@ def prune_grazing_segments(results, pcb_data: PCBData, scope_net_ids=None,
                     if worse(trust, after_trust):
                         continue  # joined only by fill KiCad may not pour
             kept_after = [x for i, x in enumerate(net_segs) if i not in trial_excl]
+            if _shallow_entry_keys(kept_after, net_vias, net_pads) - baseline_shallow:
+                continue  # keep it: removal leaves a shallow pad entry
             if _soft_joint_pairs(kept_after, net_vias, net_pads) - baseline_joints:
                 # Removal would open a soft joint: neck to clear instead.
                 from single_ended_routing import (_seg_foreign_pad_dist as _fpd,
@@ -6975,8 +7140,9 @@ def nudge_grazing_microshift(results, pcb_data: PCBData, scope_net_ids=None,
     soft joint check_drc counts: sliding an end away from another free end it
     all but met turns a coincident joint into a SEGMENT-ENDPOINT-GAP, and the
     bridge's clearance gate then refuses the repair through the graze the
-    neighbour still has. A graze that no candidate clears is left for the DRC
-    report.
+    neighbour still has. Nor may it slide a track end short of its pad's
+    depth (a shallow pad entry, pad_entry.py). A graze that no candidate
+    clears is left for the DRC report.
 
     ``max_shift`` HARD-caps how far any copper may move (callers pass half the
     routing grid step): this pass is strictly a micrometre-scale touch-up, so a
@@ -7291,6 +7457,13 @@ def nudge_grazing_microshift(results, pcb_data: PCBData, scope_net_ids=None,
                     trial = [g for g in net_segs if g not in old] + new
                     if len(_soft_joint_pairs(trial, net_vias, net_pads,
                                              COINCIDENCE_TOL)) > soft_before:
+                        continue
+                    # Nor slide a track end off its pad's depth (pad_entry.py):
+                    # a joint narrower than the track trades one defect for
+                    # another the DRC never reports.
+                    if (len(_shallow_entry_keys(trial, net_vias, net_pads))
+                            > len(_shallow_entry_keys(net_segs, net_vias,
+                                                      net_pads))):
                         continue
                     if worse(before, check_net_connectivity(net_id, trial, net_vias,
                                                             net_pads, net_zones,
@@ -8656,6 +8829,7 @@ def adopt_restored_stubs(pcb_data: PCBData, result: dict) -> None:
         if not held:
             continue
         needed = _stubs_net_needs(pcb_data, net_id, held)
+        needed += _stubs_entry_needs(pcb_data, net_id, held, needed)
         for o in needed:
             have.add(id(o))
             key = 'new_segments' if hasattr(o, 'start_x') else 'new_vias'
@@ -8663,6 +8837,35 @@ def adopt_restored_stubs(pcb_data: PCBData, result: dict) -> None:
         rest = [o for o in held if id(o) not in have]
         if rest:
             ledger[net_id] = rest
+
+
+def _stubs_entry_needs(pcb_data: PCBData, net_id: int, held: list,
+                       needed: list) -> list:
+    """The stub chains of `held` (not already in `needed`) that carry a
+    track end into its pad: without the chain an end touches its pad shallow
+    (pad_entry.py) -- the route ended on the stub's outer end, its cap
+    already grazing the pad, so connectivity calls the stub redundant, but
+    the stub is what reaches the pad centre. Not shipping it is a removal
+    like any other, and leaves the joint narrower than the track."""
+    taken = {id(o) for o in needed}
+    chains = [c for c in _stub_chains(held)
+              if not any(id(o) in taken for o in c)]
+    if not chains:
+        return []
+    segs = [s for s in pcb_data.segments if s.net_id == net_id]
+    vias = [v for v in pcb_data.vias if v.net_id == net_id]
+    pads = pcb_data.pads_by_net.get(net_id, [])
+    if not pads:
+        return []
+    base = _shallow_entry_keys(segs, vias, pads)
+    out = []
+    for chain in chains:
+        ids = {id(o) for o in chain}
+        if _shallow_entry_keys([s for s in segs if id(s) not in ids],
+                               [v for v in vias if id(v) not in ids],
+                               pads) - base:
+            out.extend(chain)
+    return out
 
 
 def _stub_chains(held: list) -> list:
