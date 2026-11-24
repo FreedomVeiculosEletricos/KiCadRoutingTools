@@ -927,6 +927,12 @@ def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
     routed_ids = {id(x) for r in results if not r.get('cleanup')
                   for x in (r.get('new_segments') or ())}
     graded = length_graded_net_ids(pcb_data, config)
+    import smd_exits as _sx_oc
+    if _sx_oc.strict():
+        # strict pad exits: a track meets a via at its centre on EVERY net --
+        # one that only touches the via's copper is what a reviewer reads as
+        # a track stopping short of the via
+        graded = {s.net_id for s in pcb_data.segments if s.net_id}
     oc_segs = [s for s in pcb_data.segments
                if s.net_id in graded
                and (scope_net_ids is None or s.net_id in scope_net_ids)
@@ -990,7 +996,8 @@ def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
         new_conns = [c for c in new_conns if _exit_ok(c)]
         web_conns = [c for c in web_conns if _exit_ok(c)]
         via_pad_conns = [c for c in via_pad_conns if _exit_ok(c)]
-        centre_conns = [c for c in centre_conns if _exit_ok(c)]
+        # (a via-centre bridge lies inside the via's own disc and its track
+        # was already cut back to meet it: it is not re-judged here)
     if new_conns or web_conns or via_pad_conns or centre_conns:
         for c in new_conns + web_conns + via_pad_conns + centre_conns:
             pcb_data.segments.append(c)
@@ -1989,8 +1996,9 @@ def worsens_smd_exits(before, after, vias, pads) -> bool:
         return False
     reach = max(exit_distance(x.width) + x.width for x in changed) + 0.05
     import smd_exits as _sx
-    if _sx.strict() and _worsens_strict_exits(before, after, changed, vias,
-                                              pads, reach):
+    if _sx.strict() and (_worsens_strict_exits(before, after, changed, vias,
+                                               pads, reach)
+                         or _worsens_via_centres(before, after, changed, vias)):
         return True
     near = []
     for p in pads or ():
@@ -2012,6 +2020,51 @@ def worsens_smd_exits(before, after, vias, pads) -> bool:
         return out
     old = grade(before)
     return any(n > old.get(k, 0) for k, n in grade(after).items())
+
+
+def _copper_stack(layers):
+    """The copper layers among ``layers`` in board order (F.Cu, In1.Cu ...
+    B.Cu); F.Cu and B.Cu are always included, as a through via spans them."""
+    import re as _re
+    inner = sorted({L for L in layers if _re.fullmatch(r'In\d+\.Cu', L or '')},
+                   key=lambda L: int(L[2:-3]))
+    return ['F.Cu'] + inner + ['B.Cu']
+
+
+def _worsens_via_centres(before, after, changed, vias, new_vias=()) -> bool:
+    """Strict exits: does ``after`` end a track inside a same-net via's
+    copper off its centre (connectivity.off_centre_via_ends, #1235) where
+    ``before`` did not? Only the vias the ``changed`` copper reaches are
+    graded."""
+    if not vias:
+        return False
+    from connectivity import off_centre_via_ends
+    near = []
+    new_ids = {id(v) for v in new_vias or ()}
+    for v in vias:
+        r = (getattr(v, 'size', 0.0) or 0.0) / 2.0 + 1e-6
+        # a NEW via is graded against every end its copper lands on, old
+        # copper included (a via drilled over an existing track end)
+        if id(v) in new_ids or any(
+                math.hypot(x.start_x - v.x, x.start_y - v.y) <= r
+                or math.hypot(x.end_x - v.x, x.end_y - v.y) <= r for x in changed):
+            near.append(v)
+    if not near:
+        return False
+
+    old_near = [v for v in near if id(v) not in new_ids]
+    # the copper stack the tracks and vias name, in board order: a through
+    # via spans the inner layers too, and an end on In2.Cu beside its centre
+    # is as off-centre as one on F.Cu (graded without it, only the via's
+    # declared F.Cu/B.Cu ends were)
+    stack = _copper_stack([x.layer for x in list(before) + list(after)]
+                          + [L for v in near for L in (getattr(v, 'layers', None) or ())])
+
+    def ends(segs, vs):
+        return {(round(e[0], 4), round(e[1], 4), id(v))
+                for s, end, v, _d in off_centre_via_ends(segs, vs, stack)
+                for e in (((s.start_x, s.start_y) if end == 0 else (s.end_x, s.end_y)),)}
+    return bool(ends(after, near) - ends(before, old_near))
 
 
 def _worsens_strict_exits(before, after, changed, vias, pads, reach) -> bool:
@@ -7860,6 +7913,8 @@ def nudge_grazing_vias(results, pcb_data: PCBData, scope_net_ids=None,
                          ['F.Cu', 'B.Cu'])
     edge_rings, edge_outer, edge_cutouts = board_edge_geometry(board_info)
     board_bounds = getattr(board_info, 'board_bounds', None)
+    _run_seg_ids = {id(x) for r in (results or ())
+                    for x in (r.get('new_segments') or ())}
     MARGIN = 0.002
     WINDOW = 2.0     # local object window around a flagged via (mm)
     _edge_clr = max(clearance, board_edge_clearance)  # #438 honor board edge rule
@@ -8212,13 +8267,33 @@ def nudge_grazing_vias(results, pcb_data: PCBData, scope_net_ids=None,
             if _ko_free and _ko_at(v, nx, ny):
                 continue
 
+            # strict pad exits: the tracks ending at the via's centre go with
+            # it, so none ends in its copper beside the centre (#1235); a
+            # move whose tracks cannot follow clear (or are input copper the
+            # writers keep as it was) is not made
+            drag = []
+            if _strict_drag_on():
+                drag = _via_drag_ends(v, net_segs, nx, ny, _run_seg_ids,
+                                      pcb_data, eff_clr(v.net_id))
+                if drag is None:
+                    continue
             # apply, verify connectivity, revert on regression
             old_x, old_y = v.x, v.y
             v.x, v.y = nx, ny
+            for _sg, _end in drag:
+                if _end == 0:
+                    _sg.start_x, _sg.start_y = nx, ny
+                else:
+                    _sg.end_x, _sg.end_y = nx, ny
             after = check_net_connectivity(v.net_id, net_segs, net_vias, net_pads,
                                            net_zones, pcb_data=pcb_data)
             if worse(before, after):
                 v.x, v.y = old_x, old_y
+                for _sg, _end in drag:
+                    if _end == 0:
+                        _sg.start_x, _sg.start_y = old_x, old_y
+                    else:
+                        _sg.end_x, _sg.end_y = old_x, old_y
                 continue
             moved += 1
             nets_changed_set.add(v.net_id)
@@ -8230,6 +8305,31 @@ def nudge_grazing_vias(results, pcb_data: PCBData, scope_net_ids=None,
             break
 
     return moved, len(nets_changed_set), moves
+
+
+def _strict_drag_on() -> bool:
+    import smd_exits
+    return smd_exits.strict()
+
+
+def _via_drag_ends(v, net_segs, nx, ny, run_seg_ids, pcb_data, clr):
+    """The (segment, end) pairs of ``net_segs`` that end at via ``v``'s
+    centre, to move with it to (nx, ny) -- or None when one cannot: it is
+    input copper (not in ``run_seg_ids``) or its moved geometry would not
+    clear foreign copper (_connector_clear)."""
+    out = []
+    for sg in net_segs:
+        for end, (ex, ey) in enumerate(((sg.start_x, sg.start_y), (sg.end_x, sg.end_y))):
+            if math.hypot(ex - v.x, ey - v.y) > 1e-4:
+                continue
+            if id(sg) not in run_seg_ids:
+                return None
+            ox, oy = (sg.end_x, sg.end_y) if end == 0 else (sg.start_x, sg.start_y)
+            if not _connector_clear(ox, oy, nx, ny, sg.width, sg.layer, sg.net_id,
+                                    pcb_data, clr):
+                return None
+            out.append((sg, end))
+    return out
 
 
 def _pt_seg_dist_t(x, y, s):

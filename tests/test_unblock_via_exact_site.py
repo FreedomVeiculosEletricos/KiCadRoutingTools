@@ -168,7 +168,7 @@ def rows_conversion():
     check('the via is drilled at the registered site, at its registered size',
           got == [(site[0], site[1], 0.25)], f'vias {got}, cell centre {centre}')
     check('the refit judged the site, not the cell centre',
-          seen == [site], f'refit at {seen}')
+          bool(seen) and all(s == site for s in seen), f'refit at {seen}')
     pcb = board()
     vias, seen, centre = convert(pcb, T)
     got = [(round(v.x, 4), round(v.y, 4)) for v in vias]

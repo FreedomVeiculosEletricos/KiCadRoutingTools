@@ -24,6 +24,10 @@ Run:
 import math
 import os
 import sys
+# B7 proves nudge_grazing_vias' hole model on a via whose track is not this
+# run's copper; strict pad exits (smd_exits.strict, the default) keep such a
+# via where it is (its track cannot follow it) -- run it non-strict.
+os.environ.setdefault('KICAD_STRICT_PAD_EXITS', '0')
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(TESTS_DIR)

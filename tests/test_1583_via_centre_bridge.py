@@ -128,12 +128,30 @@ check("the bridge starts at its end", b is not None and (b.start_x, b.start_y) =
 check("no off-centre end is left", off_centre_via_ends(pcb.segments, pcb.vias,
                                                        ['F.Cu', 'B.Cu']) == [])
 
-print("5. only a net whose length is graded is bridged")
-pcb, t1, t2, via, pa, pb = board()
-results = [{'new_segments': [t1, t2], 'new_vias': [via]}]
-n = close_soft_joints(results, pcb, None, cfg(graded=frozenset()))
-check("an ungraded net: no bridge, the track untouched",
-      n == 0 and (t1.end_x, t1.end_y) == P, f"{n} ({t1.end_x}, {t1.end_y})")
+print("5. non-strict, only a net whose length is graded is bridged")
+import smd_exits                                               # noqa: E402
+_was_strict = smd_exits.strict()
+smd_exits.set_strict(False)
+try:
+    pcb, t1, t2, via, pa, pb = board()
+    results = [{'new_segments': [t1, t2], 'new_vias': [via]}]
+    n = close_soft_joints(results, pcb, None, cfg(graded=frozenset()))
+    check("an ungraded net: no bridge, the track untouched",
+          n == 0 and (t1.end_x, t1.end_y) == P, f"{n} ({t1.end_x}, {t1.end_y})")
+finally:
+    smd_exits.set_strict(_was_strict)
+# strict pad exits (the default): every net is met at its via centres
+smd_exits.set_strict(True)
+try:
+    if smd_exits.strict():
+        pcb, t1, t2, via, pa, pb = board()
+        results = [{'new_segments': [t1, t2], 'new_vias': [via]}]
+        n = close_soft_joints(results, pcb, None, cfg(graded=frozenset()))
+        check("strict: an ungraded net is bridged too",
+              n == 1 and off_centre_via_ends(pcb.segments, pcb.vias,
+                                             ['F.Cu', 'B.Cu']) == [], f"{n}")
+finally:
+    smd_exits.set_strict(_was_strict)
 pcb, t1, t2, via, pa, pb = board()
 c = cfg(graded=frozenset())
 c._length_matched_names = frozenset({'/CLK_P'})
