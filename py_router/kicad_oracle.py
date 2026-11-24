@@ -2056,6 +2056,45 @@ def oracle_via_rungs(config, pcb_data, net_id):
     return out
 
 
+def _strict_exit_refusal(pcb_data, net_id, segs, vias) -> str:
+    """Why a link's copper may not ship under strict pad exits
+    (smd_exits.strict), '' when it may: a via whose copper is on one of the
+    net's pads, or a leg that leaves or enters a pad at an angle, through a
+    corner, or bends short of its exit (pad_entry.strict_exit_faults), or
+    an end that enters a pad shallow (pad_entry.shallow_pad_entry)."""
+    import smd_exits
+    if not smd_exits.strict() or not (segs or vias):
+        return ''
+    from pad_entry import pad_depth, strict_exit_faults
+    pads = pcb_data.pads_by_net.get(net_id, []) or []
+    for v in vias:
+        for p in pads:
+            if pad_depth(p, v.x, v.y) > -v.size / 2.0:
+                return (f"a via on pad {p.component_ref}.{p.pad_number} "
+                        f"(strict pad exits)")
+    before = [s for s in pcb_data.segments if s.net_id == net_id]
+    net_vias = [v for v in pcb_data.vias if v.net_id == net_id] + list(vias)
+    from geometry_utils import point_to_segment_distance
+    pads = [p for p in pads
+            if any(point_to_segment_distance(p.global_x, p.global_y, x.start_x,
+                                             x.start_y, x.end_x, x.end_y)
+                   <= max(p.size_x, p.size_y) + 1.0 for x in segs)]
+    if not pads:
+        return ''
+    old = strict_exit_faults(before, net_vias, pads)
+    new = strict_exit_faults(before + list(segs), net_vias, pads)
+    if any(n > old.get(k, 0) for k, n in new.items()):
+        return "a pad exit at an angle, through a corner or bent short (strict pad exits)"
+    # a link ending in a pad short of the depth its width needs (a wide link
+    # laid inside a narrow pad) joins it through less copper than the track:
+    # the pad entry rule the router's own exits keep (pad_entry)
+    from pcb_modification import _shallow_entry_keys
+    if (_shallow_entry_keys(before + list(segs), net_vias, pads)
+            - _shallow_entry_keys(before, net_vias, pads)):
+        return "a shallow pad entry (strict pad exits)"
+    return ''
+
+
 def oracle_reconnect(board_file: str, net_names, config,
                      track_via_clearance: float,
                      hole_to_hole_clearance: float,
@@ -3702,6 +3741,9 @@ def oracle_reconnect(board_file: str, net_names, config,
                            for x1, y1, x2, y2, l1, _lw in _legs]
                 if not _keepout_why(_ko_legs(_narrow) + _ko_extra, _ko_vias):
                     _legs, _why = _narrow, ''
+            if not _why:
+                _why = _strict_exit_refusal(pcb_data, net_id,
+                                            _ko_legs(_legs) + _ko_extra, _ko_vias)
             if _why:
                 print(f"    {net_name}: ({ax:.2f},{ay:.2f})<->({bx:.2f},{by:.2f})"
                       f"  DECLINED ({_why}; left unconnected, #1778)")

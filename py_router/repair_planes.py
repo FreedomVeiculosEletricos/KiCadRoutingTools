@@ -444,6 +444,45 @@ def _return_purged_copper(write_lists, purged, keep_segs, keep_vias):
             write_lists[1].append(d)
 
 
+def _strict_repair_via_on_pad(result, pcb_data, via_size) -> bool:
+    """Strict pad exits (smd_exits.strict): does a repair tap put a via on a
+    pad -- its own via, or a layer change of its trace (where the trace's
+    segments on different layers meet, a via site) -- whose copper the via's
+    would touch, on any net? The tap-via check of plane_pad_tap judges the
+    tap's own via only; a ripped retry's multi-layer trace can carry more."""
+    import smd_exits
+    if not smd_exits.strict() or not getattr(result, 'success', False):
+        return False
+    from pad_entry import pad_depth
+    segs = list(getattr(result, 'segments', None) or ())
+    pts = []
+    if getattr(result, 'via', None) is not None:
+        pts.append((result.via['x'], result.via['y'], result.via.get('size', via_size)))
+    ends = {}
+    for s in segs:
+        for xy in (s['start'], s['end']):
+            ends.setdefault((round(xy[0], 4), round(xy[1], 4)), set()).add(s['layer'])
+    net_id = segs[0]['net_id'] if segs else None
+    for x in pcb_data.segments:
+        if x.net_id != net_id:
+            continue
+        for xy in ((x.start_x, x.start_y), (x.end_x, x.end_y)):
+            k = (round(xy[0], 4), round(xy[1], 4))
+            if k in ends:
+                ends[k].add(x.layer)
+    pts += [(k[0], k[1], via_size) for k, ls in ends.items() if len(ls) > 1]
+    if not pts:
+        return False
+    for ps in pcb_data.pads_by_net.values():
+        for q in ps:
+            for x, y, sz in pts:
+                if (abs(q.global_x - x) <= q.size_x + sz
+                        and abs(q.global_y - y) <= q.size_y + sz
+                        and pad_depth(q, x, y) > -sz / 2.0):
+                    return True
+    return False
+
+
 def _tap_pad_with_ripup(pad, pad_layer, net_id, pcb_data, tap_config, blocker_config,
                         max_search_radius, via_size, via_drill, max_rip_nets,
                         protected_net_ids, first_failure, ripped_net_ids, verbose,
@@ -1880,6 +1919,10 @@ def repair_planes(
                             write_lists=(all_new_segments, all_new_vias))
                         if rr is not None:
                             result = rr
+                    if result.success and _strict_repair_via_on_pad(result, pcb_data, via_size):
+                        # strict pad exits: the tap's via, or a layer change
+                        # of its trace (a via site), lands on a pad
+                        result = replace(result, success=False)
                     if result.success:
                         total_pads_repaired += 1
                         params_note = " [fine params]" if result.params_label == 'fine' else ""

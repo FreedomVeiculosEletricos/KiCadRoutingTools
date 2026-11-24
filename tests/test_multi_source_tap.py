@@ -22,6 +22,10 @@ INVARIANTS (this test), on a real routed multilayer board:
 
 Run:  python3 tests/test_multi_source_tap.py [-v]
 """
+import os as _os_strict
+# This test proves a mechanism strict pad exits (smd_exits.strict, the
+# default) turn off -- run it, and the CLIs it drives, non-strict.
+_os_strict.environ.setdefault('KICAD_STRICT_PAD_EXITS', '0')
 import argparse
 import math
 import os

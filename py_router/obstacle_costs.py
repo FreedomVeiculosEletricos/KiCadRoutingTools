@@ -236,6 +236,9 @@ def apply_stub_proximity(obstacles: GridObstacleMap, pcb_data: PCBData,
     coord = GridCoord(config.grid_step)
     ghost_active = (ghost_via_groups and
                     config.ripped_route_avoidance_cost > 0)
+    # the SMD exit corridors of the nets still to route (smd_exits)
+    from smd_exits import reserve_exits
+    reserve_exits(obstacles, pcb_data, stub_net_ids, config)
 
     m = _stub_layer_m(config)
     stub_radius_grid = coord.to_grid_dist(config.stub_proximity_radius)

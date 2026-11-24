@@ -968,6 +968,29 @@ def close_soft_joints(results, pcb_data: PCBData, scope_net_ids, config,
         centre_conns.append(Segment(start_x=bx, start_y=by, end_x=v.x, end_y=v.y,
                                     width=w, layer=s.layer, net_id=s.net_id))
 
+    import smd_exits as _sx
+    if _sx.strict() and (new_conns or web_conns or via_pad_conns or centre_conns):
+        # strict pad exits: a connector may not leave or enter a pad at an
+        # angle, through a corner, or bend short of its exit -- the joint
+        # it would firm stays as the router left it instead
+        from pad_entry import exit_distance as _xd
+        _net_segs = defaultdict(list)
+        for _s in pcb_data.segments:
+            _net_segs[_s.net_id].append(_s)
+
+        def _exit_ok(c):
+            before = _net_segs[c.net_id]
+            after = before + [c]
+            if _worsens_strict_exits(before, after, [c], vias_by_net.get(c.net_id, []),
+                                     pcb_data.pads_by_net.get(c.net_id, []),
+                                     _xd(c.width) + c.width + 0.05):
+                return False
+            _net_segs[c.net_id] = after
+            return True
+        new_conns = [c for c in new_conns if _exit_ok(c)]
+        web_conns = [c for c in web_conns if _exit_ok(c)]
+        via_pad_conns = [c for c in via_pad_conns if _exit_ok(c)]
+        centre_conns = [c for c in centre_conns if _exit_ok(c)]
     if new_conns or web_conns or via_pad_conns or centre_conns:
         for c in new_conns + web_conns + via_pad_conns + centre_conns:
             pcb_data.segments.append(c)
@@ -1949,6 +1972,120 @@ def _restore_soft_joint_bridges(kept, removed, vias, pads):
     return kept, removed
 
 
+def worsens_smd_exits(before, after, vias, pads) -> bool:
+    """The exit guard of the copper-moving cleanup passes: does replacing one
+    net's track copper ``before`` by ``after`` (lists of that net's segments)
+    leave an SMD pad exit failing SMD Entry, SMD To Corner or a shallow entry
+    (smd_exit_violations) that met it before? Only the net's SMD pads near the
+    copper that changed are graded, so a change away from every pad costs
+    one set difference."""
+    from collections import Counter
+    from pad_entry import is_smd, exit_distance
+    after_ids = {id(x) for x in after}
+    before_ids = {id(x) for x in before}
+    changed = ([x for x in before if id(x) not in after_ids]
+               + [x for x in after if id(x) not in before_ids])
+    if not changed:
+        return False
+    reach = max(exit_distance(x.width) + x.width for x in changed) + 0.05
+    import smd_exits as _sx
+    if _sx.strict() and _worsens_strict_exits(before, after, changed, vias,
+                                              pads, reach):
+        return True
+    near = []
+    for p in pads or ():
+        if not is_smd(p):
+            continue
+        r = math.hypot(p.size_x, p.size_y) / 2.0 + reach
+        if any(math.hypot(x.start_x - p.global_x, x.start_y - p.global_y) <= r
+               or math.hypot(x.end_x - p.global_x, x.end_y - p.global_y) <= r
+               for x in changed):
+            near.append(p)
+    if not near:
+        return False
+
+    def grade(segs):
+        out = Counter()
+        for sg, _e, pad, _pts, _cs, _r, rules in smd_exit_violations(segs, vias, near):
+            for rule in rules:
+                out[(id(pad), sg.layer, rule)] += 1
+        return out
+    old = grade(before)
+    return any(n > old.get(k, 0) for k, n in grade(after).items())
+
+
+def _worsens_strict_exits(before, after, changed, vias, pads, reach) -> bool:
+    """worsens_smd_exits under strict exits (smd_exits.strict): does
+    ``after`` add a strict exit fault (pad_entry.strict_exit_faults) at a
+    pad -- SMD or through-hole -- the ``changed`` copper comes within
+    ``reach`` of?"""
+    from pad_entry import strict_exit_faults, gradable_pad
+    from geometry_utils import point_to_segment_distance
+    near = []
+    for p in pads or ():
+        r = math.hypot(p.size_x, p.size_y) / 2.0 + reach
+        if any(point_to_segment_distance(p.global_x, p.global_y, x.start_x,
+                                         x.start_y, x.end_x, x.end_y) <= r
+               for x in changed
+               if gradable_pad(p, x.layer)):
+            near.append(p)
+    if not near:
+        return False
+    old = strict_exit_faults(before, vias, near)
+    return any(n > old.get(k, 0)
+               for k, n in strict_exit_faults(after, vias, near).items())
+
+
+def smd_exit_violations(segs, vias, pads, net_id=None):
+    """Every free track end entering an SMD pad whose exit fails Altium's SMD
+    Entry / SMD To Corner (pad_entry.grade_pad_exit), as ``[(seg, (ex, ey),
+    pad, chain_pts, chain_segs, reason, rules)]``. ``segs`` / ``vias`` /
+    ``pads`` are one net's. The detector check_weird reports by and
+    rebuild_pad_exits repairs by."""
+    from collections import defaultdict
+    from pad_entry import (smd_gradable, pad_depth, terminal_chain,
+                           grade_pad_exit, on_via, on_other_track,
+                           shallow_pad_entry)
+
+    def key(x, y):
+        return (round(x, 4), round(y, 4))
+
+    by_layer = defaultdict(list)
+    for s in segs:
+        if not getattr(s, 'graphic', False):
+            by_layer[s.layer].append(s)
+    out = []
+    for layer, lsegs in by_layer.items():
+        lpads = [p for p in pads if smd_gradable(p, layer) and not _sense_copper(p)]
+        if not lpads:
+            continue
+        adj = defaultdict(list)
+        for s in lsegs:
+            adj[key(s.start_x, s.start_y)].append(s)
+            adj[key(s.end_x, s.end_y)].append(s)
+        for s in lsegs:
+            if _sense_copper(s):
+                continue
+            for ex, ey in ((s.start_x, s.start_y), (s.end_x, s.end_y)):
+                if len(adj[key(ex, ey)]) != 1 or on_via(vias, ex, ey):
+                    continue
+                if on_other_track(lsegs, s, ex, ey):
+                    continue
+                touch = [p for p in lpads
+                         if pad_depth(p, ex, ey) > -s.width / 2.0 + 1e-6]
+                if not touch:
+                    continue
+                pad = max(touch, key=lambda p: pad_depth(p, ex, ey))
+                pts, csegs, reason = terminal_chain(s, ex, ey, adj, key, vias)
+                rules = set(grade_pad_exit(pad, pts, s.width))
+                nx, ny = pts[1]
+                if shallow_pad_entry(lpads, layer, ex, ey, nx, ny, s.width):
+                    rules.add('shallow')
+                if rules:
+                    out.append((s, (ex, ey), pad, pts, csegs, reason, rules))
+    return out
+
+
 def _filled_graphics_clear(fills, x1, y1, x2, y2, layer, net_id, w, clearance):
     """Does a new ``w`` track x1,y1 -> x2,y2 keep ``clearance`` from every
     FILLED footprint graphic of another net (an SOT tab, a shield, #1181)?
@@ -2876,6 +3013,17 @@ class StrictRemovalModel:
                             in shallow_pad_contacts(hit, keep, self.vias)}
                 if _bad(E) - _bad(prev_E):
                     return False
+        # ...nor leave a pad exit failing SMD Entry / SMD To Corner that met
+        # them (worsens_smd_exits): the leg that ran straight out goes and
+        # the copper left leaves the pad through a corner.
+        if gone and self.pads:
+            _was = [x for k, x in enumerate(self.segs)
+                    if k not in prev_E and not _sense_copper(x)]
+            _now = [x for k, x in enumerate(self.segs)
+                    if k not in E and not _sense_copper(x)]
+            if worsens_smd_exits(_was, _now, self.vias,
+                                 [p for p in self.pads if not _sense_copper(p)]):
+                return False
         # #1161: removed copper narrows a terminal's web wherever it sat in
         # the exact test's window, not only at its own ends -- an in-pad
         # wiggle widening a neighbouring end's joint is a different unit.
@@ -4349,8 +4497,24 @@ def _prune_net_cycles(net_id: int, net_segs: List[Segment], net_vias, net_pads,
             x = cpar[x]
         return x
 
+    # Of a loop's legs, a track leaving an SMD pad straight out through an
+    # edge is kept before one leaving it at an angle (Altium's SMD Entry).
+    from pad_entry import is_smd, pad_depth, allowed_exits, to_local_dir
+    smd_pads = [p for p in (net_pads or []) if is_smd(p)]
+
+    def angled_exit(s):
+        for (ex, ey, ox, oy) in ((s.start_x, s.start_y, s.end_x, s.end_y),
+                                 (s.end_x, s.end_y, s.start_x, s.start_y)):
+            for p in smd_pads:
+                if s.layer in (p.layers or ()) and pad_depth(p, ex, ey) > 0:
+                    lx, ly = to_local_dir(p, ox - ex, oy - ey)
+                    ln = math.hypot(lx, ly) or 1.0
+                    return not any(abs(lx / ln - nx) < 1e-3 and abs(ly / ln - ny) < 1e-3
+                                   for nx, ny in allowed_exits(p))
+        return False
+
     order = sorted(range(len(net_segs)),
-                   key=lambda i: (grazes(net_segs[i]),
+                   key=lambda i: (grazes(net_segs[i]), angled_exit(net_segs[i]),
                                   math.hypot(net_segs[i].end_x - net_segs[i].start_x,
                                              net_segs[i].end_y - net_segs[i].start_y)))
     kept, removed = [], []
@@ -4418,6 +4582,8 @@ def _prune_net_cycles(net_id: int, net_segs: List[Segment], net_vias, net_pads,
         trial_supported = supported_vias(trial)
         if trial_supported < cur_supported:
             continue
+        if worsens_smd_exits(cur, trial, net_vias, net_pads):
+            continue    # the loop's other leg would leave a pad at an angle
         cur = trial
         cur_supported = trial_supported
         safe_removed.append(s)
@@ -5284,8 +5450,12 @@ def prune_grazing_segments(results, pcb_data: PCBData, scope_net_ids=None,
             kept_after = [x for i, x in enumerate(net_segs) if i not in trial_excl]
             if _shallow_entry_keys(kept_after, net_vias, net_pads) - baseline_shallow:
                 continue  # keep it: removal leaves a shallow pad entry
-            if _soft_joint_pairs(kept_after, net_vias, net_pads) - baseline_joints:
-                # Removal would open a soft joint: neck to clear instead.
+            if (_soft_joint_pairs(kept_after, net_vias, net_pads) - baseline_joints
+                    or worsens_smd_exits([x for i, x in enumerate(net_segs)
+                                          if i not in dropped_idx],
+                                         kept_after, net_vias, net_pads)):
+                # Removal would open a soft joint or break an SMD exit: neck
+                # to clear instead.
                 from single_ended_routing import (_seg_foreign_pad_dist as _fpd,
                                                   _seg_foreign_via_dist as _fvd,
                                                   _fab_track_floor)
@@ -5685,6 +5855,8 @@ def nudge_grazing_octolinear(results, pcb_data: PCBData, scope_net_ids=None,
                            for i in range(len(pts) - 1)
                            if (pts[i][0], pts[i][1]) != (pts[i + 1][0], pts[i + 1][1])]
                     trial = [s for s in net_segs if s not in chain] + new
+                    if worsens_smd_exits(net_segs, trial, net_vias, net_pads):
+                        continue
                     if worse(before, check_net_connectivity(net_id, trial, net_vias,
                                                             net_pads, net_zones,
                                                             pcb_data=pcb_data)):
@@ -6331,9 +6503,41 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
                                 v = _cmemo[key] = clears(x1, y1, x2, y2, layer, net_id, w)
                             return v
 
+                        # SMD pad exits (pad_entry.grade_pad_exit): a chain end
+                        # inside an SMD pad is that pad's exit run. A collapse
+                        # may straighten the chain but not break the exit --
+                        # through a corner, at an angle, or bent before the
+                        # exit distance -- where it met Altium's rules; it
+                        # looks for another collapse that keeps it instead.
+                        from pad_entry import grade_pad_exit, pad_depth, smd_gradable
+                        _exit_ends = []
+                        for _e in (0, n):
+                            for pad in net_pads:
+                                if (pad_on_layer(pad, layer) and smd_gradable(pad, layer)
+                                        and pad_depth(pad, *vpts[_e]) > 0):
+                                    _exit_ends.append((_e, pad))
+                                    break
+
+                        def exit_rules(poly):
+                            return [grade_pad_exit(pad, poly if e == 0 else poly[::-1], w)
+                                    for e, pad in _exit_ends]
+
                         def collapse(poly, leg_pos, allow_tie):
                             """One greedy pass over polyline poly -> {i: (j, pts)}."""
                             m = len(poly) - 1
+                            _exit_base = exit_rules(poly) if _exit_ends else None
+                            # a compliant exit's own leg (the chain's end
+                            # segment, from inside the pad out past the
+                            # outline) stays as laid: a collapse reaching into
+                            # it would re-run the exit inside the pad
+                            _keep_first = _keep_last = False
+                            if _exit_base is not None:
+                                for (_e, _pad), _r in zip(_exit_ends, _exit_base):
+                                    if not _r:
+                                        if _e == 0:
+                                            _keep_first = True
+                                        else:
+                                            _keep_last = True
                             pcum = [0.0]
                             for p in range(m):
                                 pcum.append(pcum[-1] + math.hypot(poly[p + 1][0] - poly[p][0],
@@ -6358,6 +6562,25 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
                                         if point_to_pad_distance(ax, ay, pad) > w / 2.0 + COINCIDENCE_TOL and \
                                            point_to_pad_distance(bx, by, pad) > w / 2.0 + COINCIDENCE_TOL:
                                             return False
+                                return True
+
+                            def _same_dir(a, b, c, d):
+                                ux, uy = b[0] - a[0], b[1] - a[1]
+                                vx, vy = d[0] - c[0], d[1] - c[1]
+                                lu, lv = math.hypot(ux, uy), math.hypot(vx, vy)
+                                return (lu > 1e-9 and lv > 1e-9
+                                        and abs(ux * vy - uy * vx) <= 1e-6 * lu * lv
+                                        and ux * vx + uy * vy > 0)
+
+                            def exit_kept(i, j, pts):
+                                """A collapse touching a kept exit leg may only
+                                run it on, straight, the way it leaves the pad."""
+                                if _keep_first and i == 0 and not _same_dir(
+                                        poly[0], poly[1], pts[0], pts[1]):
+                                    return False
+                                if _keep_last and j == m and not _same_dir(
+                                        poly[m], poly[m - 1], pts[-1], pts[-2]):
+                                    return False
                                 return True
 
                             out = {}
@@ -6414,6 +6637,14 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
                                                 _in_dense_field(pts[q][0], pts[q][1],
                                                                 pts[q + 1][0], pts[q + 1][1])
                                                 for q in range(len(pts) - 1)):
+                                            continue
+                                        if not exit_kept(i, j, pts):
+                                            continue
+                                        if _exit_base is not None and any(
+                                                not (now <= was) for now, was in zip(
+                                                    exit_rules(list(poly[:i]) + pts
+                                                               + list(poly[j + 1:])),
+                                                    _exit_base)):
                                             continue
                                         if all(clears_m(pts[q][0], pts[q][1],
                                                         pts[q + 1][0], pts[q + 1][1])
@@ -6519,6 +6750,12 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
                                                             pcb_data=pcb_data)
                         _rm = {id(s) for s in removed_chain}
                         trial = [s for s in net_segs if id(s) not in _rm] + new_chain_segs
+                        # SMD pad exits (pad_entry.grade_pad_exit): a collapse
+                        # may straighten a chain, not break an exit that met
+                        # Altium's SMD Entry / SMD To Corner.
+                        if worsens_smd_exits(net_segs, trial, net_vias, net_pads):
+                            stats['chains_reverted'] += 1
+                            continue
                         if worse(before, check_net_connectivity(net_id, trial, net_vias,
                                                                 net_pads, [],
                                                                 pcb_data=pcb_data)):
@@ -7488,6 +7725,8 @@ def nudge_grazing_microshift(results, pcb_data: PCBData, scope_net_ids=None,
                     trial = [g for g in net_segs if g not in old] + new
                     if len(_soft_joint_pairs(trial, net_vias, net_pads,
                                              COINCIDENCE_TOL)) > soft_before:
+                        continue
+                    if worsens_smd_exits(net_segs, trial, net_vias, net_pads):
                         continue
                     # Nor slide a track end off its pad's depth (pad_entry.py):
                     # a joint narrower than the track trades one defect for

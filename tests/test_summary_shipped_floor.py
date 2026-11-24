@@ -22,6 +22,10 @@ the floor the step wrote back).
 
     python3 -X utf8 tests/test_summary_shipped_floor.py
 """
+import os as _os_strict
+# This test proves a mechanism strict pad exits (smd_exits.strict, the
+# default) turn off -- run it, and the CLIs it drives, non-strict.
+_os_strict.environ.setdefault('KICAD_STRICT_PAD_EXITS', '0')
 import json
 import os
 import sys

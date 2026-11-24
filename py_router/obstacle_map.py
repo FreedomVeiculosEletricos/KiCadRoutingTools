@@ -291,6 +291,21 @@ def build_base_obstacle_map(pcb_data: PCBData, config: GridRouteConfig,
         # printed. Losing it silently reinstates the seal it exists to prevent,
         # indistinguishable from a routing failure.
         _own_pad_nets = graphic_own_pad_nets(pcb_data)
+        import smd_exits as _smdx
+        if _smdx.strict():
+            # strict exits ship no copper KiCad grades as a short: a no-net
+            # footprint graphic over a pad (a SOT89 tab drawn as a polygon)
+            # is held off every net, its own pad's included, so that pad is
+            # reached only where its copper clears the graphic -- else open
+            # A NET TIE's bridge keeps its lift: KiCad exempts the tied
+            # nets' copper on it, so that contact is no short.
+            _fp_ties = {ref for ref, fp in (getattr(pcb_data, 'footprints', None)
+                                            or {}).items()
+                        if getattr(fp, 'net_tie_groups', None)}
+            _segs_by_id = {id(s): s for s in pcb_data.segments}
+            _own_pad_nets = {k: v for k, v in _own_pad_nets.items()
+                             if getattr(_segs_by_id.get(k), 'net_id', 0)
+                             or getattr(_segs_by_id.get(k), 'owner_ref', '') in _fp_ties}
     # What the own-pad lift may NOT lift on a NET TIE: the via's DRILL off
     # the bridge. The bridge has no net, and KiCad's net-tie exemption covers
     # the tied nets' COPPER touching it, not a via's hole: it grades the hole
@@ -3842,9 +3857,10 @@ def same_net_pad_via_keepout_cells(pcb_data: PCBData, net_id: int,
         _ap_cells = np.empty((0, 2), dtype=np.int32)
     if len(_ap_cells):
         chunks.append(_ap_cells)
+    import smd_exits as _smdx
     for pad in (pcb_data.pads_by_net.get(net_id, []) if pads is None else pads):
-        if getattr(pad, 'drill', 0):
-            continue
+        if getattr(pad, 'drill', 0) and not _smdx.strict():
+            continue    # strict exits keep a via off a through-hole pad too
         gx, gy = coord.to_grid(pad.global_x, pad.global_y)
         hw, hh = pad.size_x / 2, pad.size_y / 2
         if pad.shape in ('circle', 'oval'):

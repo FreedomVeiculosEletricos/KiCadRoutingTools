@@ -75,6 +75,28 @@ PAD_ENTRY_NECK_MM = 2.0
 # it lands on (the pad's medial axis when the pad is narrower), so the joint is
 # as wide as the track with a margin over the fab's etch tolerance.
 PAD_ENTRY_MARGIN_MM = 0.05
+# Pad exit on SMD pads (pad_entry.py), Altium's SMT rules:
+#  * SMD To Corner -- a track leaves the pad straight for at least
+#    max(SMD_TO_CORNER_MM, its half-width) before its first bend. The default;
+#    a run sets its own with --smd-to-corner / RoutingConfig.smd_to_corner;
+#  * SMD Entry -- it crosses the pad outline perpendicular to an edge, inside
+#    that edge's straight span (never through a corner, never at an angle).
+#    Ends (the short edges) are always allowed; SMD_ENTRY_SIDE allows the long
+#    edges too (Altium: only on a pad whose side is > 2x its end).
+SMD_TO_CORNER_MM = 0.25
+SMD_ENTRY_SIDE = True
+# How far a straight edge exit's copper may overhang the pad's side: half a
+# 0.05 mm routing grid step, so an exit the grid set a quantum off a fine
+# pin's axis (clear of its neighbours) is an end exit, not a corner one.
+SMD_ENTRY_OVERHANG_MM = 0.025
+# Corner exits (pad_entry.corner_exit_ok): a track may also leave a pad at 45
+# degrees through a CORNER, on the corner's bisector (a round pad: radially at
+# 45 degrees). KICAD_PAD_CORNER_EXITS=0 / --no-pad-corner-exits turns them off.
+SMD_ENTRY_CORNER = True
+# How far a corner exit's centreline may run off the corner's bisector: half
+# the spacing of a 0.1 mm grid's 45-degree lines (0.0354 mm), rounded up, so
+# the exit runs on the grid diagonal nearest the corner.
+SMD_CORNER_EXIT_TOL_MM = 0.04
 TRACK_PROXIMITY_DISTANCE = 2.0  # mm
 # #1146 pairwise keep-away: band cost per cell (mm equivalent; 0 = measure
 # and report only) and the radius around the routed net's own pads where the
@@ -137,6 +159,14 @@ STITCH_PITCH = 20.0  # mm
 # Algorithm parameters
 MAX_ITERATIONS = 200000
 HEURISTIC_WEIGHT = 2.3  # 1.9 -> 2.3: #586 corpus dose-response peak (-30 verdict, DRC -67, cpu/mem ~0.85x; 1.7 and 2.5 both worse)
+# Under strict pad exits (smd_exits.strict, the default) the A* heuristic is
+# not inflated: every exit fixes the track's heading at both ends, and a
+# weighted search (f = g + w*h, w > 1) buys diagonal progress with a 45-degree
+# kink whenever the turn costs less than (w - 1) times the diagonal's excess
+# over a straight step -- 0.538 of a cell at 2.3 against the 0.5 a kink costs
+# at TURN_COST 1000. Measured on tigard / interf_u / esp_prog: zigzags
+# 345 -> 110, 592 -> 100, 26 -> 14, with fewer open nets and no slower runs.
+STRICT_HEURISTIC_WEIGHT = 1.0
 PROXIMITY_HEURISTIC_FACTOR = 0.02  # restored from 0 (1af3096): "quality-neutral"
 # was measured on a CLI that never applied it -- route.py's argparse still passed an
 # explicit 0.02, which overrides the module default, so the corpus kept routing at 0.02

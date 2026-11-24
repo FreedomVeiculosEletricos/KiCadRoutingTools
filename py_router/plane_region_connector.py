@@ -3002,6 +3002,29 @@ def route_disconnected_regions(
             fail_budget -= 1
             continue
 
+        # strict pad exits: a strap that leaves or crosses one of the net's
+        # pads at an angle, through a corner or bends short of its exit
+        # (pad_entry.strict_exit_faults) is no join -- the same gate as a
+        # plane tap's (route_planes._strict_tap_refused)
+        from route_planes import _strict_tap_refused
+        _cand = [{'start': (route_points[k][0], route_points[k][1]),
+                  'end': (route_points[k + 1][0], route_points[k + 1][1]),
+                  'width': track_width, 'layer': route_points[k][2]}
+                 for k in range(len(route_points) - 1)
+                 if route_points[k][2] == route_points[k + 1][2]]
+        if _strict_tap_refused(_cand, net_id, pcb_data):
+            print(f"{RED}REFUSED{RESET} (strict pad exits: the strap meets a pad "
+                  f"at an angle or through a corner)")
+            routes_failed += 1
+            _key = frozenset((root_i, root_j))
+            _prev = failed_at.get(_key)
+            failed_at[_key] = (dist if _prev is None else min(dist, _prev[0]),
+                              _MAX_PAIR_TRIES)
+            comp_strikes[root_i] = comp_strikes.get(root_i, 0) + 1
+            comp_strikes[root_j] = comp_strikes.get(root_j, 0) + 1
+            fail_budget -= 1
+            continue
+
         # Calculate actual route length
         route_length = 0.0
         for k in range(len(route_points) - 1):
@@ -3643,8 +3666,30 @@ def build_base_obstacles(
     # (plane net pads are excluded here - they're anchors; other plane nets' pads
     # will be blocked per-net in route_disconnected_regions)
     npth_holes = []  # (x, y, drill) of no-copper holes -> NPTH track keep-out
+    import smd_exits as _smdx
+    _strict_pads = _smdx.strict()
     for pad_net_id, pads in pcb_data.pads_by_net.items():
         if pad_net_id in exclude_net_ids:
+            if _strict_pads:
+                # strict pad exits: no via on a pad, the plane nets' own
+                # (anchors for the tracks) included -- a via site whose
+                # copper would touch the pad's is blocked
+                for pad in pads:
+                    if not any(str(pl).endswith('.Cu') for pl in (pad.layers or [])):
+                        continue
+                    _ve = config.via_size / 2.0
+                    _hw, _hh = pad_rect_halfspan(pad, _ve)
+                    _gx0, _ = coord.to_grid(pad.global_x - _hw, 0)
+                    _gx1, _ = coord.to_grid(pad.global_x + _hw, 0)
+                    _, _gy0 = coord.to_grid(0, pad.global_y - _hh)
+                    _, _gy1 = coord.to_grid(0, pad.global_y + _hh)
+                    _xs = np.arange(_gx0, _gx1 + 1, dtype=np.int32)
+                    _ys = np.arange(_gy0, _gy1 + 1, dtype=np.int32)
+                    if _xs.size and _ys.size:
+                        _gxg, _gyg = np.meshgrid(_xs, _ys)
+                        _cells = np.column_stack([_gxg.ravel(), _gyg.ravel()])
+                        _cells = filter_cells_in_pad_rect(_cells, coord.grid_step, pad, _ve)
+                        obstacles.add_blocked_vias_batch(_cells)
             continue
         for pad in pads:
             # NPTH mounting holes have NO copper (even when the library lists

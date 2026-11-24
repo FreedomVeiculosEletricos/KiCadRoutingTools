@@ -296,7 +296,9 @@ def _dump_engine_config(engine, cfg):
 _FINALIZE_ROUTE_KNOBS = (
     'via_cost', 'ordering_strategy', 'direction_order', 'max_iterations',
     'max_probe_iterations', 'heuristic_weight', 'turn_cost',
-    'direction_preference_cost', 'proximity_heuristic_factor',
+    'direction_preference_cost', 'smd_to_corner', 'smd_exit_terminals',
+    'smd_exit_reserve_cost', 'pad_exit_strict', 'pad_exit_corners',
+    'proximity_heuristic_factor',
     'stub_proximity_radius', 'stub_proximity_cost', 'via_proximity_cost',
     'bga_proximity_radius', 'bga_proximity_cost', 'bga_exclusion_zones',
     'disable_bga_zones', 'track_proximity_distance', 'track_proximity_cost',
@@ -852,6 +854,12 @@ def _final_regrade(pcb_data, output_file: str, return_results: bool,
     print(f"Run complete -- whole run, re-graded on {_where} "
           f"({record['graded_nets']} net(s), {record['seconds']:.1f}s)")
     print("=" * 60)
+    try:
+        from smd_exits import summary_line as _smdx_line
+        if _smdx_line():
+            print(f"  {_smdx_line()}")
+    except Exception:                                        # noqa: BLE001
+        pass
     _col = RED if (_bits or record['failed_multipoint']) else ''
     _end = RESET if _col else ''
     if routing_scope:
@@ -2301,6 +2309,11 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                 heuristic_weight: float = defaults.HEURISTIC_WEIGHT,
                 turn_cost: int = 1000,
                 direction_preference_cost: int = defaults.DIRECTION_PREFERENCE_COST,
+                smd_to_corner: float = defaults.SMD_TO_CORNER_MM,
+                smd_exit_terminals: bool = True,
+                smd_exit_reserve_cost: float = 0.0,
+                pad_exit_strict: bool = True,
+                pad_exit_corners: bool = True,
                 bus_enabled: bool = False,
                 bus_detection_radius: float = 5.0,
                 bus_attraction_radius: float = 5.0,
@@ -3222,6 +3235,19 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
         time_matching=time_matching, time_match_tolerance=time_match_tolerance,
         debug_memory=debug_memory, layer_costs=layer_costs
     )
+    # SMD To Corner (Altium): the straight run past an SMD pad's outline the
+    # exits keep; the module setting serves every grader of this run.
+    config_kwargs['smd_to_corner'] = smd_to_corner
+    config_kwargs['smd_exit_terminals'] = smd_exit_terminals
+    config_kwargs['smd_exit_reserve_cost'] = smd_exit_reserve_cost
+    config_kwargs['pad_exit_strict'] = pad_exit_strict
+    config_kwargs['pad_exit_corners'] = pad_exit_corners
+    from pad_entry import set_corner_exits as _set_corners
+    _set_corners(pad_exit_corners)
+    from pad_entry import set_smd_to_corner as _set_s2c
+    _set_s2c(smd_to_corner)
+    from smd_exits import set_strict as _set_strict
+    _set_strict(pad_exit_strict and smd_exit_terminals)
     config_kwargs['power_tap_neckdown'] = power_tap_neckdown
     # #1253: the rules the board's design brief declares join the caller's,
     # read here in the engine so the CLI and the GUI both get them with no
@@ -10347,12 +10373,42 @@ For differential pair routing, use route_diff.py:
                         help=f"Max A* iterations before giving up (default: {defaults.MAX_ITERATIONS})")
     parser.add_argument("--max-probe-iterations", type=int, default=defaults.MAX_PROBE_ITERATIONS,
                         help="Max iterations for quick probe phase per direction (default: 5000)")
-    parser.add_argument("--heuristic-weight", type=float, default=defaults.HEURISTIC_WEIGHT,
-                        help=f"A* heuristic weight, higher=faster but less optimal (default: {defaults.HEURISTIC_WEIGHT})")
+    parser.add_argument("--heuristic-weight", type=float, default=None,
+                        help=f"A* heuristic weight, higher=faster but less optimal (default: "
+                             f"{defaults.STRICT_HEURISTIC_WEIGHT} with strict pad exits, else "
+                             f"{defaults.HEURISTIC_WEIGHT})")
     parser.add_argument("--turn-cost", type=int, default=defaults.TURN_COST,
                         help=f"Penalty for direction changes, encourages straighter paths (default: {defaults.TURN_COST})")
     parser.add_argument("--direction-preference-cost", type=int, default=defaults.DIRECTION_PREFERENCE_COST,
                         help=f"Penalty for non-preferred layer direction, 0=disabled (default: {defaults.DIRECTION_PREFERENCE_COST})")
+    parser.add_argument("--smd-to-corner", type=float, default=defaults.SMD_TO_CORNER_MM,
+                        help="Straight run (mm) a track keeps from an SMD pad's outline before "
+                             "its first bend (Altium's SMD To Corner rule; never less than the "
+                             "track's half-width). The router lays its SMD exits this long and "
+                             "check_weird reports a shorter one as smd-to-corner "
+                             f"(default: {defaults.SMD_TO_CORNER_MM:g})")
+    parser.add_argument("--smd-exit-reserve-cost", type=float, default=0.0,
+                        help="mm-equivalent cost per grid cell a net pays to cross the "
+                             "straight SMD exit corridor of a pad whose net is still to "
+                             "route (0, the default, turns the reservation off)")
+    parser.add_argument("--no-strict-pad-exits", dest="pad_exit_strict",
+                        action="store_false", default=True,
+                        help="Let a pad with no straight perpendicular exit be reached on "
+                             "its own cells (and grade SMD pads only). Default: every pad, "
+                             "SMD and through-hole, on every net, is left only straight out "
+                             "of a flat side or at 45 degrees through a corner (see "
+                             "--no-pad-corner-exits), and a pad with no such exit stays open")
+    parser.add_argument("--no-pad-corner-exits", dest="pad_exit_corners",
+                        action="store_false", default=True,
+                        help="Leave pads only perpendicular to a flat side. Default: a "
+                             "track may also leave a pad at 45 degrees through a corner, "
+                             "on the corner's bisector (a round pad: radially at 45 degrees)")
+    parser.add_argument("--no-smd-exit-terminals", dest="smd_exit_terminals",
+                        action="store_false", default=True,
+                        help="Do not lay SMD pad exits as the route's terminals: search "
+                             "from / to the pad's own cells, so a route may leave an SMD pad "
+                             "through a corner or at an angle (default: the router lays "
+                             "straight Altium SMD Entry / SMD To Corner exits)")
     parser.add_argument("--bus", action="store_true",
                         help="Enable auto-detection and routing of bus groups (nets with clustered endpoints)")
     parser.add_argument("--bus-detection-radius", type=float, default=defaults.BUS_DETECTION_RADIUS,
@@ -11108,9 +11164,18 @@ For differential pair routing, use route_diff.py:
                 via_cost=args.via_cost,
                 max_iterations=args.max_iterations,
                 max_probe_iterations=args.max_probe_iterations,
-                heuristic_weight=args.heuristic_weight,
+                heuristic_weight=(args.heuristic_weight if args.heuristic_weight is not None
+                                  else (defaults.STRICT_HEURISTIC_WEIGHT
+                                        if (args.pad_exit_strict and args.smd_exit_terminals
+                                            and __import__('smd_exits')._strict_env_allows())
+                                        else defaults.HEURISTIC_WEIGHT)),
                 turn_cost=args.turn_cost,
                 direction_preference_cost=args.direction_preference_cost,
+                smd_to_corner=args.smd_to_corner,
+                smd_exit_terminals=args.smd_exit_terminals,
+                smd_exit_reserve_cost=args.smd_exit_reserve_cost,
+                pad_exit_strict=args.pad_exit_strict,
+                pad_exit_corners=args.pad_exit_corners,
                 bus_enabled=args.bus,
                 bus_detection_radius=args.bus_detection_radius,
                 bus_attraction_radius=args.bus_attraction_radius,

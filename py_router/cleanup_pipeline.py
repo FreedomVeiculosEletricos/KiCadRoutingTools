@@ -114,6 +114,20 @@ def _smooth_skip_net_ids(pcb_data):
             if getattr(net, 'name', None) in names}
 
 
+def pad_exit_skip_net_ids(pcb_data, config=None):
+    """Nets whose SMD pad exits are the spec and are not graded or reshaped:
+    the smoother's (protected, coupled, impedance) plus every net a length or
+    skew grade reads -- a reshaped exit changes a member's length and a
+    pair's symmetry."""
+    from pcb_modification import length_graded_net_ids
+    ids = set(_smooth_skip_net_ids(pcb_data)) | set(_skew_bound_net_ids(pcb_data))
+    try:
+        ids |= set(length_graded_net_ids(pcb_data, config))
+    except Exception:                                        # noqa: BLE001
+        pass
+    return ids
+
+
 def _skew_bound_net_ids(pcb_data):
     """Nets a skew rule grades on this board (#1759): every member of a
     group `check_drc.skew_rule_groups` forms from the board's recorded

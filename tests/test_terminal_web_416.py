@@ -12,6 +12,10 @@ parsed (synthetic segments carry a (uuid ...) as the parser expects). A thin
 0.25 mm reference segment sets the board's connection_width floor below the
 0.3 mm terminals, so joints have margin and the cases are unambiguous (a
 terminal exactly at the floor width is inherently borderline)."""
+import os as _os_strict
+# This test proves a mechanism strict pad exits (smd_exits.strict, the
+# default) turn off -- run it, and the CLIs it drives, non-strict.
+_os_strict.environ.setdefault('KICAD_STRICT_PAD_EXITS', '0')
 import os
 import sys
 import tempfile

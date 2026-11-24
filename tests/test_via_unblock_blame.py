@@ -4,6 +4,10 @@ rip the keystone instead of frontier-adjacent bystanders (#189, ottercast
 SDC0_D3: an In1 trace directly under the ball that the A* frontier never
 reaches).
 """
+import os as _os_strict
+# This test proves a mechanism strict pad exits (smd_exits.strict, the
+# default) turn off -- run it, and the CLIs it drives, non-strict.
+_os_strict.environ.setdefault('KICAD_STRICT_PAD_EXITS', '0')
 import os
 import sys
 

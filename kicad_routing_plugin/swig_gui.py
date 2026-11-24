@@ -1142,6 +1142,11 @@ class RoutingDialog(wx.Dialog):
 
         # Float parameters
         float_params = [
+            ('smd_to_corner', 'SMD To Corner (mm):', defaults.SMD_TO_CORNER_MM,
+             "Straight run a track keeps from an SMD pad's outline before its "
+             "first bend (Altium's SMD To Corner rule; never less than the "
+             "track's half-width). The router lays its SMD exits this long and "
+             "check_weird reports a shorter one as smd-to-corner. (CLI: --smd-to-corner)"),
             ('bga_proximity_radius', 'BGA Proximity (mm):', defaults.BGA_PROXIMITY_RADIUS, "Radius around BGA pads to apply extra cost"),
             ('bga_proximity_cost', 'BGA Prox. Cost:', defaults.BGA_PROXIMITY_COST, "Cost multiplier for routing near BGA pads"),
             ('stub_proximity_radius', 'Stub Proximity (mm):', defaults.STUB_PROXIMITY_RADIUS, "Radius around stubs to apply extra cost"),
@@ -2976,6 +2981,7 @@ class RoutingDialog(wx.Dialog):
         self.proximity_heuristic_factor.SetValue(defaults.PROXIMITY_HEURISTIC_FACTOR)
         self.turn_cost.SetValue(defaults.TURN_COST)
         self.direction_preference_cost.SetValue(defaults.DIRECTION_PREFERENCE_COST)
+        self.smd_to_corner.SetValue(defaults.SMD_TO_CORNER_MM)
         self.ordering_strategy.SetSelection(0)
         self.fab_tier.SetStringSelection(defaults.FAB_TIER)
         self.fab_overrides_path.SetValue("")
@@ -3358,6 +3364,7 @@ class RoutingDialog(wx.Dialog):
             'proximity_heuristic_factor': self.proximity_heuristic_factor.GetValue(),
             'turn_cost': self.turn_cost.GetValue(),
             'direction_preference_cost': self.direction_preference_cost.GetValue(),
+            'smd_to_corner': float(self.smd_to_corner.GetValue()),
             'max_ripup': self.max_ripup.GetValue(),
             'ripup_abandon_metric': self.ripup_abandon_metric.GetString(
                 self.ripup_abandon_metric.GetSelection()),
@@ -3933,6 +3940,7 @@ class RoutingDialog(wx.Dialog):
                         defaults.PROXIMITY_HEURISTIC_FACTOR),
                     turn_cost=config['turn_cost'],
                     direction_preference_cost=config.get('direction_preference_cost', defaults.DIRECTION_PREFERENCE_COST),
+                    smd_to_corner=config.get('smd_to_corner', defaults.SMD_TO_CORNER_MM),
                     max_rip_up_count=config['max_ripup'],
                     ripup_abandon_metric=config.get('ripup_abandon_metric', defaults.RIPUP_ABANDON_METRIC),
                     ripup_blocker_select=config.get('ripup_blocker_select', defaults.RIPUP_BLOCKER_SELECT),

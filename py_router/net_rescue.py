@@ -631,7 +631,15 @@ def _rescue_rungs(config, fine_grid, pcb_data, net_id):
                                     power_net_widths=power_widths,
                                     via_size=v_dia, via_drill=v_drill,
                                     max_iterations=max_iters))
-    return [_bound_rung_margin(r, net_id, config.grid_step) for r in rungs]
+    rungs = [_bound_rung_margin(r, net_id, config.grid_step) for r in rungs]
+    # A rung's turn cost keeps the run's mm-equivalent: the search prices a
+    # turn per CELL, so on a grid 4x finer the run's knob made a 45-degree
+    # kink 4x cheaper against the length it saves, and the weighted
+    # heuristic's greed for diagonal progress won every tie -- a 0.025 rescue
+    # came out as a staircase of one-cell jogs along its whole length.
+    return [replace(r, turn_cost=int(round(config.turn_cost * config.grid_step
+                                            / r.grid_step)))
+            if r.grid_step < config.grid_step - 1e-9 else r for r in rungs]
 
 
 def _bound_rung_margin(cfg, net_id, run_grid):
@@ -1846,7 +1854,10 @@ def rescue_failed_nets(state, single_ended_nets, net_clearances=None,
         if tap_results and num <= 1:
             tap_results = _withdraw_unused_escapes(pcb_data, net_id,
                                                    tap_results, config)
-        elif tap_results and not edge_results and num >= num_start:
+        elif tap_results and (not edge_results and num >= num_start
+                              or num > 1):
+            # (a net the rescue leaves open, part-joined or not: an escape
+            # whose via joins nothing across layers ships as via_dangling)
             # #1778: terrain only -- the net is as open as the rescue found
             # it, and an escape via that joins nothing across layers would
             # ship dangling (KiCad's via_dangling, a via-in-pad stamp for

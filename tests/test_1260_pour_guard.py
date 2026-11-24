@@ -40,6 +40,10 @@ image has no KiCad). Rows:
 
     python3 tests/test_1260_pour_guard.py
 """
+import os as _os_strict
+# This test proves a mechanism strict pad exits (smd_exits.strict, the
+# default) turn off -- run it, and the CLIs it drives, non-strict.
+_os_strict.environ.setdefault('KICAD_STRICT_PAD_EXITS', '0')
 import json
 import os
 import re

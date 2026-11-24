@@ -1117,6 +1117,11 @@ def try_tap_pad(
     # Imported lazily: route_planes imports this module at top level.
     from route_planes import (find_via_position, route_via_to_pad,
                               route_multi_source_to_pad)
+    # SMD pads are landed on through their straight exits (smd_exits): the
+    # multi-source trace needs the board for the exits' clearance checks
+    import functools as _ft
+    route_multi_source_to_pad = _ft.partial(route_multi_source_to_pad,
+                                            pcb_data=pcb_data)
 
     def _gate(res: TapResult) -> TapResult:
         """T6 oracle-strict terminal rung: a success the oracle cannot tie to
@@ -1243,7 +1248,8 @@ def try_tap_pad(
             best = (d2, (v.x, v.y))
     if best is not None and pad_layer and not disable_reuse:
         segs = route_via_to_pad(best[1], pad, pad_layer, net_id,
-                                routing_obs, config, verbose=False)
+                                routing_obs, config, verbose=False,
+                                pcb_data=pcb_data)
         if segs:  # non-empty trace: actually connects the pad to the via
             r = _gate(TapResult(success=True, via=None, segments=segs,
                                 reused_via_pos=best[1]))
@@ -1363,6 +1369,12 @@ def try_tap_pad(
     # -- no trace needed. find_via_position may return an off-centre but still
     # in-pad position when the exact centre is blocked (issue #99).
     in_pad = point_in_pad_rect(via_pos[0], via_pos[1], pad, 1e-6)
+    import smd_exits as _smdx
+    if _smdx.strict():
+        # strict pad exits: no via in a pad, nor with its copper on one
+        from pad_entry import pad_depth as _pdepth
+        if in_pad or _pdepth(pad, via_pos[0], via_pos[1]) > -via_size / 2.0:
+            return TapResult(success=False)
     if pad_layer and not in_pad:
         # The via landed OUTSIDE the pad copper, so a via->pad trace IS needed --
         # but _needs_trace_map can be False (e.g. find_via_position returns an
@@ -1377,7 +1389,8 @@ def try_tap_pad(
         # planes --rip-blocker-nets).
         route_result = route_via_to_pad(via_pos, pad, pad_layer, net_id,
                                         routing_obs, config, verbose=False,
-                                        return_blocked_cells=True)
+                                        return_blocked_cells=True,
+                                        pcb_data=pcb_data)
         if not route_result.success:
             return TapResult(success=False, blocked_cells=route_result.blocked_cells or [])
         segments = route_result.segments

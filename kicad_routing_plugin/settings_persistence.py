@@ -91,6 +91,7 @@ def get_dialog_settings(dialog):
         'heuristic_weight': dialog.heuristic_weight.GetValue(),
         'turn_cost': dialog.turn_cost.GetValue(),
         'direction_preference_cost': dialog.direction_preference_cost.GetValue(),
+        'smd_to_corner': dialog.smd_to_corner.GetValue(),
         'ordering_strategy': dialog.ordering_strategy.GetSelection(),
         'fab_tier': dialog.fab_tier.GetSelection(),
         'fab_overrides_path': dialog.fab_overrides_path.GetValue(),
@@ -440,6 +441,8 @@ def restore_dialog_settings(dialog, settings):
         dialog.turn_cost.SetValue(settings['turn_cost'])
     if 'direction_preference_cost' in settings:
         dialog.direction_preference_cost.SetValue(settings['direction_preference_cost'])
+    if 'smd_to_corner' in settings:
+        dialog.smd_to_corner.SetValue(float(settings['smd_to_corner']))
     if 'ordering_strategy' in settings:
         dialog.ordering_strategy.SetSelection(settings['ordering_strategy'])
     if 'fab_overrides_recent' in settings:

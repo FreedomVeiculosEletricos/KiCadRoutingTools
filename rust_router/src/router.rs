@@ -254,6 +254,17 @@ pub(crate) struct SearchOptions {
     norm_end_dir: Option<(f64, f64)>,
     direction_steps: i32,
     track_margin: TrackMarginArg,
+    /// SMD pad exits laid as terminals: cell key -> (heading x, y, extra g).
+    /// A SOURCE with a heading is the mouth of a straight exit the track
+    /// already runs along (heading = its direction): the first move from it
+    /// may turn at most 90 degrees and pays the turn cost against it. Empty
+    /// = no constraint (the default).
+    pub source_headings: FxHashMap<u64, (i32, i32, i32)>,
+    /// A TARGET with a heading is the mouth of a straight exit the track
+    /// continues along to the pad (heading = that direction): it is reached
+    /// only by a move turning at most 90 degrees onto the heading, which
+    /// pays the turn cost, plus the extra g (the exit's own length).
+    pub target_headings: FxHashMap<u64, (i32, i32, i32)>,
 }
 
 impl SearchOptions {
@@ -281,8 +292,44 @@ impl SearchOptions {
             norm_end_dir,
             direction_steps,
             track_margin,
+            source_headings: FxHashMap::default(),
+            target_headings: FxHashMap::default(),
         }
     }
+
+    /// Install the terminal headings (route_multi's source_headings /
+    /// target_headings): rows (gx, gy, layer, hx, hy, extra_g), the heading
+    /// normalized to its octant.
+    pub(crate) fn set_headings(
+        &mut self,
+        source_headings: Option<Vec<(i32, i32, u8, i32, i32, i32)>>,
+        target_headings: Option<Vec<(i32, i32, u8, i32, i32, i32)>>,
+    ) {
+        for (gx, gy, layer, hx, hy, g) in source_headings.unwrap_or_default() {
+            if hx != 0 || hy != 0 {
+                self.source_headings.insert(GridState::new(gx, gy, layer).as_key(),
+                                            (hx.signum(), hy.signum(), g.max(0)));
+            }
+        }
+        for (gx, gy, layer, hx, hy, g) in target_headings.unwrap_or_default() {
+            if hx != 0 || hy != 0 {
+                self.target_headings.insert(GridState::new(gx, gy, layer).as_key(),
+                                            (hx.signum(), hy.signum(), g.max(0)));
+            }
+        }
+    }
+}
+
+/// Turn cost of a heading change from (pdx, pdy) to (dx, dy), both octant
+/// unit steps: the knob is the 90-degree anchor (45 -> half, 135 -> 1.5x).
+#[inline]
+fn turn_cost_between(turn_cost: i32, pdx: i32, pdy: i32, dx: i32, dy: i32) -> i32 {
+    if (pdx == 0 && pdy == 0) || (dx == pdx && dy == pdy) {
+        return 0;
+    }
+    let delta = (octant_index(dx, dy) - octant_index(pdx, pdy)).rem_euclid(8);
+    let angle_units = delta.min(8 - delta); // 1=45deg .. 4=180deg
+    (turn_cost as i64 * angle_units as i64 / 2) as i32
 }
 
 /// Check if position (nx, ny) would violate via exclusion: true if blocked
@@ -452,7 +499,9 @@ impl GridSearch {
             let key = state.as_key();
             // Penalize starting on expensive layers
             let layer_cost = router.layer_cost_or_default(layer as usize);
-            let initial_g = layer_cost - min_layer_cost;
+            // An exit mouth starts at its exit's own length (extra g).
+            let exit_g = opts.source_headings.get(&key).map_or(0, |h| h.2);
+            let initial_g = layer_cost - min_layer_cost + exit_g;
             let h = router.heuristic_to_targets(&state, &target_states, &target_hint);
             initial_h = initial_h.min(h);
             open_set.push(OpenEntry {
@@ -595,6 +644,22 @@ impl GridSearch {
 
         // Check if reached target
         if self.target_set.contains(&current_key) {
+            // An exit mouth is entered turning at most 90 degrees onto its
+            // heading (a via arrival or a source on it is fine).
+            let mouth_ok = match self.opts.target_headings.get(&current_key) {
+                Some(&(cx, cy, _)) => match self.store.parent(current_idx) {
+                    Some(parent_idx) => {
+                        let (px, py, _) = self.store.coords(parent_idx);
+                        let (ax, ay) = ((current.gx - px).signum(), (current.gy - py).signum());
+                        (ax == 0 && ay == 0) || ax * cx + ay * cy >= 0
+                    }
+                    None => true,
+                },
+                None => true,
+            };
+            if !mouth_ok {
+                return SearchStep::Skipped;
+            }
             // If end_direction is specified, verify we arrived from a compatible direction
             let arrival_ok = if let Some((end_dx, end_dy)) = self.opts.norm_end_dir {
                 if let Some(parent_idx) = self.store.parent(current_idx) {
@@ -647,13 +712,23 @@ impl GridSearch {
         let current_steps = self.store.steps_of(current_idx);
 
         // Previous direction (parent -> current) for turn cost calculation
-        let prev_direction: Option<(i32, i32)> = self.store.parent(current_idx).map(|parent_idx| {
-            let (px, py, _) = self.store.coords(parent_idx);
-            let pdx = current.gx - px;
-            let pdy = current.gy - py;
-            // Normalize to unit direction (vias produce a zero delta)
-            if pdx == 0 && pdy == 0 { (0, 0) } else { (pdx.signum(), pdy.signum()) }
-        });
+        let prev_direction: Option<(i32, i32)> = match self.store.parent(current_idx) {
+            Some(parent_idx) => {
+                let (px, py, _) = self.store.coords(parent_idx);
+                let pdx = current.gx - px;
+                let pdy = current.gy - py;
+                // Normalize to unit direction (vias produce a zero delta)
+                Some(if pdx == 0 && pdy == 0 { (0, 0) } else { (pdx.signum(), pdy.signum()) })
+            }
+            // An exit mouth: the track already runs along the exit's heading.
+            None => self.opts.source_headings.get(&current_key).map(|h| (h.0, h.1)),
+        };
+        // The first move off an exit mouth turns at most 90 degrees.
+        let mouth_heading: Option<(i32, i32)> = if self.store.parent(current_idx).is_none() {
+            self.opts.source_headings.get(&current_key).map(|h| (h.0, h.1))
+        } else {
+            None
+        };
 
         // Expand neighbors - 8 directions.
         // S6: the layer_forbidden(current.layer) test is hoisted out of the
@@ -674,6 +749,11 @@ impl GridSearch {
                     }
                 }
 
+                if let Some((hx, hy)) = mouth_heading {
+                    if dx * hx + dy * hy < 0 {
+                        continue;
+                    }
+                }
                 // Start direction constraint for the first N steps
                 if let Some((start_dx, start_dy)) = self.opts.norm_start_dir {
                     if current_steps < self.opts.direction_steps
@@ -781,7 +861,15 @@ impl GridSearch {
                         - router.path_attraction_potential(current.gx, current.gy, current.layer);
                     (step_cost - d_phi).max(move_cost / 10)
                 } else { step_cost };
-                let new_g = g + step_cost;
+                let mut new_g = g + step_cost;
+                // Into an exit mouth: at most 90 degrees onto its heading,
+                // paying that turn and the exit's own length.
+                if let Some(&(cx, cy, exit_g)) = self.opts.target_headings.get(&neighbor_key) {
+                    if dx * cx + dy * cy < 0 {
+                        continue;
+                    }
+                    new_g += turn_cost_between(router.turn_cost, dx, dy, cx, cy) + exit_g;
+                }
 
                 if new_g < existing_g {
                     if existing_g != i32::MAX {
@@ -910,7 +998,11 @@ impl GridSearch {
                     router.path_attraction_potential(current.gx, current.gy, layer)
                         - router.path_attraction_potential(current.gx, current.gy, current.layer)
                 } else { 0 };
-                let new_g = g + (combined_via_cost + proximity_cost - via_shaping).max(0);
+                let mut new_g = g + (combined_via_cost + proximity_cost - via_shaping).max(0);
+                // A via landing on an exit mouth pays the exit's own length.
+                if let Some(&(_, _, exit_g)) = self.opts.target_headings.get(&neighbor_key) {
+                    new_g += exit_g;
+                }
 
                 if new_g < existing_g {
                     if existing_g != i32::MAX {
@@ -1098,13 +1190,23 @@ impl GridRouter {
     /// list of floats (#156). When > 0 on a layer, the swept-capsule check
     /// reserves that Euclidean radius along every move on that layer.
     ///
+    /// source_headings / target_headings: SMD pad exits laid as terminals
+    /// (pad_entry.exit_corridors), rows (gx, gy, layer, hx, hy, extra_g) for
+    /// cells that are also in sources / targets. Such a cell is the MOUTH of
+    /// a straight exit from a pad centre: a source's first move turns at most
+    /// 90 degrees off the heading (and pays the turn cost against it); a
+    /// target is entered by a move turning at most 90 degrees onto the
+    /// heading, paying that turn. extra_g is the exit's own length, so the
+    /// search picks the exit -- end or side -- by the whole route's cost.
+    /// None (the default) leaves the search unchanged.
+    ///
     /// max_iterations_ceiling: #529 dynamic iterations -- when above
     /// max_iterations, hitting the cap grants +1x max_iterations tranches
     /// while best_h keeps improving by a quantum per tranche, up to the
     /// ceiling. 0 (the default) disables: existing callers are unchanged.
     ///
     /// C1: thin wrapper over the shared GridSearch core with a StatsSink.
-    #[pyo3(signature = (obstacles, sources, targets, max_iterations, collinear_vias=false, via_exclusion_radius=0, start_direction=None, end_direction=None, direction_steps=2, track_margin=TrackMarginArg::Scalar(0.0), max_iterations_ceiling=0, quantum_cells=2.0, quantum_pct=2.0, grace_tranches=0, via_rung=0))]
+    #[pyo3(signature = (obstacles, sources, targets, max_iterations, collinear_vias=false, via_exclusion_radius=0, start_direction=None, end_direction=None, direction_steps=2, track_margin=TrackMarginArg::Scalar(0.0), max_iterations_ceiling=0, quantum_cells=2.0, quantum_pct=2.0, grace_tranches=0, via_rung=0, source_headings=None, target_headings=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn route_multi(
         &self,
@@ -1123,11 +1225,14 @@ impl GridRouter {
         quantum_pct: f64,
         grace_tranches: u32,
         via_rung: usize,
+        source_headings: Option<Vec<(i32, i32, u8, i32, i32, i32)>>,
+        target_headings: Option<Vec<(i32, i32, u8, i32, i32, i32)>>,
     ) -> (Option<Vec<(i32, i32, u8)>>, u32, std::collections::HashMap<String, f64>) {
         let mut opts = SearchOptions::new(collinear_vias, via_exclusion_radius,
                                       start_direction, end_direction,
                                       direction_steps, track_margin);
         opts.via_rung = via_rung;
+        opts.set_headings(source_headings, target_headings);
         let mut sink = StatsSink::default();
         let mut search = GridSearch::new(self, sources, targets, max_iterations, opts, &mut sink);
         search.set_iteration_ceiling(max_iterations_ceiling, quantum_cells, quantum_pct, grace_tranches);
@@ -1182,7 +1287,7 @@ impl GridRouter {
     /// 0 (the default) disables.
     ///
     /// C1: thin wrapper over the shared GridSearch core with a FrontierSink.
-    #[pyo3(signature = (obstacles, sources, targets, max_iterations, collinear_vias=false, via_exclusion_radius=0, start_direction=None, end_direction=None, direction_steps=2, track_margin=TrackMarginArg::Scalar(0.0), max_iterations_ceiling=0, quantum_cells=2.0, quantum_pct=2.0, grace_tranches=0, via_rung=0))]
+    #[pyo3(signature = (obstacles, sources, targets, max_iterations, collinear_vias=false, via_exclusion_radius=0, start_direction=None, end_direction=None, direction_steps=2, track_margin=TrackMarginArg::Scalar(0.0), max_iterations_ceiling=0, quantum_cells=2.0, quantum_pct=2.0, grace_tranches=0, via_rung=0, source_headings=None, target_headings=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn route_with_frontier(
         &self,
@@ -1201,11 +1306,14 @@ impl GridRouter {
         quantum_pct: f64,
         grace_tranches: u32,
         via_rung: usize,
+        source_headings: Option<Vec<(i32, i32, u8, i32, i32, i32)>>,
+        target_headings: Option<Vec<(i32, i32, u8, i32, i32, i32)>>,
     ) -> (Option<Vec<(i32, i32, u8)>>, u32, Vec<(i32, i32, u8)>) {
         let mut opts = SearchOptions::new(collinear_vias, via_exclusion_radius,
                                       start_direction, end_direction,
                                       direction_steps, track_margin);
         opts.via_rung = via_rung;
+        opts.set_headings(source_headings, target_headings);
         let mut sink = FrontierSink::new();
         let mut search = GridSearch::new(self, sources, targets, max_iterations, opts, &mut sink);
         search.set_iteration_ceiling(max_iterations_ceiling, quantum_cells, quantum_pct, grace_tranches);

@@ -1377,6 +1377,37 @@ def _neck_route_terminal_grazes(segments, path, coord, start_original, end_origi
     return _hard
 
 
+def _shift_to_mouth(path, term_idx, neighbor_idx, original, pts, pcb_data,
+                    net_id, config, layer_names):
+    """Move ``pts[term_idx]`` -- a path end on an SMD exit's mouth cell whose
+    weld ``original`` is that exit's anchor -- onto the exit's mouth point
+    (smd_exits.mouth_point), when the path's segment into it stays clear
+    there. Returns True when the end is an exit mouth (moved or already on
+    its point)."""
+    if original is None or not path or len(path) < 2:
+        return False
+    import smd_exits
+    mp = smd_exits.mouth_point(path[term_idx], (original[0], original[1]))
+    if mp is None:
+        return False
+    fx, fy = pts[term_idx]
+    if abs(mp[0] - fx) < 1e-9 and abs(mp[1] - fy) < 1e-9:
+        return True
+    if path[term_idx][2] != path[neighbor_idx][2] or pcb_data is None:
+        return False
+    layer = layer_names[path[term_idx][2]]
+    from pcb_modification import _connector_clear
+    nx, ny = pts[neighbor_idx]
+    clr = config.layer_clearance(layer, config.obstacle_clearance(net_id), net_id)
+    if not _connector_clear(nx, ny, mp[0], mp[1],
+                            config.get_net_track_width(net_id, layer), layer,
+                            net_id, pcb_data, clr,
+                            net_clearances=getattr(config, 'net_clearances', None) or None):
+        return False
+    pts[term_idx] = mp
+    return True
+
+
 def _merge_terminal_to_exact(path, term_idx, neighbor_idx, original, pts,
                              pcb_data, net_id, config, layer_names):
     """#4: route.py is on-grid, but a route's TERMINAL connects to an off-grid pad
@@ -1882,6 +1913,12 @@ def _note_dynamic_extension(iters: int, base: int,
               f"{iters} (base {base})")
 
 
+def _heading_rows(sources, targets):
+    """The SMD exit mouths' headings for one search (smd_exits.heading_rows)."""
+    from smd_exits import heading_rows
+    return heading_rows(sources, targets)
+
+
 def _probe_route_with_frontier(
     router: 'GridRouter',
     obstacles: 'GridObstacleMap',
@@ -1976,7 +2013,7 @@ def _probe_route_with_frontier_once(
     # Probe forward direction
     path, iterations, blocked_cells = router.route_with_frontier(
         obstacles, forward_sources, forward_targets, probe_iterations, track_margin=track_margin, via_exclusion_radius=_ver, via_rung=_vrung,
-        collinear_vias=env_knobs.COLLINEAR_VIAS)
+        **_heading_rows(forward_sources, forward_targets), collinear_vias=env_knobs.COLLINEAR_VIAS)
     first_probe_iters = iterations
     first_total_iters = first_probe_iters
     first_blocked = blocked_cells
@@ -2016,7 +2053,7 @@ def _probe_route_with_frontier_once(
         _dyn_base, _dyn_kw = _dynamic_iterations(config)
         path, full_iters, full_blocked = router.route_with_frontier(
             obstacles, forward_sources, forward_targets, _dyn_base, track_margin=track_margin, via_exclusion_radius=_ver, via_rung=_vrung,
-        collinear_vias=env_knobs.COLLINEAR_VIAS, **_dyn_kw)
+        **_heading_rows(forward_sources, forward_targets), collinear_vias=env_knobs.COLLINEAR_VIAS, **_dyn_kw)
         _note_dynamic_extension(full_iters, _dyn_base, print_prefix)
         first_total_iters += full_iters
         total_iterations += full_iters
@@ -2031,7 +2068,7 @@ def _probe_route_with_frontier_once(
     # Probe backward direction (bidirectional mode)
     path, iterations, blocked_cells = router.route_with_frontier(
         obstacles, forward_targets, forward_sources, probe_iterations, track_margin=track_margin, via_exclusion_radius=_ver, via_rung=_vrung,
-        collinear_vias=env_knobs.COLLINEAR_VIAS)
+        **_heading_rows(forward_targets, forward_sources), collinear_vias=env_knobs.COLLINEAR_VIAS)
     second_probe_iters = iterations
     second_total_iters = second_probe_iters
     second_blocked = blocked_cells
@@ -2078,7 +2115,7 @@ def _probe_route_with_frontier_once(
     _dyn_base, _dyn_kw = _dynamic_iterations(config)
     path, full_iters, full_blocked = router.route_with_frontier(
         obstacles, forward_sources, forward_targets, _dyn_base, track_margin=track_margin, via_exclusion_radius=_ver, via_rung=_vrung,
-        collinear_vias=env_knobs.COLLINEAR_VIAS, **_dyn_kw)
+        **_heading_rows(forward_sources, forward_targets), collinear_vias=env_knobs.COLLINEAR_VIAS, **_dyn_kw)
     _note_dynamic_extension(full_iters, _dyn_base, print_prefix)
     first_total_iters += full_iters
     total_iterations += full_iters
@@ -2094,7 +2131,7 @@ def _probe_route_with_frontier_once(
 
     path, backward_full_iters, backward_full_blocked = router.route_with_frontier(
         obstacles, forward_targets, forward_sources, _dyn_base, track_margin=track_margin, via_exclusion_radius=_ver, via_rung=_vrung,
-        collinear_vias=env_knobs.COLLINEAR_VIAS, **_dyn_kw)
+        **_heading_rows(forward_targets, forward_sources), collinear_vias=env_knobs.COLLINEAR_VIAS, **_dyn_kw)
     _note_dynamic_extension(backward_full_iters, _dyn_base, print_prefix)
     second_total_iters += backward_full_iters
     total_iterations += backward_full_iters
@@ -2709,10 +2746,85 @@ def route_net_with_obstacles(pcb_data: PCBData, net_id: int, config: GridRouteCo
     the layers a track ban forbids it are forbidden layers of the route
     (`net_keepouts.config_for_nets`, #1527)."""
     from net_keepouts import stamp as _nk_stamp, config_for_nets
+    import smd_exits
     with _nk_stamp(obstacles, pcb_data, (net_id,), config):
-        return _route_net_with_obstacles_impl(
-            pcb_data, net_id, config_for_nets(pcb_data, (net_id,), config),
-            obstacles, *args, **kwargs)
+        cfg = config_for_nets(pcb_data, (net_id,), config)
+        # The SMD pad exits are the route's terminals (smd_exits); a search
+        # they leave without a path is retried on the plain pad cells, so
+        # the exits never cost a net.
+        with smd_exits.active_mouths({}):
+            res = _route_net_with_obstacles_impl(
+                pcb_data, net_id, cfg, obstacles, *args, **kwargs)
+            used = smd_exits.swapped()
+        if used and (res is None or res.get('failed')) and smd_exits.fallback_allowed():
+            smd_exits.note_fallback()
+            res = _route_net_with_obstacles_impl(
+                pcb_data, net_id, cfg, obstacles, *args,
+                smd_exit_terminals=False, **kwargs)
+        return res
+
+
+def _phase_pad_mouths(sources, targets, end_a, end_b, pcb_data, net_id, config,
+                      obstacles, layer_names):
+    """A multipoint edge's ends as SMD exit mouths (smd_exits.exit_mouths):
+    each end ``(pad_row, pad_obj)`` that is a single-layer SMD pad gets its
+    compliant exits' mouth cells in place of the pad's own cells (its centre
+    and any #479 seeded cell on its copper; island cells stay). Returns
+    ``(sources, targets, mouths, anchor, fences)``: the mouths for
+    active_mouths, {cell: (anchor_x, anchor_y)} to weld a path end on a mouth
+    to, and the pads to fence (smd_exits.fence_pad arguments) while the
+    mouths are searched."""
+    if not getattr(config, 'smd_exit_terminals', True):
+        return sources, targets, {}, {}, []
+    import smd_exits
+    if net_id in smd_exits.skip_net_ids(pcb_data):
+        return sources, targets, {}, {}, []
+    from pad_entry import pad_depth
+    mouths, anchor, fences = {}, {}, []
+    out = []
+    coord = GridCoord(config.grid_step)
+    for cells, (row, pad) in ((sources, end_a), (targets, end_b)):
+        if pad is None:
+            out.append(cells)
+            continue
+        if _pad_all_layer_reach(pcb_data, pad):
+            if not smd_exits.strict() or '*.Cu' not in getattr(pad, 'layers', ()):
+                out.append(cells)
+                continue
+            # strict: a through-hole pad is reached through its exits on
+            # every layer the edge's cells offer it on
+            lis = sorted({c[2] for c in cells
+                          if pad_depth(pad, *coord.to_float(c[0], c[1])) >= 0.0})
+        else:
+            lis = [row[2]]
+        keep = list(cells)
+        for li in lis:
+            layer = layer_names[li]
+            ms = smd_exits.exit_mouths(pad, layer, li,
+                                       config.get_net_track_width(net_id, layer),
+                                       config.grid_step, pcb_data, net_id, config,
+                                       obstacles)
+            if not ms:
+                if smd_exits.exit_gradable(pad, layer):
+                    smd_exits.STATS['no_exit'] += 1
+                    if smd_exits.strict():
+                        # strict: no compliant exit, no terminal on this layer
+                        keep = [c for c in keep if c[2] != li or pad_depth(
+                            pad, *coord.to_float(c[0], c[1])) < 0.0]
+                continue
+            smd_exits.STATS['pads'] += 1
+            # the map's base width: the router adds a wide net's margin itself
+            fences.append((obstacles, pad, li, config.track_width, config.grid_step))
+            keep = [c for c in keep
+                    if c[2] != li or pad_depth(pad, *coord.to_float(c[0], c[1])) < 0.0]
+            for gx, gy, l2, ax, ay, sx, sy, g in ms:
+                keep.append((gx, gy, l2))
+                mouths[(gx, gy, l2)] = (sx, sy, g)
+                anchor[(gx, gy, l2)] = (ax, ay)
+        out.append(keep)
+    fences.extend(smd_exits.net_pad_fences(pcb_data, net_id, obstacles, config,
+                                           layer_names))
+    return out[0], out[1], mouths, anchor, fences
 
 
 def _route_net_with_obstacles_impl(pcb_data: PCBData, net_id: int, config: GridRouteConfig,
@@ -2721,7 +2833,8 @@ def _route_net_with_obstacles_impl(pcb_data: PCBData, net_id: int, config: GridR
                               reverse_direction: bool = False,
                               bounds: Optional[Tuple[int, int, int, int]] = None,
                               sources_override: Optional[List[Tuple]] = None,
-                              targets_override: Optional[List[Tuple]] = None) -> Optional[dict]:
+                              targets_override: Optional[List[Tuple]] = None,
+                              smd_exit_terminals: bool = True) -> Optional[dict]:
     """Route a single net using pre-built obstacles (for incremental routing).
 
     Args:
@@ -2812,6 +2925,14 @@ def _route_net_with_obstacles_impl(pcb_data: PCBData, net_id: int, config: GridR
                                  bounds)
     targets = _clear_launch_rows(targets, obstacles, coord, pcb_data, net_id,
                                  bounds)
+    # SMD pad exits (Altium SMD Entry / SMD To Corner): a pad terminal is
+    # searched from / to its compliant exits' mouths, welded to their
+    # anchors, so the route leaves the pad straight out of an edge
+    # (smd_exits). The caller retries without them on failure.
+    if smd_exit_terminals:
+        from smd_exits import swap_terminals
+        sources, targets = swap_terminals(sources, targets, pcb_data, net_id,
+                                          config, obstacles, config.layers)
 
     # Endpoint stub-proximity exemption (soft-knobs C5): a target that sits
     # beside ANOTHER net's stub paid full stub cost on the final approach
@@ -3033,13 +3154,19 @@ def _route_net_with_obstacles_impl(pcb_data: PCBData, net_id: int, config: GridR
 
     # Simplify path by removing collinear intermediate points
     path = simplify_path(path)
+    # an end on an SMD exit mouth is drawn at the exit's mouth point
+    pts = [coord.to_float(p[0], p[1]) for p in path]
+    _shift_to_mouth(path, 0, 1, start_original, pts, pcb_data, net_id, config,
+                    layer_names)
+    _shift_to_mouth(path, len(path) - 1, len(path) - 2, end_original, pts,
+                    pcb_data, net_id, config, layer_names)
 
     new_segments = []
     new_vias = []
 
     start_bridge = None
     if start_original:
-        first_grid_x, first_grid_y = coord.to_float(path_start[0], path_start[1])
+        first_grid_x, first_grid_y = pts[0]
         orig_x, orig_y, orig_layer = start_original
         if abs(orig_x - first_grid_x) > 0.001 or abs(orig_y - first_grid_y) > 0.001:
             seg = Segment(
@@ -3058,8 +3185,8 @@ def _route_net_with_obstacles_impl(pcb_data: PCBData, net_id: int, config: GridR
         gx1, gy1, layer1 = path[i]
         gx2, gy2, layer2 = path[i + 1]
 
-        x1, y1 = coord.to_float(gx1, gy1)
-        x2, y2 = coord.to_float(gx2, gy2)
+        x1, y1 = pts[i]
+        x2, y2 = pts[i + 1]
 
         if layer1 != layer2:
             # Check if layer change is at an existing through-hole pad
@@ -3101,7 +3228,7 @@ def _route_net_with_obstacles_impl(pcb_data: PCBData, net_id: int, config: GridR
         new_segments = [sg for sg in new_segments if sg is not start_bridge]
 
     if end_original:
-        last_grid_x, last_grid_y = coord.to_float(path_end[0], path_end[1])
+        last_grid_x, last_grid_y = pts[-1]
         orig_x, orig_y, orig_layer = end_original
         if (abs(orig_x - last_grid_x) > 0.001 or abs(orig_y - last_grid_y) > 0.001) \
                 and not _bridge_adds_nothing_in_keepout(
@@ -3631,6 +3758,12 @@ def _place_shrunk_via_in_pad(pad_obj, obstacles, config, pcb_data, net_id,
     placement legality WITHOUT an epoch bump, so a failure under inflight
     state must not be trusted later. Likewise when the caller hands
     ``pending_vias`` (this net's own uncommitted vias, see the impl)."""
+    import smd_exits as _smdx
+    if _smdx.strict():
+        # strict pad exits: no via goes in or against a pad, and the stub
+        # escape it falls back to leaves the pad by no exit rule -- a boxed
+        # pad stays open instead
+        return None
     from plane_pad_tap import inflight_copper_dicts
     _iv, _isg = inflight_copper_dicts(pcb_data)
     _inflight = bool(_iv) or bool(_isg) or bool(pending_vias)
@@ -5644,6 +5777,7 @@ def _route_multipoint_main_impl(
     cumulative_iterations = 0
     last_failure = None
     routed_edge_pos = None
+    _mouth_anchor = {}   # SMD exit mouth -> anchor of the edge that routed
     for attempt in range(max_main_attempts):
         idx_a, idx_b, edge_len = mst_edges[attempt]
         if attempt:
@@ -5696,6 +5830,22 @@ def _route_multipoint_main_impl(
         # the seeded cells weld to their own grid point (below, #1777)
         _seeded = (set(sources) | set(targets)) - _pre
 
+        # SMD pad exits (smd_exits): an SMD pad end of the edge is searched
+        # from / to its compliant exits' mouths, welded to their anchors.
+        _plain_ends = (list(sources), list(targets))
+        sources, targets, _mouths, _mouth_anchor, _fences = _phase_pad_mouths(
+            sources, targets, (pad_a, pad_a_obj), (pad_b, pad_b_obj),
+            pcb_data, net_id, config, obstacles, layer_names)
+        # strict exits: the islands' other pads are launched / landed on
+        # through their exits too, never from their own copper
+        import smd_exits as _smdx0
+        sources = _smdx0.strict_terminal_cells(
+            sources, _mouths, _mouth_anchor, _fences, pcb_data, net_id, config,
+            obstacles, layer_names, GridCoord(config.grid_step))
+        targets = _smdx0.strict_terminal_cells(
+            targets, _mouths, _mouth_anchor, _fences, pcb_data, net_id, config,
+            obstacles, layer_names, GridCoord(config.grid_step))
+
         # Mark source/target cells -- THIS attempt's only. An override lets
         # the A* enter a cell another net's clearance blocks, so it belongs to
         # the endpoints it was made for; left on the map it is a hole a later
@@ -5707,14 +5857,34 @@ def _route_multipoint_main_impl(
 
         # Use probe routing helper, steered through this edge's bucket of
         # corridor waypoints (tap edges follow their own buckets later).
-        (path, total_iterations, forward_blocked, backward_blocked, reversed_path,
-         fwd_iters, bwd_iters, necked_down, uniform_width, main_unblock_vias,
-         main_unblock_segments) = _route_with_via_unblock(
-            router, obstacles, config, sources, targets, track_margin,
-            pcb_data, net_id, print_prefix="  ", direction_labels=("forward", "backward"),
-            waypoints=waypoint_buckets.get(frozenset((idx_a, idx_b)), [])
-        )
+        import smd_exits as _smdx
+        with _smdx.active_mouths(_mouths, _fences):
+            (path, total_iterations, forward_blocked, backward_blocked, reversed_path,
+             fwd_iters, bwd_iters, necked_down, uniform_width, main_unblock_vias,
+             main_unblock_segments) = _route_with_via_unblock(
+                router, obstacles, config, sources, targets, track_margin,
+                pcb_data, net_id, print_prefix="  ", direction_labels=("forward", "backward"),
+                waypoints=waypoint_buckets.get(frozenset((idx_a, idx_b)), [])
+            )
         cumulative_iterations += total_iterations
+        if path is None and _mouths and _smdx.fallback_allowed():
+            # the exits left no path: the plain pad cells -- in the late
+            # stages only (smd_exits.no_plain_fallback); before, the failed
+            # edge goes on to Phase 3 and the rip-up ladder
+            _smdx.note_fallback()
+            sources, targets = _plain_ends
+            _mouth_anchor = {}
+            obstacles.clear_source_target_cells()
+            for gx, gy, layer in sources + targets:
+                obstacles.add_source_target_cell(gx, gy, layer)
+            (path, _it2, forward_blocked, backward_blocked, reversed_path,
+             fwd_iters, bwd_iters, necked_down, uniform_width, main_unblock_vias,
+             main_unblock_segments) = _route_with_via_unblock(
+                router, obstacles, config, sources, targets, track_margin,
+                pcb_data, net_id, print_prefix="  ", direction_labels=("forward", "backward"),
+                waypoints=waypoint_buckets.get(frozenset((idx_a, idx_b)), [])
+            )
+            cumulative_iterations += _it2
 
         if path is not None:
             routed_edge_pos = attempt
@@ -5880,7 +6050,10 @@ def _route_multipoint_main_impl(
     _end_orig = (pad_b[3], pad_b[4], layer_names[pad_b[2]])
     if path:
         _own = _island_cells.get(pad_components.get(idx_a, idx_a), {}).get(tuple(path[0]))
-        if _own is not None:
+        if tuple(path[0]) in _mouth_anchor:
+            # an SMD exit mouth: weld to its anchor, the exit's own leg
+            _start_orig = (*_mouth_anchor[tuple(path[0])], layer_names[path[0][2]])
+        elif _own is not None:
             _start_orig = (_own[0], _own[1], layer_names[path[0][2]])
         elif tuple(path[0]) in _seeded:
             # a #479 seeded on-pad cell: its grid point is on the pad's
@@ -5893,7 +6066,9 @@ def _route_multipoint_main_impl(
                 *coord.to_float(path[0][0], path[0][1]),
                 layer_names[path[0][2]]), layer_names[path[0][2]])
         _own = _island_cells.get(pad_components.get(idx_b, idx_b), {}).get(tuple(path[-1]))
-        if _own is not None:
+        if tuple(path[-1]) in _mouth_anchor:
+            _end_orig = (*_mouth_anchor[tuple(path[-1])], layer_names[path[-1][2]])
+        elif _own is not None:
             _end_orig = (_own[0], _own[1], layer_names[path[-1][2]])
         elif tuple(path[-1]) in _seeded:
             _end_orig = (*_seeded_pad_weld(
@@ -6710,6 +6885,26 @@ def _route_multipoint_taps_impl(
                         targets.append(_cell)
                         _tset.add(_cell)
 
+        # SMD pad exits (smd_exits): the target pad is landed on through its
+        # compliant exits' mouths, welded to their anchors.
+        _plain_targets = list(targets)
+        _src_none = (None, None)
+        _s_unused, targets, _tap_mouths, _tap_anchor, _tap_fences = _phase_pad_mouths(
+            [], targets, _src_none, (tgt_pad, tgt_pad_obj),
+            pcb_data, net_id, config, obstacles, layer_names)
+        # strict exits: a tap launches from a routed pad, and lands on the
+        # target island's pads, only through their exits
+        import smd_exits as _smdx0
+        targets = _smdx0.strict_terminal_cells(
+            targets, _tap_mouths, _tap_anchor, _tap_fences, pcb_data, net_id,
+            config, obstacles, layer_names, coord)
+        _src_anchor = {}
+        sources = _smdx0.strict_terminal_cells(
+            sources, _tap_mouths, _src_anchor, _tap_fences, pcb_data, net_id,
+            config, obstacles, layer_names, coord)
+        for _c, (_ax, _ay) in _src_anchor.items():
+            tap_point_map[_c] = (_ax, _ay, layer_names[_c[2]])
+
         # Mark source/target cells -- THIS edge's only (_SCOPE_OVERRIDES_NOTE).
         obstacles.clear_source_target_cells()
         for gx, gy, layer in sources + targets:
@@ -6753,14 +6948,33 @@ def _route_multipoint_taps_impl(
         # the via-in-pad rescue below often turns a stalled edge into a
         # routed one, and then nothing needs explaining.
         with deferred_diagnostics(config) as _edge_diag:
-            (path, tap_iterations, forward_blocked, backward_blocked, reversed_tap_path,
-             _, _, necked_down, uniform_width, unblock_vias,
-             unblock_segments) = _route_with_via_unblock(
-                router, obstacles, config, sources, targets, track_margin,
-                pcb_data, net_id, print_prefix="      ", direction_labels=("forward", "backward"),
-                waypoints=waypoint_buckets.get(frozenset((src_idx, tgt_idx)), []),
-                pending_vias=all_vias, pad_sources=False
-            )
+            import smd_exits as _smdx
+            with _smdx.active_mouths(_tap_mouths, _tap_fences):
+                (path, tap_iterations, forward_blocked, backward_blocked, reversed_tap_path,
+                 _, _, necked_down, uniform_width, unblock_vias,
+                 unblock_segments) = _route_with_via_unblock(
+                    router, obstacles, config, sources, targets, track_margin,
+                    pcb_data, net_id, print_prefix="      ", direction_labels=("forward", "backward"),
+                    waypoints=waypoint_buckets.get(frozenset((src_idx, tgt_idx)), []),
+                    pending_vias=all_vias, pad_sources=False
+                )
+            if path is None and _tap_mouths and _smdx.fallback_allowed():
+                # the exits left no path: land on the plain pad cells
+                _smdx.note_fallback()
+                targets = _plain_targets
+                _tap_anchor = {}
+                obstacles.clear_source_target_cells()
+                for gx, gy, layer in sources + targets:
+                    obstacles.add_source_target_cell(gx, gy, layer)
+                (path, _tit2, forward_blocked, backward_blocked, reversed_tap_path,
+                 _, _, necked_down, uniform_width, unblock_vias,
+                 unblock_segments) = _route_with_via_unblock(
+                    router, obstacles, config, sources, targets, track_margin,
+                    pcb_data, net_id, print_prefix="      ", direction_labels=("forward", "backward"),
+                    waypoints=waypoint_buckets.get(frozenset((src_idx, tgt_idx)), []),
+                    pending_vias=all_vias, pad_sources=False
+                )
+                tap_iterations += _tit2
 
             if path is None:
                 # Multipoint parity rung (#424): the #189 unblock inside the
@@ -6891,7 +7105,10 @@ def _route_multipoint_taps_impl(
         # landing to the pad centre would draw a long any-angle slash to a
         # route that ended elsewhere on the island (the SDC0_CMD class,
         # tap_point_map contract mirrored on the target side).
-        if path[-1] in _tgt_isl:
+        if tuple(path[-1]) in _tap_anchor:
+            # an SMD exit mouth: weld to its anchor, the exit's own leg
+            end_original = (*_tap_anchor[tuple(path[-1])], path_end_layer)
+        elif path[-1] in _tgt_isl:
             _ex, _ey = _tgt_isl[path[-1]]
             end_original = (_ex, _ey, path_end_layer)
         else:
@@ -7212,6 +7429,9 @@ def _route_keepout_refusal(pcb_data, segments, vias):
     gated before the search, but the A* may still step between two endpoint
     overrides inside an area (a 0.1 mm grid step on the issue's board), so
     the edge FAILS here and the caller's rip/retry ladder runs."""
+    strict_why = _strict_exit_refusal(pcb_data, segments, vias)
+    if strict_why:
+        return (f"route copper: {strict_why}", "a diagonal or corner pad exit")
     gate = _keepout_gate(pcb_data)
     if gate is None:
         return None
@@ -7219,6 +7439,50 @@ def _route_keepout_refusal(pcb_data, segments, vias):
     if not why:
         return None
     return (f"route copper: {why}", "items_not_allowed")
+
+
+def _strict_exit_refusal(pcb_data, segments, vias) -> str:
+    """Strict pad exits (smd_exits.strict): '' when a converted route's
+    copper keeps every pad exit straight -- no leg leaving or entering one of
+    its net's pads at an angle, through a corner or bent short of its exit
+    (pad_entry.strict_exit_faults), no via on a pad -- else why not. The
+    exits are the search's terminals, so this only catches what the
+    conversion and welds add after the search (a passed pad's weld leg, a
+    terminal bridge); the edge then fails like an unroutable one."""
+    import smd_exits
+    segments = [x for x in segments or () if x is not None]
+    if not smd_exits.strict() or pcb_data is None or not (segments or vias):
+        return ''
+    from pad_entry import pad_depth, strict_exit_faults
+    from geometry_utils import point_to_segment_distance
+    by_net = {}
+    for x in segments:
+        by_net.setdefault(x.net_id, ([], []))[0].append(x)
+    for v in vias or ():
+        by_net.setdefault(v.net_id, ([], []))[1].append(v)
+    for nid, (segs, nvias) in by_net.items():
+        pads = pcb_data.pads_by_net.get(nid, []) or []
+        for v in nvias:
+            for p in pads:
+                if pad_depth(p, v.x, v.y) > -getattr(v, 'size', 0) / 2.0:
+                    return f"a via on pad {p.component_ref}.{p.pad_number}"
+        near = [p for p in pads
+                if any(point_to_segment_distance(p.global_x, p.global_y, x.start_x,
+                                                 x.start_y, x.end_x, x.end_y)
+                       <= max(p.size_x, p.size_y) + 1.0 for x in segs)]
+        if not near:
+            continue
+        ids = {id(x) for x in segs}
+        before = [x for x in pcb_data.segments if x.net_id == nid and id(x) not in ids]
+        allv = [v for v in pcb_data.vias if v.net_id == nid] + list(nvias)
+        old = strict_exit_faults(before, allv, near)
+        new = strict_exit_faults(before + segs, allv, near)
+        for (pid, layer, kind), n in new.items():
+            if n > old.get((pid, layer, kind), 0):
+                p = next(q for q in near if id(q) == pid)
+                return (f"{kind} at pad {p.component_ref}.{p.pad_number} "
+                        f"(strict pad exits)")
+    return ''
 
 
 def _bridge_inside_own_through_via(pcb_data, net_id, config, layer, a, b,
@@ -7425,12 +7689,19 @@ def _path_to_segments_vias(
     # off-grid endpoint instead of its grid-cell stand-in when that cell grazes a
     # foreign pad but the exact endpoint clears it (#4 off-grid connection graze).
     pts = [coord.to_float(p[0], p[1]) for p in path]
+    # An end on an SMD exit's mouth cell, welded to its anchor, is drawn at
+    # the exit's mouth point on the pad's axis (smd_exits.mouth_point).
+    _at_mouth = (_shift_to_mouth(path, 0, 1, start_original, pts, pcb_data,
+                                 net_id, config, layer_names),
+                 _shift_to_mouth(path, len(path) - 1, len(path) - 2, end_original,
+                                 pts, pcb_data, net_id, config, layer_names))
     merge_start = merge_end = False
     if pcb_data is not None:
-        merge_start = _merge_terminal_to_exact(path, 0, 1, start_original, pts,
-                                               pcb_data, net_id, config, layer_names)
-        merge_end = _merge_terminal_to_exact(path, len(path) - 1, len(path) - 2, end_original, pts,
-                                             pcb_data, net_id, config, layer_names)
+        merge_start = (not _at_mouth[0]) and _merge_terminal_to_exact(
+            path, 0, 1, start_original, pts, pcb_data, net_id, config, layer_names)
+        merge_end = (not _at_mouth[1]) and _merge_terminal_to_exact(
+            path, len(path) - 1, len(path) - 2, end_original, pts,
+            pcb_data, net_id, config, layer_names)
 
     # Add connecting segment from original start to first path point if needed
     # (skipped when merged: the first path segment now ends at the exact point)

@@ -495,7 +495,8 @@ def _audit_plane_via_map(obstacles, pcb_data, config, net_id,
         print(f"  [OBSTACLE AUDIT route_planes] skipped ({e})")
 
 
-def _path_to_segments(path, via_pos, pad, pad_layer, net_id, config, coord):
+def _path_to_segments(path, via_pos, pad, pad_layer, net_id, config, coord,
+                      end_point=None, pcb_data=None):
     """Convert an A* grid path (oriented via->pad) into trace segment dicts.
 
     Shared by route_via_to_pad (single source) and route_multi_source_to_pad
@@ -505,6 +506,19 @@ def _path_to_segments(path, via_pos, pad, pad_layer, net_id, config, coord):
     the pad end.
     """
     segments = []
+    pts = [coord.to_float(c[0], c[1]) for c in path]
+    if path and end_point is not None and len(path) >= 2 and pcb_data is not None:
+        # an end on an SMD exit mouth is drawn at the exit's mouth point
+        import smd_exits
+        from pcb_modification import _connector_clear
+        mp = smd_exits.mouth_point(tuple(path[-1]), end_point)
+        if mp is not None and _connector_clear(
+                pts[-2][0], pts[-2][1], mp[0], mp[1], config.track_width,
+                pad_layer, net_id, pcb_data,
+                config.layer_clearance(pad_layer, config.obstacle_clearance(net_id),
+                                       net_id),
+                net_clearances=getattr(config, 'net_clearances', None) or None):
+            pts[-1] = mp
 
     # Add connecting segment from via to first path point
     if path:
@@ -521,11 +535,8 @@ def _path_to_segments(path, via_pos, pad, pad_layer, net_id, config, coord):
 
     # Convert path points to segments
     for i in range(len(path) - 1):
-        gx1, gy1, _ = path[i]
-        gx2, gy2, _ = path[i + 1]
-
-        x1, y1 = coord.to_float(gx1, gy1)
-        x2, y2 = coord.to_float(gx2, gy2)
+        x1, y1 = pts[i]
+        x2, y2 = pts[i + 1]
 
         if (x1, y1) != (x2, y2):
             segments.append({
@@ -536,20 +547,51 @@ def _path_to_segments(path, via_pos, pad, pad_layer, net_id, config, coord):
                 'net_id': net_id
             })
 
-    # Add connecting segment from last path point to pad center
+    # Add connecting segment from last path point to pad center -- or, for a
+    # path ending on an SMD exit mouth, to that exit's anchor (`end_point`):
+    # the straight exit is the trace's own last leg (smd_exits)
     if path:
-        last_gx, last_gy, _ = path[-1]
-        last_x, last_y = coord.to_float(last_gx, last_gy)
-        if abs(pad.global_x - last_x) > 0.001 or abs(pad.global_y - last_y) > 0.001:
+        last_x, last_y = pts[-1]
+        ex, ey = end_point if end_point is not None else (pad.global_x, pad.global_y)
+        if abs(ex - last_x) > 0.001 or abs(ey - last_y) > 0.001:
             segments.append({
                 'start': (last_x, last_y),
-                'end': (pad.global_x, pad.global_y),
+                'end': (ex, ey),
                 'width': config.track_width,
                 'layer': pad_layer,
                 'net_id': net_id
             })
 
+    if _strict_tap_refused(segments, net_id, pcb_data):
+        return None
     return _bound_tap_neck(segments, net_id, pad_layer, config)
+
+
+def _strict_tap_refused(segments, net_id, pcb_data) -> bool:
+    """Strict pad exits (smd_exits.strict): does this tap trace leave or
+    enter one of its net's pads at an angle, through a corner or bend short
+    of its exit (pad_entry.strict_exit_faults)? Then the tap is no tap -- the
+    pad stays as it was instead of shipping a diagonal pad exit."""
+    import smd_exits
+    if not smd_exits.strict() or not segments or pcb_data is None:
+        return False
+    from kicad_parser import Segment as _Seg
+    from pad_entry import strict_exit_faults
+    new = [_Seg(start_x=d['start'][0], start_y=d['start'][1], end_x=d['end'][0],
+                end_y=d['end'][1], width=d['width'], layer=d['layer'],
+                net_id=net_id) for d in segments]
+    before = [x for x in pcb_data.segments if x.net_id == net_id]
+    vias = [v for v in pcb_data.vias if v.net_id == net_id]
+    from geometry_utils import point_to_segment_distance
+    pads = [p for p in (pcb_data.pads_by_net.get(net_id, []) or [])
+            if any(point_to_segment_distance(p.global_x, p.global_y, x.start_x,
+                                             x.start_y, x.end_x, x.end_y)
+                   <= max(p.size_x, p.size_y) + 1.0 for x in new)]
+    if not pads:
+        return False
+    old = strict_exit_faults(before, vias, pads)
+    return any(n > old.get(k, 0)
+               for k, n in strict_exit_faults(before + new, vias, pads).items())
 
 
 def _bound_tap_neck(segments, net_id, pad_layer, config):
@@ -578,6 +620,44 @@ def _bound_tap_neck(segments, net_id, pad_layer, config):
     return segments
 
 
+def _tap_mouths(pad, pad_layer, net_id, routing_obstacles, config, pcb_data,
+                layer_idx=0):
+    """The SMD exit mouths a plane tap lands on ``pad`` through
+    (smd_exits.exit_mouths at the tap's width): ``(targets, headings,
+    anchors)`` -- the mouth cells, their target_headings rows and
+    {cell: anchor}; empty when the pad gets none (no board, not SMD, no exit
+    fits, or the run turned the exits off)."""
+    if pcb_data is None or not getattr(config, 'smd_exit_terminals', True):
+        return [], [], {}
+    import smd_exits
+    if net_id in smd_exits.skip_net_ids(pcb_data):
+        return [], [], {}
+    ms = smd_exits.exit_mouths(pad, pad_layer, layer_idx, config.track_width,
+                               config.grid_step, pcb_data, net_id, config,
+                               routing_obstacles)
+    from pad_entry import smd_gradable
+    if ms or smd_gradable(pad, pad_layer):
+        smd_exits.STATS['pads' if ms else 'no_exit'] += 1
+    tg = [(gx, gy, li) for gx, gy, li, *_ in ms]
+    th = [(gx, gy, li, -sx, -sy, g) for gx, gy, li, _ax, _ay, sx, sy, g in ms]
+    anchors = {(gx, gy, li): (ax, ay) for gx, gy, li, ax, ay, _sx, _sy, _g in ms}
+    return tg, th, anchors
+
+
+def _plain_tap_allowed(pad, pad_layer) -> bool:
+    """May a tap land on ``pad``'s own cells (no exit mouth)? Not with strict
+    exits on a pad the exit rule governs (smd_exits.strict)."""
+    import smd_exits
+    return not (smd_exits.strict() and smd_exits.exit_gradable(pad, pad_layer))
+
+
+def _mouth_fence(pad, layer_idx, routing_obstacles, config):
+    """The pad fenced while its mouths are searched (smd_exits.fenced)."""
+    import smd_exits
+    return smd_exits.fenced([(routing_obstacles, pad, layer_idx,
+                              config.track_width, config.grid_step)])
+
+
 def route_via_to_pad(
     via_pos: Tuple[float, float],
     pad: Pad,
@@ -588,10 +668,13 @@ def route_via_to_pad(
     max_iterations: int = 10000,
     verbose: bool = False,
     return_blocked_cells: bool = False,
-    router: Optional[GridRouter] = None
+    router: Optional[GridRouter] = None,
+    pcb_data=None,
 ) -> Optional[List[Dict]]:
     """
-    Route from via position to pad center using A* pathfinding.
+    Route from via position to pad center using A* pathfinding. With
+    ``pcb_data`` an SMD pad is landed on through its straight exits
+    (_tap_mouths), the plain pad cell when none gives a path.
 
     Args:
         via_pos: (x, y) position of the via
@@ -673,14 +756,33 @@ def route_via_to_pad(
             proximity_heuristic_cost=config.get_proximity_heuristic_cost()
         )
 
-    path, iterations, blocked_cells = router.route_with_frontier(
-        routing_obstacles, sources, targets, max_iterations,
-        env_knobs.COLLINEAR_VIAS,  # collinear_vias (#487: KICAD_COLLINEAR_VIAS=1)
-        0,      # via_exclusion_radius
-        None,   # start_direction
-        None,   # end_direction
-        0       # direction_steps
-    )
+    _end_point = None
+    _mt, _mh, _ma = _tap_mouths(pad, pad_layer, net_id, routing_obstacles,
+                                config, pcb_data, layer_idx)
+    path = None
+    if _mt:
+        with _mouth_fence(pad, layer_idx, routing_obstacles, config):
+            path, iterations, blocked_cells = router.route_with_frontier(
+                routing_obstacles, sources, _mt, max_iterations,
+                env_knobs.COLLINEAR_VIAS, 0, None, None, 0,
+                target_headings=_mh)
+        if path is not None:
+            _end_point = _ma.get(tuple(path[-1]))
+        elif _plain_tap_allowed(pad, pad_layer):
+            import smd_exits
+            smd_exits.note_fallback()
+    _strict_miss = path is None and not _plain_tap_allowed(pad, pad_layer)
+    if _strict_miss:
+        iterations, blocked_cells = locals().get('iterations', 0), locals().get('blocked_cells', [])
+    if path is None and not _strict_miss:
+        path, iterations, blocked_cells = router.route_with_frontier(
+            routing_obstacles, sources, targets, max_iterations,
+            env_knobs.COLLINEAR_VIAS,  # collinear_vias (#487: KICAD_COLLINEAR_VIAS=1)
+            0,      # via_exclusion_radius
+            None,   # start_direction
+            None,   # end_direction
+            0       # direction_steps
+        )
 
     if path is None:
         if verbose:
@@ -695,7 +797,8 @@ def route_via_to_pad(
     routing_obstacles.clear_source_target_cells()
 
     # Convert path to segments
-    segments = _path_to_segments(path, via_pos, pad, pad_layer, net_id, config, coord)
+    segments = _path_to_segments(path, via_pos, pad, pad_layer, net_id, config, coord,
+                                 end_point=_end_point, pcb_data=pcb_data)
     if segments is None:
         if return_blocked_cells:
             return RouteResult(segments=None, blocked_cells=[], success=False)
@@ -717,8 +820,11 @@ def route_multi_source_to_pad(
     verbose: bool = False,
     return_blocked_cells: bool = False,
     router: Optional[GridRouter] = None,
+    pcb_data=None,
 ):
     """Route a trace from `pad` to ANY of `candidate_positions` in ONE A* (#259).
+    With ``pcb_data`` an SMD pad is landed on through its straight exits
+    (_tap_mouths), as route_via_to_pad.
 
     Replaces a per-candidate `route_via_to_pad` loop (one full A* per candidate,
     ~99% of them failing on dense boards) with a single multi-source search: all
@@ -778,14 +884,34 @@ def route_multi_source_to_pad(
 
     # One search seeded from all candidates; generous budget since it replaces K.
     ms_iters = max(max_iterations, min(60000, len(source_cells) * 4))
-    path, iterations, blocked_cells = router.route_with_frontier(
-        routing_obstacles, source_cells, [(pad_gx, pad_gy, layer_idx)], ms_iters,
-        env_knobs.COLLINEAR_VIAS,  # collinear_vias (#487: KICAD_COLLINEAR_VIAS=1)
-        0,      # via_exclusion_radius
-        None,   # start_direction
-        None,   # end_direction
-        0       # direction_steps
-    )
+    _end_point = None
+    _mt, _mh, _ma = _tap_mouths(pad, pad_layer, net_id, routing_obstacles,
+                                config, pcb_data, layer_idx)
+    path = None
+    if _mt:
+        with _mouth_fence(pad, layer_idx, routing_obstacles, config):
+            path, iterations, blocked_cells = router.route_with_frontier(
+                routing_obstacles, source_cells, _mt, ms_iters,
+                env_knobs.COLLINEAR_VIAS, 0, None, None, 0,
+                target_headings=_mh)
+        if path is not None:
+            e1 = tuple(path[-1]) if tuple(path[-1]) in _ma else tuple(path[0])
+            _end_point = _ma.get(e1)
+        elif _plain_tap_allowed(pad, pad_layer):
+            import smd_exits
+            smd_exits.note_fallback()
+    _strict_miss = path is None and not _plain_tap_allowed(pad, pad_layer)
+    if _strict_miss:
+        iterations, blocked_cells = locals().get('iterations', 0), locals().get('blocked_cells', [])
+    if path is None and not _strict_miss:
+        path, iterations, blocked_cells = router.route_with_frontier(
+            routing_obstacles, source_cells, [(pad_gx, pad_gy, layer_idx)], ms_iters,
+            env_knobs.COLLINEAR_VIAS,  # collinear_vias (#487: KICAD_COLLINEAR_VIAS=1)
+            0,      # via_exclusion_radius
+            None,   # start_direction
+            None,   # end_direction
+            0       # direction_steps
+        )
     routing_obstacles.clear_source_target_cells()
 
     if path is None:
@@ -806,7 +932,8 @@ def route_multi_source_to_pad(
     if verbose and len(source_cells) > 1:
         print(f"[multi-source {len(source_cells)} cand, {iterations}it]", end=" ")
 
-    segments = _path_to_segments(path, via_pos, pad, pad_layer, net_id, config, coord)
+    segments = _path_to_segments(path, via_pos, pad, pad_layer, net_id, config, coord,
+                                 end_point=_end_point, pcb_data=pcb_data)
     if segments is None:
         if return_blocked_cells:
             return RouteResult(segments=None, blocked_cells=[], success=False), None

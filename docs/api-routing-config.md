@@ -58,6 +58,15 @@ Default net class, else `routing_defaults.py` (`TRACK_WIDTH` 0.3,
 | `turn_cost` | `1000` | Penalty per direction change (straighter routes) |
 | `direction_order` | `'forward'` | Try `'forward'` or `'backward'` direction first |
 
+### Pad exits (SMD Entry / SMD To Corner)
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `smd_to_corner` | `0.25` | Straight run (mm) a track keeps past a pad's outline before its first bend (Altium's SMD To Corner; never less than the track's half-width). CLI `--smd-to-corner` |
+| `smd_exit_terminals` | `True` | The router lays pad exits itself (`smd_exits`): a pad terminal is searched from / to the mouths of its straight exits. `False` (CLI `--no-smd-exit-terminals`): the plain pad cells |
+| `pad_exit_strict` | `True` | Strict pad exits (`smd_exits.strict`): every pad the exits grade -- SMD and through-hole, every net -- is left only straight out of a flat side, perpendicular, never at 45 degrees or through a corner, on any grid lane the side carries; a pad with no such exit stays open instead of being entered another way, no via goes in or against a pad, and every stage that lays copper (route conversion, plane taps, oracle links, joint bridges, cleanup passes) refuses copper that breaks an exit. The CLI's default heuristic weight is then `routing_defaults.STRICT_HEURISTIC_WEIGHT` (1.0). CLI `--no-strict-pad-exits`; `KICAD_STRICT_PAD_EXITS=0` turns it off for the process |
+| `smd_exit_reserve_cost` | `0.0` | mm-equivalent cost per grid cell a net pays to cross the exit corridor of another, still unrouted net's pad (`smd_exits.reserve_exits`); 0 = off. CLI `--smd-exit-reserve-cost` |
+
 ### Proximity penalties (soft costs)
 
 Quick table; every field is specified in detail right below — **what feeds it,

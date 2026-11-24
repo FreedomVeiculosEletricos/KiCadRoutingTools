@@ -194,6 +194,28 @@ class GridRouteConfig:
     # global plan's replace() clone; never on a config that emits copper.
     plan_probe: bool = False
     turn_cost: int = 1000  # Penalty for direction changes (encourages straighter paths)
+    # SMD To Corner (Altium's rule, routing_defaults.SMD_TO_CORNER_MM): the
+    # straight run (mm) a track keeps from an SMD pad's outline before its
+    # first bend (never less than its half-width; pad_entry.exit_distance).
+    smd_to_corner: float = 0.25
+    # The router lays SMD pad exits itself (smd_exits): a pad terminal is
+    # searched from / to its compliant straight exits. False: the plain pad
+    # cells, as before.
+    smd_exit_terminals: bool = True
+    # Strict pad exits (smd_exits.strict): every pad the exits grade -- SMD
+    # and through-hole, every net -- is reached only through a straight
+    # exit perpendicular to a flat side, or at 45 degrees through a corner
+    # when pad_exit_corners; a pad with no such exit stays open rather than
+    # being entered any other way. False: SMD pads only, retried on the pad
+    # cells.
+    pad_exit_strict: bool = True
+    # Corner exits (pad_entry.corner_exits): a track may also leave a pad at
+    # 45 degrees through a corner, on the corner's bisector. False: edge
+    # exits only (perpendicular to a flat side).
+    pad_exit_corners: bool = True
+    # mm-equivalent cost per grid cell of another, still unrouted net's SMD
+    # exit corridor (smd_exits.reserve_exits); 0 turns the reservation off
+    smd_exit_reserve_cost: float = 0.0
     # BGA exclusion zones (auto-detected from PCB) - vias blocked inside these areas
     bga_exclusion_zones: List[Tuple[float, float, float, float]] = field(default_factory=list)
     stub_proximity_radius: float = 2.0  # mm - radius around stubs to penalize
