@@ -3186,10 +3186,8 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                 for nid in pcb_data.nets:
                     if nid == 0:
                         continue
-                    w_all = _dr.draw_size('track_width', nid)
-                    by_layer = {l: _dr.draw_size('track_width', nid, l) for l in _cu}
-                    by_layer = {l: w for l, w in by_layer.items() if w is not None}
-                    if by_layer and len(set(by_layer.values())) > 1:
+                    w_all, by_layer = _dr.track_draw_widths(nid, _cu)
+                    if by_layer:
                         _per_layer[nid] = by_layer
                     # An explicit --track-width is the PNS 'custom size': it
                     # wins where a layer's rule allows it and is clamped into

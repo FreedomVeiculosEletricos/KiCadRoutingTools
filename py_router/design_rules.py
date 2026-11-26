@@ -2506,6 +2506,20 @@ class DesignRules:
             v = c.max
         return float(v)
 
+    def track_draw_widths(self, net_id: int, layers: Sequence[str]
+                          ) -> Tuple[Optional[float], Dict[str, float]]:
+        """The track width to draw ``net_id`` at, and its per-layer widths.
+
+        The first value is :meth:`draw_size` with no layer (None when nothing
+        declares one). The dict is ``{layer: width}`` over ``layers`` when a
+        layer-scoped rule gives the net different widths on different layers,
+        else empty: a net with one width everywhere needs no per-layer map."""
+        by_layer = {l: self.draw_size('track_width', net_id, l) for l in layers}
+        by_layer = {l: w for l, w in by_layer.items() if w is not None}
+        if len(set(by_layer.values())) < 2:
+            by_layer = {}
+        return self.draw_size('track_width', net_id), by_layer
+
     # ---------------- disclosure ----------------
 
     def unsupported(self) -> List[Tuple[str, str]]:
