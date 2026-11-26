@@ -8228,8 +8228,12 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                         power_nets_widths=power_nets_widths,
                         # The step's netclass widths: without them the
                         # finalize read class nets at the board default and
-                        # the pad-entry allowance never bounded its taps.
+                        # the pad-entry allowance never bounded its taps
+                        # (#2047); under --escalation off/board the region
+                        # joins also keep each plane net at its own width /
+                        # floor (net class / .kicad_dru / impedance).
                         net_track_widths=dict(config.net_track_widths or {}),
+                        net_layer_widths=dict(config.net_layer_widths or {}),
                         netclass_width_floors=dict(
                             getattr(config, 'netclass_width_floors', None) or {}),
                         # #658: the chain's layer economics reach the
@@ -8327,8 +8331,12 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                         power_nets_widths=power_nets_widths,
                         # The step's netclass widths: without them the
                         # finalize read class nets at the board default and
-                        # the pad-entry allowance never bounded its taps.
+                        # the pad-entry allowance never bounded its taps
+                        # (#2047); under --escalation off/board the region
+                        # joins also keep each plane net at its own width /
+                        # floor (net class / .kicad_dru / impedance).
                         net_track_widths=dict(config.net_track_widths or {}),
+                        net_layer_widths=dict(config.net_layer_widths or {}),
                         netclass_width_floors=dict(
                             getattr(config, 'netclass_width_floors', None) or {}),
                         # #658: same layer economics as the GUI leg above.
